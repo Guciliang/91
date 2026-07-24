@@ -122,7 +122,7 @@ test("crawler upload target uses explicit local-save option instead of auto targ
   assert.match(combinedSource, /本地保存，不上传/);
   assert.match(
     crawlerPageSource,
-    /UPLOAD_TARGET_KINDS\s*=\s*new Set\(\["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "webdav"\]\)/
+    /UPLOAD_TARGET_KINDS\s*=\s*new Set\(\["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "quark", "webdav"\]\)/
   );
   assert.match(crawlerPageSource, /drives\.filter\(\(d\) => UPLOAD_TARGET_KINDS\.has\(d\.kind\)\)/);
   assert.doesNotMatch(combinedSource, /自动：唯一/);
@@ -288,6 +288,43 @@ test("quark drive form supports qr login and manual cookie fallback", () => {
   assert.ok(match, "quark credential field block should be present");
   assert.match(match[1], /key: "cookie"/);
   assert.match(match[1], /__pus=\.\.\.; __puus=\.\.\.; \.\.\./);
+});
+
+test("quark drive form exposes optional proxy and OpenList-compatible Crypt settings", () => {
+  const match =
+    /case "quark":\s*return \[([\s\S]*?)\];\s*case "p115":/.exec(
+      constantsSource
+    );
+  assert.ok(match, "quark credential field block should be present");
+  const fields = match[1];
+
+  assert.match(fields, /key: "proxy_url"/);
+  assert.match(fields, /http:\/\/127\.0\.0\.1:7890/);
+  assert.match(fields, /socks5:\/\/127\.0\.0\.1:1080/);
+  assert.match(fields, /key: "crypt_enabled"/);
+  assert.match(fields, /defaultValue: "false"/);
+  assert.match(fields, /key: "crypt_password"/);
+  assert.match(fields, /key: "crypt_salt"/);
+  assert.match(fields, /key: "crypt_filename_encryption"/);
+  assert.match(fields, /value: "standard"/);
+  assert.match(fields, /value: "obfuscate"/);
+  assert.match(fields, /value: "off"/);
+  assert.match(fields, /key: "crypt_directory_name_encryption"/);
+  assert.match(fields, /key: "crypt_filename_encoding"/);
+  assert.match(fields, /value: "base64"/);
+  assert.match(fields, /value: "base32"/);
+  assert.match(fields, /value: "base32768"/);
+  assert.match(fields, /key: "crypt_suffix"/);
+  assert.match(fields, /defaultValue: ".bin"/);
+  assert.match(driveFormSource, /password\|salt\|token\|secret/i);
+  assert.match(driveFormSource, /<PasswordInput[\s\S]*?required=\{f\.required && !isEdit\}/);
+});
+
+test("quark is available as a crawler upload target", () => {
+  assert.match(
+    crawlerPageSource,
+    /UPLOAD_TARGET_KINDS\s*=\s*new Set\([^\n]*"quark"[^\n]*\)/
+  );
 });
 
 test("p123 drive form exposes qr login and phone or email password login", () => {

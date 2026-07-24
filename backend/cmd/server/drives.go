@@ -101,15 +101,33 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 	var drv drives.Drive
 	switch d.Kind {
 	case "quark":
-		drv = quark.New(quark.Config{
-			ID:     d.ID,
-			Cookie: d.Credentials["cookie"],
-			RootID: d.RootID,
+		base := quark.New(quark.Config{
+			ID:            d.ID,
+			Cookie:        d.Credentials["cookie"],
+			RootID:        d.RootID,
+			ProxyURL:      d.Credentials["proxy_url"],
+			UploadTempDir: a.uploadWorkDir("quark"),
 			OnCookieUpdate: func(cookie string) {
 				d.Credentials["cookie"] = cookie
 				_ = a.cat.UpsertDrive(ctx, d)
 			},
 		})
+		if parseBoolDefault(d.Credentials["crypt_enabled"], false) {
+			cryptDrive, err := quark.NewCrypt(base, quark.CryptConfig{
+				Password:                d.Credentials["crypt_password"],
+				Salt:                    d.Credentials["crypt_salt"],
+				FilenameEncryption:      d.Credentials["crypt_filename_encryption"],
+				DirectoryNameEncryption: parseBoolDefault(d.Credentials["crypt_directory_name_encryption"], true),
+				FilenameEncoding:        d.Credentials["crypt_filename_encoding"],
+				Suffix:                  d.Credentials["crypt_suffix"],
+			})
+			if err != nil {
+				return fmt.Errorf("quark crypt configuration: %w", err)
+			}
+			drv = cryptDrive
+		} else {
+			drv = base
+		}
 	case "p115":
 		drv = p115.New(p115.Config{
 			ID:            d.ID,

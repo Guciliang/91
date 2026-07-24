@@ -822,10 +822,97 @@ func prepareFFmpegLink(ctx context.Context, link *drives.StreamLink) (*drives.St
 	if link == nil {
 		return nil, func() {}, errors.New("missing stream link")
 	}
+	if link.PlaintextSource != nil {
+		return startLocalPlaintextFFmpegProxy(ctx, link)
+	}
 	if !shouldProxyFFmpegLink(link) {
 		return link, func() {}, nil
 	}
 	return startLocalFFmpegProxy(ctx, link)
+}
+
+func startLocalPlaintextFFmpegProxy(ctx context.Context, link *drives.StreamLink) (*drives.StreamLink, func(), error) {
+	if link.PlaintextSource == nil || strings.TrimSpace(link.PlaintextFileID) == "" {
+		return nil, nil, errors.New("plaintext stream source is incomplete")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, err
+	}
+	source := link.PlaintextSource
+	fileID := link.PlaintextFileID
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/stream" {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			size, err := source.PlaintextSize(r.Context(), fileID)
+			if err != nil {
+				http.Error(w, "plaintext source unavailable", http.StatusBadGateway)
+				return
+			}
+			start, length, partial, valid := drives.ParseSingleByteRange(r.Header.Get("Range"), size)
+			if !valid {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			contentType := "application/octet-stream"
+			if typed, ok := source.(interface{ PlaintextContentType(string) string }); ok {
+				if candidate := typed.PlaintextContentType(fileID); candidate != "" {
+					contentType = candidate
+				}
+			}
+			var body io.ReadCloser
+			if r.Method != http.MethodHead && length > 0 {
+				body, err = source.OpenPlaintextRange(r.Context(), fileID, start, length)
+				if err != nil {
+					http.Error(w, "plaintext source unavailable", http.StatusBadGateway)
+					return
+				}
+				defer body.Close()
+			}
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Type", contentType)
+			w.Header().Set("Cache-Control", "no-store")
+			if partial {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
+				w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+				w.WriteHeader(http.StatusPartialContent)
+			} else {
+				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+				w.WriteHeader(http.StatusOK)
+			}
+			if r.Method == http.MethodHead || length == 0 {
+				return
+			}
+			_, _ = io.Copy(w, body)
+		}),
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[preview] plaintext ffmpeg proxy: %v", err)
+		}
+	}()
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		})
+	}
+	go func() {
+		<-ctx.Done()
+		cleanup()
+	}()
+	return &drives.StreamLink{URL: "http://" + ln.Addr().String() + "/stream"}, cleanup, nil
 }
 
 func shouldProxyFFmpegLink(link *drives.StreamLink) bool {
@@ -835,6 +922,11 @@ func shouldProxyFFmpegLink(link *drives.StreamLink) bool {
 	raw := strings.ToLower(link.URL)
 	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
 		return false
+	}
+	// A private client carries a per-drive proxy. FFmpeg cannot inherit that
+	// client, so route the source through the loopback relay.
+	if link.HTTPClient != nil {
+		return true
 	}
 	// FFmpeg forwards custom Authorization/Cookie headers to redirect targets.
 	// Keep protected first-hop links behind our loopback proxy so redirects are
@@ -854,7 +946,9 @@ func startLocalFFmpegProxy(ctx context.Context, link *drives.StreamLink) (*drive
 		return nil, nil, err
 	}
 	client := &http.Client{Timeout: 0}
-	if link.PassThroughRedirects {
+	if link.HTTPClient != nil {
+		client = link.HTTPClient
+	} else if link.PassThroughRedirects {
 		client = streamhttp.NewClient(0)
 	}
 	srv := &http.Server{

@@ -314,14 +314,14 @@ func (a *AdminServer) validateCrawlerUploadDrive(ctx context.Context, driveID st
 		return fmt.Errorf("上传目标网盘 %q 不存在", driveID)
 	}
 	if !isCrawlerUploadTargetKind(d.Kind) {
-		return fmt.Errorf("上传目标网盘 %q 类型为 %s，仅支持 115网盘、PikPak、123网盘、Google Drive、OneDrive、联通网盘、光鸭网盘、WebDAV", driveID, d.Kind)
+		return fmt.Errorf("上传目标网盘 %q 类型为 %s，仅支持 115网盘、PikPak、123网盘、Google Drive、OneDrive、联通网盘、光鸭网盘、夸克网盘、WebDAV", driveID, d.Kind)
 	}
 	return nil
 }
 
 func isCrawlerUploadTargetKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "webdav":
+	case "p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "quark", "webdav":
 		return true
 	default:
 		return false

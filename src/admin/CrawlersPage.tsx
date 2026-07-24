@@ -27,7 +27,7 @@ import { AdminEmptyVisual } from "./AdminEmptyVisual";
 
 const BUSY_STATES = new Set(["scanning", "generating", "uploading", "queued"]);
 const POLL_INTERVAL_MS = 5000;
-const UPLOAD_TARGET_KINDS = new Set(["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "webdav"]);
+const UPLOAD_TARGET_KINDS = new Set(["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "quark", "webdav"]);
 
 function statusBusy(status?: api.DriveGenerationStatus) {
   return BUSY_STATES.has(status?.state ?? "");

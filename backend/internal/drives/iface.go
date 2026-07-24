@@ -98,11 +98,30 @@ type StreamLink struct {
 	// signed URL's exact expiry.
 	Expires time.Time
 
+	// HTTPClient is an optional per-drive client used for the final stream
+	// request. It is intentionally not serialized: providers such as Quark can
+	// require a private proxy for both their API and their media CDN.
+	HTTPClient *http.Client `json:"-"`
+
 	// PassThroughRedirects tells the online playback proxy to make the first
 	// authenticated request itself, but relay an upstream 3xx Location to the
 	// browser instead of following it on the server. Background consumers such
 	// as fingerprinting and transcoding still follow redirects to read bytes.
 	PassThroughRedirects bool
+
+	// PlaintextSource is an internal-only stream source for transforms such as
+	// Crypt. Consumers that need a URL (FFmpeg) create a short-lived loopback
+	// proxy, while the playback proxy serves it directly. It is never exposed
+	// in API JSON or redirect responses.
+	PlaintextSource PlaintextRangeProvider `json:"-"`
+	PlaintextFileID string                 `json:"-"`
+}
+
+// PlaintextRangeProvider is implemented by drives that transform remote bytes
+// before clients can consume them. Ranges are expressed in plaintext bytes.
+type PlaintextRangeProvider interface {
+	PlaintextSize(ctx context.Context, fileID string) (int64, error)
+	OpenPlaintextRange(ctx context.Context, fileID string, offset, limit int64) (io.ReadCloser, error)
 }
 
 // ErrNotSupported 代表某家盘不支持某操作
@@ -185,4 +204,49 @@ func ErrorMentionsHTTPStatus(err error, statuses ...int) bool {
 		return false
 	}
 	return TextMentionsHTTPStatus(err.Error(), statuses...)
+}
+
+// ParseSingleByteRange parses the single byte range emitted by browsers and
+// media tools. It clamps a valid end offset to the resource size and rejects
+// multipart ranges because transformed streams can serve one range at a time.
+func ParseSingleByteRange(raw string, size int64) (start, length int64, partial, valid bool) {
+	if size < 0 {
+		return 0, 0, false, false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, size, false, true
+	}
+	if !strings.HasPrefix(raw, "bytes=") || strings.Contains(raw, ",") || size == 0 {
+		return 0, 0, false, false
+	}
+	values := strings.SplitN(strings.TrimPrefix(raw, "bytes="), "-", 2)
+	if len(values) != 2 {
+		return 0, 0, false, false
+	}
+	if values[0] == "" {
+		suffix, err := strconv.ParseInt(values[1], 10, 64)
+		if err != nil || suffix <= 0 {
+			return 0, 0, false, false
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return size - suffix, suffix, true, true
+	}
+	start, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0, 0, false, false
+	}
+	end := size - 1
+	if values[1] != "" {
+		end, err = strconv.ParseInt(values[1], 10, 64)
+		if err != nil || end < start {
+			return 0, 0, false, false
+		}
+		if end >= size {
+			end = size - 1
+		}
+	}
+	return start, end - start + 1, true, true
 }

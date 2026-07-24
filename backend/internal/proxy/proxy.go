@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -211,6 +212,18 @@ func (p *Proxy) ServeStream(w http.ResponseWriter, r *http.Request, driveID, fil
 		http.Error(w, errDriveNotFound.Error(), errDriveNotFound.Code)
 		return
 	}
+	if plaintext, ok := d.(drives.PlaintextRangeProvider); ok {
+		if err := p.servePlaintext(w, r, plaintext, fileID); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			p.reportStreamResult(driveID, err)
+			writeStreamError(w, d.Kind(), err)
+			return
+		}
+		p.reportStreamResult(driveID, nil)
+		return
+	}
 
 	link, err := p.getLink(r.Context(), d, driveID, fileID, r.Header)
 	if err != nil {
@@ -245,6 +258,49 @@ func (p *Proxy) ServeStream(w http.ResponseWriter, r *http.Request, driveID, fil
 		return
 	}
 	p.reportStreamResult(driveID, nil)
+}
+
+func (p *Proxy) servePlaintext(w http.ResponseWriter, r *http.Request, source drives.PlaintextRangeProvider, fileID string) error {
+	size, err := source.PlaintextSize(r.Context(), fileID)
+	if err != nil {
+		return err
+	}
+	start, length, partial, valid := drives.ParseSingleByteRange(r.Header.Get("Range"), size)
+	if !valid {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return nil
+	}
+	var body io.ReadCloser
+	if r.Method != http.MethodHead && length > 0 {
+		body, err = source.OpenPlaintextRange(r.Context(), fileID, start, length)
+		if err != nil {
+			return err
+		}
+		defer body.Close()
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	contentType := "application/octet-stream"
+	if typed, ok := source.(interface{ PlaintextContentType(string) string }); ok {
+		if candidate := typed.PlaintextContentType(fileID); candidate != "" {
+			contentType = candidate
+		}
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	if partial {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		w.WriteHeader(http.StatusOK)
+	}
+	if body == nil {
+		return nil
+	}
+	_, err = io.Copy(w, body)
+	return err
 }
 
 func (p *Proxy) reportStreamResult(driveID string, err error) {
@@ -336,8 +392,22 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, link *drives.Strea
 	}
 
 	client := p.http
+	if link.HTTPClient != nil {
+		client = link.HTTPClient
+	}
 	if link.PassThroughRedirects && !forceRelay {
-		client = p.relay
+		// A per-drive proxy still needs to be honoured when relaying a provider
+		// redirect. The standard client follows redirects, so clone only this
+		// small behavior difference.
+		if link.HTTPClient != nil {
+			clone := *link.HTTPClient
+			clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			client = &clone
+		} else {
+			client = p.relay
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {

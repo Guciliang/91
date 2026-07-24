@@ -284,5 +284,5 @@ export function DriveForm({
 }
 
 function isSecretCredential(key: string): boolean {
-  return /password|token|secret/i.test(key);
+  return /password|salt|token|secret/i.test(key);
 }

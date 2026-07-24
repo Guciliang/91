@@ -234,6 +234,9 @@ func Compute(ctx context.Context, drv drives.Drive, v *catalog.Video, cfg Config
 	if hc == nil {
 		hc = streamhttp.NewClient(0)
 	}
+	if plaintext, ok := drv.(drives.PlaintextRangeProvider); ok {
+		return computePlaintext(ctx, plaintext, v, cfg)
+	}
 	link, err := drv.StreamURL(ctx, v.FileID)
 	if err != nil {
 		return "", fmt.Errorf("fingerprint: stream url: %w", err)
@@ -266,6 +269,33 @@ func Compute(ctx context.Context, drv drives.Drive, v *catalog.Video, cfg Config
 		}
 		if int64(len(data)) != r.length {
 			return "", fmt.Errorf("fingerprint: short sample at %d: got %d want %d", r.start, len(data), r.length)
+		}
+		_, _ = h.Write([]byte(fmt.Sprintf("offset=%d length=%d\n", r.start, r.length)))
+		_, _ = h.Write(data)
+		_, _ = h.Write([]byte("\n"))
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func computePlaintext(ctx context.Context, source drives.PlaintextRangeProvider, v *catalog.Video, cfg Config) (string, error) {
+	ranges := sampleRanges(v.Size, cfg.SampleSizeBytes, cfg.FullHashMaxSize)
+	h := sha256.New()
+	writeHashHeader(h, v.Size, ranges)
+	for _, r := range ranges {
+		body, err := source.OpenPlaintextRange(ctx, v.FileID, r.start, r.length)
+		if err != nil {
+			return "", fmt.Errorf("fingerprint: open plaintext sample: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(body, r.length+1))
+		closeErr := body.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("fingerprint: read plaintext sample: %w", readErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("fingerprint: close plaintext sample: %w", closeErr)
+		}
+		if int64(len(data)) != r.length {
+			return "", fmt.Errorf("fingerprint: short plaintext sample at %d: got %d want %d", r.start, len(data), r.length)
 		}
 		_, _ = h.Write([]byte(fmt.Sprintf("offset=%d length=%d\n", r.start, r.length)))
 		_, _ = h.Write(data)
@@ -407,6 +437,9 @@ func readHTTPRange(ctx context.Context, hc *http.Client, link *drives.StreamLink
 		}
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.start, end))
+	if link.HTTPClient != nil {
+		hc = link.HTTPClient
+	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fingerprint: read remote sample: %w", err)

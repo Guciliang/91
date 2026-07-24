@@ -197,6 +197,73 @@ export function credentialFields(kind: Kind): CredentialField[] {
           multiline: true,
           required: true,
         },
+        {
+          key: "proxy_url",
+          label: "代理地址(可选)",
+          placeholder: "http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+        },
+        {
+          key: "crypt_enabled",
+          label: "启用 Crypt",
+          placeholder: "",
+          type: "select",
+          defaultValue: "false",
+          options: [
+            { value: "false", label: "关闭" },
+            { value: "true", label: "开启" },
+          ],
+        },
+        {
+          key: "crypt_password",
+          label: "Crypt 密码",
+          placeholder: "与 OpenList / rclone Crypt 保持一致",
+        },
+        {
+          key: "crypt_salt",
+          label: "Crypt 盐(可选)",
+          placeholder: "与 OpenList / rclone Crypt 保持一致",
+        },
+        {
+          key: "crypt_filename_encryption",
+          label: "文件名加密",
+          placeholder: "",
+          type: "select",
+          defaultValue: "standard",
+          options: [
+            { value: "standard", label: "标准" },
+            { value: "obfuscate", label: "混淆" },
+            { value: "off", label: "关闭" },
+          ],
+        },
+        {
+          key: "crypt_directory_name_encryption",
+          label: "目录名加密",
+          placeholder: "",
+          type: "select",
+          defaultValue: "true",
+          options: [
+            { value: "true", label: "开启" },
+            { value: "false", label: "关闭" },
+          ],
+        },
+        {
+          key: "crypt_filename_encoding",
+          label: "文件名编码",
+          placeholder: "",
+          type: "select",
+          defaultValue: "base64",
+          options: [
+            { value: "base64", label: "base64" },
+            { value: "base32", label: "base32" },
+            { value: "base32768", label: "base32768" },
+          ],
+        },
+        {
+          key: "crypt_suffix",
+          label: "加密文件后缀",
+          placeholder: ".bin",
+          defaultValue: ".bin",
+        },
       ];
     case "p115":
       return [

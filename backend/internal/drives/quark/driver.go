@@ -2,10 +2,18 @@ package quark
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -31,6 +39,9 @@ type Driver struct {
 	apiBase               string
 	pr                    string
 	client                *resty.Client
+	streamHTTPClient      *http.Client
+	proxyErr              error
+	uploadTempDir         string
 	onCookieUpdate        func(string)
 	useTranscodingAddress bool
 }
@@ -39,7 +50,9 @@ type Config struct {
 	ID                    string
 	Cookie                string
 	RootID                string
-	UseTranscodingAddress bool // 开启后对视频文件返回转码直链（支持 302），但可能画质不一致
+	UseTranscodingAddress bool   // 开启后对视频文件返回转码直链（支持 302），但可能画质不一致
+	ProxyURL              string // HTTP(S) / SOCKS5 代理，仅用于此夸克盘
+	UploadTempDir         string
 	OnCookieUpdate        func(cookie string)
 }
 
@@ -56,6 +69,7 @@ func New(c Config) *Driver {
 		referer:               defaultReferer,
 		apiBase:               defaultAPI,
 		pr:                    defaultPR,
+		uploadTempDir:         c.UploadTempDir,
 		useTranscodingAddress: c.UseTranscodingAddress,
 		onCookieUpdate:        c.OnCookieUpdate,
 	}
@@ -64,6 +78,14 @@ func New(c Config) *Driver {
 		SetHeader("Accept", "application/json, text/plain, */*").
 		SetHeader("Referer", d.referer).
 		SetHeader("User-Agent", d.ua)
+	if transport, err := transportForProxy(c.ProxyURL); err != nil {
+		// Init returns this sanitized error before contacting Quark. Keeping New
+		// non-failing preserves the driver construction contract used elsewhere.
+		d.proxyErr = err
+	} else if transport != nil {
+		d.client.SetTransport(transport)
+		d.streamHTTPClient = &http.Client{Transport: transport}
+	}
 	return d
 }
 
@@ -122,6 +144,9 @@ func (d *Driver) request(ctx context.Context, path, method string, query map[str
 }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return d.proxyErr
+	}
 	return d.request(ctx, "/config", http.MethodGet, nil, nil, nil)
 }
 
@@ -202,9 +227,10 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 	headers.Set("Cookie", d.cookie)
 
 	return &drives.StreamLink{
-		URL:     r.Data[0].DownloadUrl,
-		Headers: headers,
-		Expires: time.Now().Add(10 * time.Minute),
+		URL:        r.Data[0].DownloadUrl,
+		Headers:    headers,
+		Expires:    time.Now().Add(10 * time.Minute),
+		HTTPClient: d.streamHTTPClient,
 	}, nil
 }
 
@@ -263,10 +289,365 @@ func (d *Driver) findChildDir(ctx context.Context, parent, name string) (string,
 	return "", nil
 }
 
-// ---------- 上传（第一版不实现，走本地预览视频兜底） ----------
+// ---------- 上传 ----------
+
+// UploadResult is returned to callers that persist a source-content
+// fingerprint, such as the crawler migration worker.
+type UploadResult struct {
+	FileID string
+	SHA1   string
+	Size   int64
+}
+
+type uploadPreResp struct {
+	Data struct {
+		TaskID    string          `json:"task_id"`
+		UploadID  string          `json:"upload_id"`
+		ObjKey    string          `json:"obj_key"`
+		UploadURL string          `json:"upload_url"`
+		FID       string          `json:"fid"`
+		Bucket    string          `json:"bucket"`
+		Callback  json.RawMessage `json:"callback"`
+		AuthInfo  string          `json:"auth_info"`
+	} `json:"data"`
+	Metadata struct {
+		PartSize int64 `json:"part_size"`
+	} `json:"metadata"`
+}
+
+type uploadHashResp struct {
+	Data struct {
+		Finish bool   `json:"finish"`
+		FID    string `json:"fid"`
+	} `json:"data"`
+}
+
+type uploadAuthResp struct {
+	Data struct {
+		AuthKey string `json:"auth_key"`
+	} `json:"data"`
+}
 
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
-	return "", drives.ErrNotSupported
+	result, err := d.upload(ctx, parentID, name, r, size)
+	if err != nil {
+		return "", err
+	}
+	return result.FileID, nil
+}
+
+// UploadAndReportSHA1 reports the hash of the supplied data, rather than the
+// transport bytes, which keeps crawler deduplication stable with Crypt.
+func (d *Driver) UploadAndReportSHA1(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	return d.upload(ctx, parentID, name, r, size)
+}
+
+func (d *Driver) upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	if strings.TrimSpace(parentID) == "" {
+		return UploadResult{}, errors.New("quark upload: empty parent id")
+	}
+	if strings.TrimSpace(name) == "" {
+		return UploadResult{}, errors.New("quark upload: empty file name")
+	}
+	if r == nil {
+		return UploadResult{}, errors.New("quark upload: empty reader")
+	}
+
+	tmp, md5Hex, sha1Hex, written, err := d.cacheUpload(r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+	}()
+
+	pre, err := d.uploadPre(ctx, parentID, name, written)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	finished, finishedID, err := d.uploadHash(ctx, md5Hex, sha1Hex, pre.Data.TaskID)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	if finished {
+		fileID := firstNonEmpty(finishedID, pre.Data.FID)
+		if fileID == "" {
+			fileID, err = d.findUploadedFile(ctx, parentID, name)
+			if err != nil {
+				return UploadResult{}, err
+			}
+		}
+		return UploadResult{FileID: fileID, SHA1: sha1Hex, Size: written}, nil
+	}
+	if pre.Metadata.PartSize <= 0 || pre.Data.UploadID == "" || pre.Data.ObjKey == "" || pre.Data.Bucket == "" || pre.Data.UploadURL == "" {
+		return UploadResult{}, errors.New("quark upload: invalid multipart task")
+	}
+
+	partCount := int((written + pre.Metadata.PartSize - 1) / pre.Metadata.PartSize)
+	etags := make([]string, 0, partCount)
+	for index := 0; index < partCount; index++ {
+		if err := ctx.Err(); err != nil {
+			return UploadResult{}, err
+		}
+		offset := int64(index) * pre.Metadata.PartSize
+		length := minInt64(pre.Metadata.PartSize, written-offset)
+		etag, err := d.uploadPart(ctx, pre, guessMime(name), index+1, io.NewSectionReader(tmp, offset, length))
+		if err != nil {
+			return UploadResult{}, err
+		}
+		etags = append(etags, etag)
+	}
+	if err := d.uploadCommit(ctx, pre, etags); err != nil {
+		return UploadResult{}, err
+	}
+	if err := d.uploadFinish(ctx, pre); err != nil {
+		return UploadResult{}, err
+	}
+	fileID := pre.Data.FID
+	if fileID == "" {
+		fileID, err = d.findUploadedFile(ctx, parentID, name)
+		if err != nil {
+			return UploadResult{}, err
+		}
+	}
+	return UploadResult{FileID: fileID, SHA1: sha1Hex, Size: written}, nil
+}
+
+func (d *Driver) cacheUpload(r io.Reader, expectedSize int64) (*os.File, string, string, int64, error) {
+	dir := d.uploadTempDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, "", "", 0, fmt.Errorf("quark upload: create temp dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, "quark-upload-*")
+	if err != nil {
+		return nil, "", "", 0, fmt.Errorf("quark upload: create temp file: %w", err)
+	}
+	cleanup := func(err error) (*os.File, string, string, int64, error) {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, "", "", 0, err
+	}
+	md5Hash, sha1Hash := md5.New(), sha1.New()
+	written, err := io.Copy(io.MultiWriter(tmp, md5Hash, sha1Hash), r)
+	if err != nil {
+		return cleanup(fmt.Errorf("quark upload: cache source: %w", err))
+	}
+	if expectedSize >= 0 && expectedSize != written {
+		return cleanup(fmt.Errorf("quark upload: source size changed: got %d want %d", written, expectedSize))
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return cleanup(fmt.Errorf("quark upload: rewind source: %w", err))
+	}
+	return tmp, hex.EncodeToString(md5Hash.Sum(nil)), hex.EncodeToString(sha1Hash.Sum(nil)), written, nil
+}
+
+func (d *Driver) uploadPre(ctx context.Context, parentID, name string, size int64) (uploadPreResp, error) {
+	now := time.Now().UnixMilli()
+	var out uploadPreResp
+	err := d.request(ctx, "/file/upload/pre", http.MethodPost, nil, map[string]any{
+		"ccp_hash_update": true, "dir_name": "", "file_name": name,
+		"format_type": guessMime(name), "l_created_at": now, "l_updated_at": now,
+		"pdir_fid": parentID, "size": size,
+	}, &out)
+	return out, err
+}
+
+func (d *Driver) uploadHash(ctx context.Context, md5Hex, sha1Hex, taskID string) (bool, string, error) {
+	var out uploadHashResp
+	err := d.request(ctx, "/file/update/hash", http.MethodPost, nil, map[string]string{
+		"md5": md5Hex, "sha1": sha1Hex, "task_id": taskID,
+	}, &out)
+	return out.Data.Finish, out.Data.FID, err
+}
+
+func (d *Driver) uploadPart(ctx context.Context, pre uploadPreResp, mimeType string, number int, body io.Reader) (string, error) {
+	now := time.Now().UTC().Format(http.TimeFormat)
+	authMeta := fmt.Sprintf("PUT\n\n%s\n%s\nx-oss-date:%s\nx-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit\n/%s/%s?partNumber=%d&uploadId=%s", mimeType, now, now, pre.Data.Bucket, pre.Data.ObjKey, number, pre.Data.UploadID)
+	var auth uploadAuthResp
+	if err := d.request(ctx, "/file/upload/auth", http.MethodPost, nil, map[string]string{
+		"auth_info": pre.Data.AuthInfo, "auth_meta": authMeta, "task_id": pre.Data.TaskID,
+	}, &auth); err != nil {
+		return "", err
+	}
+	u, err := ossURL(pre)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	q.Set("partNumber", strconv.Itoa(number))
+	q.Set("uploadId", pre.Data.UploadID)
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), body)
+	if err != nil {
+		return "", fmt.Errorf("quark upload: build part request: %w", err)
+	}
+	req.Header.Set("Authorization", auth.Data.AuthKey)
+	req.Header.Set("Content-Type", mimeType)
+	req.Header.Set("Referer", d.referer+"/")
+	req.Header.Set("x-oss-date", now)
+	req.Header.Set("x-oss-user-agent", "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit")
+	resp, err := d.uploadHTTPClient().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("quark upload: send part: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("quark upload: part returned HTTP %d", resp.StatusCode)
+	}
+	etag := strings.TrimSpace(resp.Header.Get("Etag"))
+	if etag == "" {
+		return "", errors.New("quark upload: part response has no etag")
+	}
+	return etag, nil
+}
+
+type completeMultipartUpload struct {
+	XMLName xml.Name                `xml:"CompleteMultipartUpload"`
+	Parts   []completeMultipartPart `xml:"Part"`
+}
+
+type completeMultipartPart struct {
+	Number int    `xml:"PartNumber"`
+	ETag   string `xml:"ETag"`
+}
+
+func (d *Driver) uploadCommit(ctx context.Context, pre uploadPreResp, etags []string) error {
+	parts := make([]completeMultipartPart, 0, len(etags))
+	for index, etag := range etags {
+		parts = append(parts, completeMultipartPart{Number: index + 1, ETag: etag})
+	}
+	body, err := xml.Marshal(completeMultipartUpload{Parts: parts})
+	if err != nil {
+		return fmt.Errorf("quark upload: encode complete request: %w", err)
+	}
+	body = append([]byte(xml.Header), body...)
+	sum := md5.Sum(body)
+	contentMD5 := base64.StdEncoding.EncodeToString(sum[:])
+	callback := base64.StdEncoding.EncodeToString(pre.Data.Callback)
+	now := time.Now().UTC().Format(http.TimeFormat)
+	authMeta := fmt.Sprintf("POST\n%s\napplication/xml\n%s\nx-oss-callback:%s\nx-oss-date:%s\nx-oss-user-agent:aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit\n/%s/%s?uploadId=%s", contentMD5, now, callback, now, pre.Data.Bucket, pre.Data.ObjKey, pre.Data.UploadID)
+	var auth uploadAuthResp
+	if err := d.request(ctx, "/file/upload/auth", http.MethodPost, nil, map[string]string{
+		"auth_info": pre.Data.AuthInfo, "auth_meta": authMeta, "task_id": pre.Data.TaskID,
+	}, &auth); err != nil {
+		return err
+	}
+	u, err := ossURL(pre)
+	if err != nil {
+		return err
+	}
+	q := u.Query()
+	q.Set("uploadId", pre.Data.UploadID)
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("quark upload: build commit request: %w", err)
+	}
+	req.Header.Set("Authorization", auth.Data.AuthKey)
+	req.Header.Set("Content-MD5", contentMD5)
+	req.Header.Set("Content-Type", "application/xml")
+	req.Header.Set("Referer", d.referer+"/")
+	req.Header.Set("x-oss-callback", callback)
+	req.Header.Set("x-oss-date", now)
+	req.Header.Set("x-oss-user-agent", "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit")
+	resp, err := d.uploadHTTPClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("quark upload: commit parts: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("quark upload: commit returned HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (d *Driver) uploadFinish(ctx context.Context, pre uploadPreResp) error {
+	return d.request(ctx, "/file/upload/finish", http.MethodPost, nil, map[string]string{
+		"obj_key": pre.Data.ObjKey, "task_id": pre.Data.TaskID,
+	}, nil)
+}
+
+func (d *Driver) findUploadedFile(ctx context.Context, parentID, name string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		entries, err := d.List(ctx, parentID)
+		if err != nil {
+			lastErr = err
+		} else {
+			for _, entry := range entries {
+				if !entry.IsDir && entry.Name == name {
+					return entry.ID, nil
+				}
+			}
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
+	}
+	if lastErr != nil {
+		return "", fmt.Errorf("quark upload: look up completed file: %w", lastErr)
+	}
+	return "", errors.New("quark upload: completed file was not returned by provider")
+}
+
+func (d *Driver) uploadHTTPClient() *http.Client {
+	if d.streamHTTPClient != nil {
+		return d.streamHTTPClient
+	}
+	return http.DefaultClient
+}
+
+func ossURL(pre uploadPreResp) (*url.URL, error) {
+	u, err := url.Parse(pre.Data.UploadURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, errors.New("quark upload: invalid OSS endpoint")
+	}
+	if !strings.HasPrefix(u.Host, pre.Data.Bucket+".") {
+		u.Host = pre.Data.Bucket + "." + u.Host
+	}
+	u.Path = "/" + strings.TrimLeft(pre.Data.ObjKey, "/")
+	return u, nil
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
+	fileID = strings.TrimSpace(fileID)
+	newName = strings.TrimSpace(newName)
+	if fileID == "" {
+		return errors.New("quark rename: empty file id")
+	}
+	if newName == "" {
+		return errors.New("quark rename: empty file name")
+	}
+	if err := d.request(ctx, "/file/rename", http.MethodPost, nil, map[string]string{
+		"fid": fileID, "file_name": newName,
+	}, nil); err != nil {
+		return fmt.Errorf("quark rename: %w", err)
+	}
+	return nil
 }
 
 func (d *Driver) Remove(ctx context.Context, fileID string) error {

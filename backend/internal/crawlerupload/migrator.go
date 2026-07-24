@@ -34,6 +34,7 @@ import (
 	"github.com/video-site/backend/internal/drives/p115"
 	"github.com/video-site/backend/internal/drives/p123"
 	"github.com/video-site/backend/internal/drives/pikpak"
+	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/drives/webdav"
 	"github.com/video-site/backend/internal/drives/wopan"
@@ -266,6 +267,36 @@ type webdavAdapter struct {
 	d *webdav.Driver
 }
 
+type quarkUploadDriver interface {
+	ID() string
+	Kind() string
+	RootID() string
+	EnsureDir(ctx context.Context, pathFromRoot string) (string, error)
+	UploadAndReportSHA1(ctx context.Context, parentID, name string, r io.Reader, size int64) (quark.UploadResult, error)
+	Rename(ctx context.Context, fileID, newName string) error
+}
+
+type quarkAdapter struct {
+	d quarkUploadDriver
+}
+
+func (a *quarkAdapter) ID() string     { return a.d.ID() }
+func (a *quarkAdapter) Kind() string   { return a.d.Kind() }
+func (a *quarkAdapter) RootID() string { return a.d.RootID() }
+func (a *quarkAdapter) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	return a.d.EnsureDir(ctx, pathFromRoot)
+}
+func (a *quarkAdapter) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	result, err := a.d.UploadAndReportSHA1(ctx, parentID, name, r, size)
+	if err != nil {
+		return UploadResult{}, err
+	}
+	return UploadResult{FileID: result.FileID, Hash: result.SHA1, Size: result.Size}, nil
+}
+func (a *quarkAdapter) Rename(ctx context.Context, fileID, newName string) error {
+	return a.d.Rename(ctx, fileID, newName)
+}
+
 func (a *webdavAdapter) ID() string     { return a.d.ID() }
 func (a *webdavAdapter) Kind() string   { return a.d.Kind() }
 func (a *webdavAdapter) RootID() string { return a.d.RootID() }
@@ -303,6 +334,10 @@ func adaptUploadTarget(d drives.Drive) (uploadTarget, error) {
 		return &guangyapanAdapter{d: v}, nil
 	case *webdav.Driver:
 		return &webdavAdapter{d: v}, nil
+	case *quark.Driver:
+		return &quarkAdapter{d: v}, nil
+	case *quark.CryptDriver:
+		return &quarkAdapter{d: v}, nil
 	case uploadTarget:
 		// 测试或自定义实现可以直接传入；优先使用具体类型分支以拿到适配器。
 		return v, nil
