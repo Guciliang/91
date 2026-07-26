@@ -989,9 +989,10 @@ func TestHandleUpsertWebDAVMergesCredentials(t *testing.T) {
 		Name:   "WebDAV",
 		RootID: "/media",
 		Credentials: map[string]string{
-			"base_url": "https://openlist.example.com/dav",
-			"username": "existing-user",
-			"password": "existing-password",
+			"base_url":                "https://openlist.example.com/dav",
+			"username":                "existing-user",
+			"password":                "existing-password",
+			"strm_allow_outside_root": "false",
 		},
 		Status: "ok",
 	}); err != nil {
@@ -1006,7 +1007,8 @@ func TestHandleUpsertWebDAVMergesCredentials(t *testing.T) {
 		"credentials": {
 			"base_url": "",
 			"username": "updated-user",
-			"password": ""
+			"password": "",
+			"strm_allow_outside_root": "true"
 		}
 	}`))
 	rr := httptest.NewRecorder()
@@ -1028,8 +1030,36 @@ func TestHandleUpsertWebDAVMergesCredentials(t *testing.T) {
 	if got.Credentials["password"] != "existing-password" {
 		t.Fatalf("password = %q, want preserved", got.Credentials["password"])
 	}
+	if got.Credentials["strm_allow_outside_root"] != "true" {
+		t.Fatalf("strm_allow_outside_root = %q, want true", got.Credentials["strm_allow_outside_root"])
+	}
 	if !isCrawlerUploadTargetKind(got.Kind) {
 		t.Fatalf("kind %q should be a crawler upload target", got.Kind)
+	}
+}
+
+func TestSTRMAllowOutsideRootForDriveSupportsWebDAV(t *testing.T) {
+	tests := []struct {
+		name    string
+		drive   *catalog.Drive
+		present bool
+		want    bool
+	}{
+		{name: "webdav default", drive: &catalog.Drive{Kind: "webdav"}, present: true},
+		{name: "webdav enabled", drive: &catalog.Drive{Kind: "webdav", Credentials: map[string]string{"strm_allow_outside_root": "true"}}, present: true, want: true},
+		{name: "localstorage enabled", drive: &catalog.Drive{Kind: "localstorage", Credentials: map[string]string{"strm_allow_outside_root": "true"}}, present: true, want: true},
+		{name: "other drive", drive: &catalog.Drive{Kind: "onedrive"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := strmAllowOutsideRootForDrive(tt.drive)
+			if (got != nil) != tt.present {
+				t.Fatalf("result = %v, present = %v, want present = %v", got, got != nil, tt.present)
+			}
+			if got != nil && *got != tt.want {
+				t.Fatalf("result = %v, want %v", *got, tt.want)
+			}
+		})
 	}
 }
 

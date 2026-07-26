@@ -57,7 +57,7 @@ func (a *AdminServer) handleListDrives(w http.ResponseWriter, r *http.Request) {
 		// catalog.Drive 保持一致。
 		SkipDirIDs  []string `json:"skipDirIds"`
 		LastCrawlAt int64    `json:"lastCrawlAt,omitempty"`
-		// STRMAllowOutsideRoot 是 localstorage 的 .strm 越root开关；其它 kind 省略。
+		// STRMAllowOutsideRoot 是 localstorage 和 WebDAV 的 .strm 越root开关；其它 kind 省略。
 		STRMAllowOutsideRoot          *bool            `json:"strmAllowOutsideRoot,omitempty"`
 		ScanGenerationStatus          GenerationStatus `json:"scanGenerationStatus"`
 		ThumbnailGenerationStatus     GenerationStatus `json:"thumbnailGenerationStatus"`

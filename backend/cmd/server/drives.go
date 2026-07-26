@@ -256,12 +256,13 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 		})
 	case webdav.Kind:
 		drv = webdav.New(webdav.Config{
-			ID:       d.ID,
-			BaseURL:  d.Credentials["base_url"],
-			Username: d.Credentials["username"],
-			Password: d.Credentials["password"],
-			RootID:   d.RootID,
-			ProxyURL: d.Credentials["proxy_url"],
+			ID:                   d.ID,
+			BaseURL:              d.Credentials["base_url"],
+			Username:             d.Credentials["username"],
+			Password:             d.Credentials["password"],
+			RootID:               d.RootID,
+			ProxyURL:             d.Credentials["proxy_url"],
+			STRMAllowOutsideRoot: parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false),
 		})
 	case localstorage.Kind:
 		drv = localstorage.New(localstorage.Config{

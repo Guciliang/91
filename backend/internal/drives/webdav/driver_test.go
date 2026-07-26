@@ -162,6 +162,74 @@ func TestDriverResolvesHTTPSTRMWithoutForwardingWebDAVCredentials(t *testing.T) 
 	}
 }
 
+func TestDriverResolvesWebDAVSTRMPaths(t *testing.T) {
+	dav := newTestDAV(t)
+	dav.addDir("/library")
+	dav.addDir("/library/shows")
+	dav.addDir("/archive")
+	dav.addFile("/library/shows/movie.strm", []byte("../movie.mp4\n"))
+	dav.addFile("/library/movie.mp4", []byte("in-root"))
+	dav.addFile("/library/shows/outside.strm", []byte("/archive/movie.mp4\n"))
+	dav.addFile("/archive/movie.mp4", []byte("outside-root"))
+	dav.addFile("/library/shows/nested.strm", []byte("inner.strm\n"))
+	dav.addFile("/library/shows/inner.strm", []byte("https://media.example/movie.mp4\n"))
+	server := httptest.NewServer(dav)
+	t.Cleanup(server.Close)
+
+	strict := New(Config{
+		ID:       "dav-main",
+		BaseURL:  server.URL + "/dav",
+		Username: testDAVUsername,
+		Password: testDAVPassword,
+		RootID:   "/library",
+	})
+	link, err := strict.StreamURL(context.Background(), "/library/shows/movie.strm")
+	if err != nil {
+		t.Fatalf("relative StreamURL: %v", err)
+	}
+	if got, want := link.URL, server.URL+"/dav/library/movie.mp4"; got != want {
+		t.Fatalf("relative URL = %q, want %q", got, want)
+	}
+	if got := link.Headers.Get("Authorization"); got == "" {
+		t.Fatal("WebDAV STRM path must keep WebDAV authorization")
+	}
+	request, err := http.NewRequest(http.MethodGet, link.URL, nil)
+	if err != nil {
+		t.Fatalf("new WebDAV STRM request: %v", err)
+	}
+	request.Header = link.Headers.Clone()
+	response, err := link.HTTPClient.Do(request)
+	if err != nil {
+		t.Fatalf("WebDAV STRM request: %v", err)
+	}
+	defer response.Body.Close()
+	if body, err := io.ReadAll(response.Body); err != nil || string(body) != "in-root" {
+		t.Fatalf("WebDAV STRM response = body %q err %v", body, err)
+	}
+	if _, err := strict.StreamURL(context.Background(), "/library/shows/outside.strm"); err == nil || !strings.Contains(err.Error(), "escapes configured root") {
+		t.Fatalf("strict outside-root error = %v", err)
+	}
+	if _, err := strict.StreamURL(context.Background(), "/library/shows/nested.strm"); err == nil || !strings.Contains(err.Error(), "nested strm") {
+		t.Fatalf("nested strm error = %v", err)
+	}
+
+	relaxed := New(Config{
+		ID:                   "dav-main",
+		BaseURL:              server.URL + "/dav",
+		Username:             testDAVUsername,
+		Password:             testDAVPassword,
+		RootID:               "/library",
+		STRMAllowOutsideRoot: true,
+	})
+	link, err = relaxed.StreamURL(context.Background(), "/library/shows/outside.strm")
+	if err != nil {
+		t.Fatalf("outside-root StreamURL: %v", err)
+	}
+	if got, want := link.URL, server.URL+"/dav/archive/movie.mp4"; got != want {
+		t.Fatalf("outside-root URL = %q, want %q", got, want)
+	}
+}
+
 func TestDriverRejectsInvalidSTRMTargets(t *testing.T) {
 	dav := newTestDAV(t)
 	dav.addDir("/library")

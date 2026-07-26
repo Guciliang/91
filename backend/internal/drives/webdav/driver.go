@@ -48,13 +48,17 @@ type Config struct {
 	Password string
 	RootID   string
 	ProxyURL string
+	// STRMAllowOutsideRoot allows a .strm file to reference another path on
+	// the configured WebDAV endpoint outside RootID. It is disabled by default.
+	STRMAllowOutsideRoot bool
 }
 
 type Driver struct {
-	id       string
-	rootID   string
-	username string
-	password string
+	id                   string
+	rootID               string
+	username             string
+	password             string
+	strmAllowOutsideRoot bool
 
 	baseURL   *url.URL
 	basePath  string
@@ -69,13 +73,14 @@ func New(c Config) *Driver {
 	baseURL, basePath, baseErr := parseBaseURL(c.BaseURL)
 	configErr := errors.Join(rootErr, baseErr)
 	d := &Driver{
-		id:        strings.TrimSpace(c.ID),
-		rootID:    rootID,
-		username:  strings.TrimSpace(c.Username),
-		password:  c.Password,
-		baseURL:   baseURL,
-		basePath:  basePath,
-		configErr: configErr,
+		id:                   strings.TrimSpace(c.ID),
+		rootID:               rootID,
+		username:             strings.TrimSpace(c.Username),
+		password:             c.Password,
+		strmAllowOutsideRoot: c.STRMAllowOutsideRoot,
+		baseURL:              baseURL,
+		basePath:             basePath,
+		configErr:            configErr,
 	}
 	metadata, err := newHTTPClient(metadataTimeout, c.ProxyURL)
 	if err != nil {
@@ -276,15 +281,62 @@ func (d *Driver) streamURLFromSTRM(ctx context.Context, fileID string) (*drives.
 		return nil, err
 	}
 	u, err := url.Parse(target)
-	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" {
-		return nil, errors.New("webdav: strm target must be an http or https URL")
+	if err != nil {
+		return nil, fmt.Errorf("webdav: parse strm target: %w", err)
 	}
+	if u.Scheme != "" || u.Host != "" {
+		if (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" {
+			return nil, errors.New("webdav: strm target must be an http or https URL or a WebDAV path")
+		}
+		// External links intentionally have no WebDAV headers, so Basic
+		// credentials cannot leak to the target origin.
+		return &drives.StreamLink{
+			URL:                  u.String(),
+			Expires:              time.Now().Add(24 * time.Hour),
+			PassThroughRedirects: true,
+			HTTPClient:           d.transfer,
+		}, nil
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("webdav: strm WebDAV path must not contain a query or fragment")
+	}
+	remotePath, err := d.strmRemotePath(fileID, u.Path)
+	if err != nil {
+		return nil, err
+	}
+	streamURL, err := d.urlForRemotePath(remotePath, false)
+	if err != nil {
+		return nil, err
+	}
+	headers := make(http.Header)
+	d.addRequestHeaders(headers)
+	headers.Set("Accept-Encoding", "identity")
 	return &drives.StreamLink{
-		URL:                  u.String(),
+		URL:                  streamURL,
+		Headers:              headers,
 		Expires:              time.Now().Add(24 * time.Hour),
 		PassThroughRedirects: true,
 		HTTPClient:           d.transfer,
 	}, nil
+}
+
+func (d *Driver) strmRemotePath(strmPath, target string) (string, error) {
+	if strings.HasPrefix(target, "/") {
+		strmPath = target
+	} else {
+		strmPath = path.Join(path.Dir(strmPath), target)
+	}
+	remotePath, err := normalizeRemotePath(strmPath)
+	if err != nil {
+		return "", err
+	}
+	if !d.strmAllowOutsideRoot && !pathWithinRoot(remotePath, d.rootID) {
+		return "", errors.New("webdav: strm target escapes configured root (enable strm_allow_outside_root to allow)")
+	}
+	if strings.EqualFold(path.Ext(remotePath), ".strm") {
+		return "", errors.New("webdav: nested strm target is not supported")
+	}
+	return remotePath, nil
 }
 
 func (d *Driver) readSTRMTarget(ctx context.Context, fileID string) (string, error) {
@@ -534,6 +586,15 @@ func (d *Driver) urlFor(remotePath string, directoryHint bool) (string, error) {
 	remotePath, err := d.resolveID(remotePath)
 	if err != nil {
 		return "", err
+	}
+	return d.urlForRemotePath(remotePath, directoryHint)
+}
+
+// urlForRemotePath builds an endpoint URL for an already normalized path. The
+// caller is responsible for applying any RootID restriction first.
+func (d *Driver) urlForRemotePath(remotePath string, directoryHint bool) (string, error) {
+	if d.configErr != nil {
+		return "", d.configErr
 	}
 	u := *d.baseURL
 	base := strings.TrimSuffix(d.basePath, "/")

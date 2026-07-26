@@ -219,7 +219,15 @@ test("webdav drive form asks for a standard endpoint and basic auth credentials"
   assert.match(fields, /placeholder: "https:\/\/openlist\.example\.com\/dav"/);
   assert.match(fields, /key: "username"/);
   assert.match(fields, /key: "password"/);
+  assert.match(fields, /key: "strm_allow_outside_root"/);
+  assert.match(fields, /label: "\.strm 允许指向 WebDAV 根目录外"/);
+  assert.match(fields, /type: "select"/);
+  assert.match(fields, /defaultValue: "false"/);
   assert.doesNotMatch(fields, /encrypt|crypt|302/i);
+  assert.match(
+    drivesPageSource,
+    /d\.kind === "localstorage" \|\| d\.kind === "webdav"/
+  );
 });
 
 test("pikpak drive form only exposes account login fields", () => {

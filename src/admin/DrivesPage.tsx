@@ -189,7 +189,7 @@ export function DrivesPage() {
     try {
       const result = await api.getDriveCredentials(d.id);
       const creds = { ...(result.credentials ?? {}) };
-      if (d.kind === "localstorage" && !("strm_allow_outside_root" in creds)) {
+      if ((d.kind === "localstorage" || d.kind === "webdav") && !("strm_allow_outside_root" in creds)) {
         creds.strm_allow_outside_root = (d.strmAllowOutsideRoot ?? false) ? "true" : "false";
       }
       const nextForm: FormState = {

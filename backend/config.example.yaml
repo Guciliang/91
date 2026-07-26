@@ -92,6 +92,9 @@ proxy:
 #     base_url: "https://example.com/dav"
 #     username: "..."
 #     password: "..."
+#     # 可选：允许 .strm 指向当前 WebDAV 根目录外的路径；仍限制在该 WebDAV 端点内。
+#     # 默认 false，防止 .strm 无意访问根目录外的文件。
+#     strm_allow_outside_root: false
 # 本地存储示例：
 # - id: "local-media"
 #   kind: "localstorage"

@@ -72,10 +72,10 @@ func (a *AdminServer) removeImportedCrawlerScript(d *catalog.Drive) (bool, error
 	return true, nil
 }
 
-// strmAllowOutsideRootForDrive 返回 localstorage 的 .strm 越root开关；
+// strmAllowOutsideRootForDrive 返回 localstorage 和 WebDAV 的 .strm 越root开关；
 // 其它 kind 返回 nil（JSON 省略）。未配置时默认 false。
 func strmAllowOutsideRootForDrive(d *catalog.Drive) *bool {
-	if d == nil || d.Kind != "localstorage" {
+	if d == nil || (d.Kind != "localstorage" && d.Kind != "webdav") {
 		return nil
 	}
 	result := false
