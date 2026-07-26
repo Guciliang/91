@@ -175,6 +175,7 @@ func TestDriverResolvesWebDAVSTRMPaths(t *testing.T) {
 	dav.addFile("/library/shows/inner.strm", []byte("https://media.example/movie.mp4\n"))
 	server := httptest.NewServer(dav)
 	t.Cleanup(server.Close)
+	dav.addFile("/library/shows/outside-http.strm", []byte(server.URL+"/dav/archive/movie.mp4\n"))
 
 	strict := New(Config{
 		ID:       "dav-main",
@@ -209,6 +210,9 @@ func TestDriverResolvesWebDAVSTRMPaths(t *testing.T) {
 	if _, err := strict.StreamURL(context.Background(), "/library/shows/outside.strm"); err == nil || !strings.Contains(err.Error(), "escapes configured root") {
 		t.Fatalf("strict outside-root error = %v", err)
 	}
+	if _, err := strict.StreamURL(context.Background(), "/library/shows/outside-http.strm"); err == nil || !strings.Contains(err.Error(), "escapes configured root") {
+		t.Fatalf("strict same-endpoint URL error = %v", err)
+	}
 	if _, err := strict.StreamURL(context.Background(), "/library/shows/nested.strm"); err == nil || !strings.Contains(err.Error(), "nested strm") {
 		t.Fatalf("nested strm error = %v", err)
 	}
@@ -227,6 +231,29 @@ func TestDriverResolvesWebDAVSTRMPaths(t *testing.T) {
 	}
 	if got, want := link.URL, server.URL+"/dav/archive/movie.mp4"; got != want {
 		t.Fatalf("outside-root URL = %q, want %q", got, want)
+	}
+	link, err = relaxed.StreamURL(context.Background(), "/library/shows/outside-http.strm")
+	if err != nil {
+		t.Fatalf("outside-root HTTP StreamURL: %v", err)
+	}
+	if got, want := link.URL, server.URL+"/dav/archive/movie.mp4"; got != want {
+		t.Fatalf("outside-root HTTP URL = %q, want %q", got, want)
+	}
+	if got := link.Headers.Get("Authorization"); got == "" {
+		t.Fatal("same-endpoint HTTP STRM path must keep WebDAV authorization")
+	}
+	request, err = http.NewRequest(http.MethodGet, link.URL, nil)
+	if err != nil {
+		t.Fatalf("new same-endpoint WebDAV STRM request: %v", err)
+	}
+	request.Header = link.Headers.Clone()
+	response, err = link.HTTPClient.Do(request)
+	if err != nil {
+		t.Fatalf("same-endpoint WebDAV STRM request: %v", err)
+	}
+	defer response.Body.Close()
+	if body, err := io.ReadAll(response.Body); err != nil || string(body) != "outside-root" {
+		t.Fatalf("same-endpoint WebDAV STRM response = body %q err %v", body, err)
 	}
 }
 

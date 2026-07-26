@@ -259,20 +259,7 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 	if strings.EqualFold(path.Ext(fileID), ".strm") {
 		return d.streamURLFromSTRM(ctx, fileID)
 	}
-	u, err := d.urlFor(fileID, false)
-	if err != nil {
-		return nil, err
-	}
-	headers := make(http.Header)
-	d.addRequestHeaders(headers)
-	headers.Set("Accept-Encoding", "identity")
-	return &drives.StreamLink{
-		URL:                  u,
-		Headers:              headers,
-		Expires:              time.Now().Add(24 * time.Hour),
-		PassThroughRedirects: true,
-		HTTPClient:           d.transfer,
-	}, nil
+	return d.streamLinkForRemotePath(fileID)
 }
 
 func (d *Driver) streamURLFromSTRM(ctx context.Context, fileID string) (*drives.StreamLink, error) {
@@ -285,6 +272,13 @@ func (d *Driver) streamURLFromSTRM(ctx context.Context, fileID string) (*drives.
 		return nil, fmt.Errorf("webdav: parse strm target: %w", err)
 	}
 	if u.Scheme != "" || u.Host != "" {
+		if endpointPath, ok := d.remotePathFromSTRMURL(u); ok {
+			remotePath, err := d.strmRemotePath(fileID, endpointPath)
+			if err != nil {
+				return nil, err
+			}
+			return d.streamLinkForRemotePath(remotePath)
+		}
 		if (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" {
 			return nil, errors.New("webdav: strm target must be an http or https URL or a WebDAV path")
 		}
@@ -304,20 +298,35 @@ func (d *Driver) streamURLFromSTRM(ctx context.Context, fileID string) (*drives.
 	if err != nil {
 		return nil, err
 	}
-	streamURL, err := d.urlForRemotePath(remotePath, false)
-	if err != nil {
-		return nil, err
+	return d.streamLinkForRemotePath(remotePath)
+}
+
+// remotePathFromSTRMURL recognizes a full URL that points back to this WebDAV
+// endpoint. Users commonly place that form in .strm files when the target is
+// outside the configured library root. Only an unadorned endpoint URL is
+// treated as WebDAV; signed URLs and other links remain external so credentials
+// cannot be sent to an unintended target.
+func (d *Driver) remotePathFromSTRMURL(target *url.URL) (string, bool) {
+	if target == nil || d.baseURL == nil || target.User != nil || target.RawQuery != "" || target.Fragment != "" ||
+		!strings.EqualFold(target.Scheme, d.baseURL.Scheme) || !strings.EqualFold(target.Host, d.baseURL.Host) {
+		return "", false
 	}
-	headers := make(http.Header)
-	d.addRequestHeaders(headers)
-	headers.Set("Accept-Encoding", "identity")
-	return &drives.StreamLink{
-		URL:                  streamURL,
-		Headers:              headers,
-		Expires:              time.Now().Add(24 * time.Hour),
-		PassThroughRedirects: true,
-		HTTPClient:           d.transfer,
-	}, nil
+
+	endpointPath := strings.TrimSuffix(d.basePath, "/")
+	if endpointPath == "" {
+		endpointPath = "/"
+	}
+	targetPath := path.Clean("/" + target.Path)
+	if endpointPath == "/" {
+		return targetPath, true
+	}
+	if targetPath == endpointPath {
+		return "/", true
+	}
+	if !strings.HasPrefix(targetPath, endpointPath+"/") {
+		return "", false
+	}
+	return strings.TrimPrefix(targetPath, endpointPath), true
 }
 
 func (d *Driver) strmRemotePath(strmPath, target string) (string, error) {
@@ -337,6 +346,23 @@ func (d *Driver) strmRemotePath(strmPath, target string) (string, error) {
 		return "", errors.New("webdav: nested strm target is not supported")
 	}
 	return remotePath, nil
+}
+
+func (d *Driver) streamLinkForRemotePath(remotePath string) (*drives.StreamLink, error) {
+	streamURL, err := d.urlForRemotePath(remotePath, false)
+	if err != nil {
+		return nil, err
+	}
+	headers := make(http.Header)
+	d.addRequestHeaders(headers)
+	headers.Set("Accept-Encoding", "identity")
+	return &drives.StreamLink{
+		URL:                  streamURL,
+		Headers:              headers,
+		Expires:              time.Now().Add(24 * time.Hour),
+		PassThroughRedirects: true,
+		HTTPClient:           d.transfer,
+	}, nil
 }
 
 func (d *Driver) readSTRMTarget(ctx context.Context, fileID string) (string, error) {

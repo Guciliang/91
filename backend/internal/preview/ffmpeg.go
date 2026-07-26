@@ -948,6 +948,13 @@ func startLocalFFmpegProxy(ctx context.Context, link *drives.StreamLink) (*drive
 	client := &http.Client{Timeout: 0}
 	if link.HTTPClient != nil {
 		client = link.HTTPClient
+		if link.PassThroughRedirects {
+			// Keep the per-drive transport (including an optional proxy), but use
+			// the normal streaming redirect policy for background media reads.
+			clone := *link.HTTPClient
+			clone.CheckRedirect = streamhttp.CheckRedirect
+			client = &clone
+		}
 	} else if link.PassThroughRedirects {
 		client = streamhttp.NewClient(0)
 	}

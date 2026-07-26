@@ -186,8 +186,8 @@ export type CredentialField = {
   defaultValue?: string;
 };
 
-function cloudSecurityFields(): CredentialField[] {
-  return [
+function cloudSecurityFields(cryptEnabled = false): CredentialField[] {
+  const fields: CredentialField[] = [
     {
       key: "proxy_url",
       label: "代理地址(可选)",
@@ -204,10 +204,17 @@ function cloudSecurityFields(): CredentialField[] {
         { value: "true", label: "开启" },
       ],
     },
+  ];
+
+  if (!cryptEnabled) return fields;
+
+  return [
+    ...fields,
     {
       key: "crypt_password",
       label: "Crypt 密码",
       placeholder: "与 OpenList / rclone Crypt 保持一致",
+      required: true,
     },
     {
       key: "crypt_salt",
@@ -258,7 +265,8 @@ function cloudSecurityFields(): CredentialField[] {
   ];
 }
 
-export function credentialFields(kind: Kind): CredentialField[] {
+export function credentialFields(kind: Kind, credentials: Record<string, string> = {}): CredentialField[] {
+	const cryptEnabled = ["1", "t", "true"].includes((credentials.crypt_enabled ?? "").toLowerCase());
 	const cloudBaseFields = (() => {
 		switch (kind) {
 			case "quark":
@@ -314,7 +322,7 @@ export function credentialFields(kind: Kind): CredentialField[] {
 				return undefined;
 		}
 	})();
-	if (cloudBaseFields) return [...cloudBaseFields, ...cloudSecurityFields()];
+	if (cloudBaseFields) return [...cloudBaseFields, ...cloudSecurityFields(cryptEnabled)];
 
   switch (kind) {
     case "quark":

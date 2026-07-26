@@ -47,7 +47,7 @@ export function DriveForm({
   onTypeSelected?: () => void;
 }) {
   const idPrefix = useId();
-  const fields = useMemo(() => credentialFields(form.kind), [form.kind]);
+  const fields = useMemo(() => credentialFields(form.kind, form.creds), [form.kind, form.creds]);
   const [step, setStep] = useState<"type" | "form">(isEdit ? "form" : "type");
   const nameId = `${idPrefix}-drive-name`;
   const rootId = `${idPrefix}-drive-root`;

@@ -226,7 +226,7 @@ test("webdav drive form asks for a standard endpoint and basic auth credentials"
   assert.doesNotMatch(fields, /encrypt|crypt|302/i);
   assert.match(
     constantsSource,
-    /if \(cloudBaseFields\) return \[\.\.\.cloudBaseFields, \.\.\.cloudSecurityFields\(\)\]/
+    /if \(cloudBaseFields\) return \[\.\.\.cloudBaseFields, \.\.\.cloudSecurityFields\(cryptEnabled\)\]/
   );
   assert.match(
     drivesPageSource,
@@ -303,7 +303,7 @@ test("quark drive form supports qr login and manual cookie fallback", () => {
 });
 
 test("cloud drive forms expose optional proxy and OpenList-compatible Crypt settings", () => {
-  assert.match(constantsSource, /function cloudSecurityFields\(\)/);
+  assert.match(constantsSource, /function cloudSecurityFields\(cryptEnabled = false\)/);
   assert.match(constantsSource, /key: "proxy_url"/);
   assert.match(constantsSource, /http:\/\/127\.0\.0\.1:7890/);
   assert.match(constantsSource, /socks5:\/\/127\.0\.0\.1:1080/);
@@ -325,9 +325,17 @@ test("cloud drive forms expose optional proxy and OpenList-compatible Crypt sett
   for (const kind of ["quark", "p115", "p123", "pikpak", "wopan", "guangyapan", "onedrive", "googledrive", "webdav"]) {
     assert.match(constantsSource, new RegExp(`case "${kind}":`));
   }
-  assert.doesNotMatch(constantsSource, /case "localstorage"[\s\S]*?cloudSecurityFields\(\)/);
+  assert.doesNotMatch(constantsSource, /case "localstorage"[\s\S]*?cloudSecurityFields\(cryptEnabled\)/);
   assert.match(driveFormSource, /password\|salt\|token\|secret/i);
   assert.match(driveFormSource, /<PasswordInput[\s\S]*?required=\{f\.required && !isEdit\}/);
+});
+
+test("Crypt detail fields are rendered and validated only after Crypt is enabled", () => {
+  assert.match(constantsSource, /const cryptEnabled = \["1", "t", "true"\]\.includes\(\(credentials\.crypt_enabled \?\? ""\)\.toLowerCase\(\)\)/);
+  assert.match(constantsSource, /if \(!cryptEnabled\) return fields;/);
+  assert.match(constantsSource, /key: "crypt_password"[\s\S]*?required: true/);
+  assert.match(driveFormSource, /credentialFields\(form\.kind, form\.creds\)/);
+  assert.match(drivesPageSource, /credentialFields\(form\.kind, form\.creds\)\.find/);
 });
 
 test("quark is available as a crawler upload target", () => {
@@ -458,7 +466,7 @@ test("drive form required fields use save-time prompts instead of label stars", 
   assert.match(drivesPageSource, /if \(!name\) \{[\s\S]*show\("请填写网盘名称", "error"\)/);
   assert.match(
     drivesPageSource,
-    /credentialFields\(form\.kind\)\.find\([\s\S]*field\.required[\s\S]*show\(`请填写\$\{missingField\.label\}`, "error"\)/
+    /credentialFields\(form\.kind, form\.creds\)\.find\([\s\S]*field\.required[\s\S]*show\(`请填写\$\{missingField\.label\}`, "error"\)/
   );
 });
 

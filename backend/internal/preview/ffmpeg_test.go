@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/streamhttp"
 )
 
 func TestNewDefaultsToThreeSecondTeaserSegments(t *testing.T) {
@@ -317,6 +318,7 @@ func TestPrepareFFmpegLinkDoesNotLeakWebDAVCredentialsToRedirectTarget(t *testin
 			"User-Agent":          {"video-site-webdav"},
 		},
 		PassThroughRedirects: true,
+		HTTPClient:           streamhttp.NewNoRedirectClient(0),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

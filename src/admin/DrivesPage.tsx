@@ -251,7 +251,7 @@ export function DrivesPage() {
           return;
         }
       }
-      const missingField = credentialFields(form.kind).find(
+      const missingField = credentialFields(form.kind, form.creds).find(
         (field) =>
           field.required &&
           !((form.creds[field.key] ?? field.defaultValue ?? "").trim())
