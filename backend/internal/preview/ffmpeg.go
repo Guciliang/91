@@ -1917,12 +1917,25 @@ func (w *Worker) generateTeaser(ctx context.Context, v *catalog.Video, link *dri
 
 func (w *Worker) generateTeaserFromOriginal(ctx context.Context, v *catalog.Video, link *drives.StreamLink, duration float64) (string, error) {
 	gen, ok := w.Gen.(refreshingTeaserGenerator)
-	if !ok || w.Drive == nil || w.Drive.Kind() != "p115" {
+	if !ok || w.Drive == nil || !shouldRefreshTeaserInputs(w.Drive, link) {
 		return w.Gen.Generate(ctx, link, duration)
 	}
 	return gen.GenerateWithLinkProvider(ctx, link, duration, func(ctx context.Context) (*drives.StreamLink, error) {
 		return w.Drive.StreamURL(ctx, v.FileID)
 	})
+}
+
+func shouldRefreshTeaserInputs(drive drives.Drive, link *drives.StreamLink) bool {
+	if drive == nil {
+		return false
+	}
+	if drive.Kind() == "p115" {
+		return true
+	}
+	// WebDAV sources which redirect to an upstream download URL can reject
+	// concurrent segment reads. Refreshing the .strm link per segment makes the
+	// generator fetch those redirects one at a time.
+	return drive.Kind() == "webdav" && link != nil && link.PassThroughRedirects
 }
 
 func preferredGenerationStreamLink(ctx context.Context, drive drives.Drive, fileID string) (*drives.StreamLink, bool, error) {

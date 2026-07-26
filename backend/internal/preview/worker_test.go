@@ -834,6 +834,28 @@ func TestPreviewWorkerRefreshesP115LinksPerTeaserInput(t *testing.T) {
 	}
 }
 
+func TestPreviewWorkerRefreshesRedirectingWebDAVLinksPerTeaserInput(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "preview-webdav-redirect-refresh")
+	video.DurationSeconds = 81
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeTeaserGenerator{}
+	drv := &previewFakeDrive{kind: "webdav", passThroughRedirects: true}
+	worker := NewWorker(gen, cat, drv)
+
+	worker.process(ctx, video)
+
+	if gen.refreshCalls != 3 {
+		t.Fatalf("refresh calls = %d, want 3 extra links for a four-input WebDAV teaser", gen.refreshCalls)
+	}
+	if drv.streamCalls != 4 {
+		t.Fatalf("stream calls = %d, want initial link plus 3 refreshed links", drv.streamCalls)
+	}
+}
+
 func seedPreviewTestVideo(t *testing.T, id string) (*catalog.Catalog, *catalog.Video) {
 	t.Helper()
 	ctx := context.Background()
@@ -954,12 +976,13 @@ func (g *fakeTeaserGenerator) MoveToLocal(_ string, videoID string) (string, err
 }
 
 type previewFakeDrive struct {
-	kind           string
-	streamFileID   string
-	streamCalls    int
-	streamErr      error
-	ensureDirCalls int
-	uploadCalls    int
+	kind                 string
+	streamFileID         string
+	streamCalls          int
+	streamErr            error
+	passThroughRedirects bool
+	ensureDirCalls       int
+	uploadCalls          int
 }
 
 type generationPreviewDrive struct {
@@ -1006,7 +1029,10 @@ func (d *previewFakeDrive) StreamURL(_ context.Context, fileID string) (*drives.
 	if d.streamErr != nil {
 		return nil, d.streamErr
 	}
-	return &drives.StreamLink{URL: "https://video.example/clip.mp4"}, nil
+	return &drives.StreamLink{
+		URL:                  "https://video.example/clip.mp4",
+		PassThroughRedirects: d.passThroughRedirects,
+	}, nil
 }
 func (d *previewFakeDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
 	d.uploadCalls++
