@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/video-site/backend/internal/drives"
 )
 
 func TestCryptDriverDecryptsNonZeroPlaintextRange(t *testing.T) {
@@ -770,6 +772,95 @@ func TestUploadUsesQuarkPreHashMultipartCommitAndFinish(t *testing.T) {
 	if got, want := strings.Join(calls, ","), "pre,hash,auth,part,auth,part,auth,part,auth,part,auth,commit,finish"; got != want {
 		t.Fatalf("calls = %s, want %s", got, want)
 	}
+}
+
+func TestCryptDriverWrapsAnyCloudDriveForDirectoriesAndUploads(t *testing.T) {
+	base := &genericCryptTestDrive{}
+	cryptDrive, err := NewCrypt(base, CryptConfig{
+		Password:                "generic password",
+		Salt:                    "generic salt",
+		FilenameEncryption:      "standard",
+		DirectoryNameEncryption: true,
+		FilenameEncoding:        "base64",
+		Suffix:                  ".bin",
+	})
+	if err != nil {
+		t.Fatalf("NewCrypt: %v", err)
+	}
+
+	dirID, err := cryptDrive.EnsureDir(context.Background(), "Library/Films")
+	if err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	if dirID != "encrypted-dir" {
+		t.Fatalf("EnsureDir ID = %q", dirID)
+	}
+	wantPath := cryptDrive.cipher.EncryptDirName("Library") + "/" + cryptDrive.cipher.EncryptDirName("Films")
+	if base.ensuredPath != wantPath {
+		t.Fatalf("encrypted path = %q, want %q", base.ensuredPath, wantPath)
+	}
+
+	plain := []byte("generic crypt upload")
+	fileID, err := cryptDrive.Upload(context.Background(), dirID, "movie.mkv", bytes.NewReader(plain), int64(len(plain)))
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if fileID != "encrypted-file" {
+		t.Fatalf("Upload file ID = %q", fileID)
+	}
+	if base.uploadedName != cryptDrive.cipher.EncryptFileName("movie.mkv") {
+		t.Fatalf("encrypted name = %q", base.uploadedName)
+	}
+	if base.uploadedSize != cryptDrive.cipher.EncryptedSize(int64(len(plain))) {
+		t.Fatalf("encrypted size = %d", base.uploadedSize)
+	}
+	decrypted, err := cryptDrive.cipher.DecryptData(io.NopCloser(bytes.NewReader(base.uploadedData)))
+	if err != nil {
+		t.Fatalf("DecryptData: %v", err)
+	}
+	got, readErr := io.ReadAll(decrypted)
+	closeErr := decrypted.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read decrypted upload: read=%v close=%v", readErr, closeErr)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("decrypted upload = %q, want %q", got, plain)
+	}
+}
+
+type genericCryptTestDrive struct {
+	ensuredPath  string
+	uploadedName string
+	uploadedData []byte
+	uploadedSize int64
+}
+
+func (d *genericCryptTestDrive) Kind() string               { return "p123" }
+func (d *genericCryptTestDrive) ID() string                 { return "generic-crypt" }
+func (d *genericCryptTestDrive) RootID() string             { return "root" }
+func (d *genericCryptTestDrive) Init(context.Context) error { return nil }
+func (d *genericCryptTestDrive) List(context.Context, string) ([]drives.Entry, error) {
+	return nil, nil
+}
+func (d *genericCryptTestDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *genericCryptTestDrive) StreamURL(context.Context, string) (*drives.StreamLink, error) {
+	return nil, fmt.Errorf("not used")
+}
+func (d *genericCryptTestDrive) EnsureDir(_ context.Context, path string) (string, error) {
+	d.ensuredPath = path
+	return "encrypted-dir", nil
+}
+func (d *genericCryptTestDrive) Upload(_ context.Context, _ string, name string, r io.Reader, size int64) (string, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", err
+	}
+	d.uploadedName = name
+	d.uploadedData = data
+	d.uploadedSize = size
+	return "encrypted-file", nil
 }
 
 func writeQuarkTestJSON(w http.ResponseWriter, value any) {

@@ -290,32 +290,30 @@ test("quark drive form supports qr login and manual cookie fallback", () => {
   assert.match(match[1], /__pus=\.\.\.; __puus=\.\.\.; \.\.\./);
 });
 
-test("quark drive form exposes optional proxy and OpenList-compatible Crypt settings", () => {
-  const match =
-    /case "quark":\s*return \[([\s\S]*?)\];\s*case "p115":/.exec(
-      constantsSource
-    );
-  assert.ok(match, "quark credential field block should be present");
-  const fields = match[1];
-
-  assert.match(fields, /key: "proxy_url"/);
-  assert.match(fields, /http:\/\/127\.0\.0\.1:7890/);
-  assert.match(fields, /socks5:\/\/127\.0\.0\.1:1080/);
-  assert.match(fields, /key: "crypt_enabled"/);
-  assert.match(fields, /defaultValue: "false"/);
-  assert.match(fields, /key: "crypt_password"/);
-  assert.match(fields, /key: "crypt_salt"/);
-  assert.match(fields, /key: "crypt_filename_encryption"/);
-  assert.match(fields, /value: "standard"/);
-  assert.match(fields, /value: "obfuscate"/);
-  assert.match(fields, /value: "off"/);
-  assert.match(fields, /key: "crypt_directory_name_encryption"/);
-  assert.match(fields, /key: "crypt_filename_encoding"/);
-  assert.match(fields, /value: "base64"/);
-  assert.match(fields, /value: "base32"/);
-  assert.match(fields, /value: "base32768"/);
-  assert.match(fields, /key: "crypt_suffix"/);
-  assert.match(fields, /defaultValue: ".bin"/);
+test("cloud drive forms expose optional proxy and OpenList-compatible Crypt settings", () => {
+  assert.match(constantsSource, /function cloudSecurityFields\(\)/);
+  assert.match(constantsSource, /key: "proxy_url"/);
+  assert.match(constantsSource, /http:\/\/127\.0\.0\.1:7890/);
+  assert.match(constantsSource, /socks5:\/\/127\.0\.0\.1:1080/);
+  assert.match(constantsSource, /key: "crypt_enabled"/);
+  assert.match(constantsSource, /defaultValue: "false"/);
+  assert.match(constantsSource, /key: "crypt_password"/);
+  assert.match(constantsSource, /key: "crypt_salt"/);
+  assert.match(constantsSource, /key: "crypt_filename_encryption"/);
+  assert.match(constantsSource, /value: "standard"/);
+  assert.match(constantsSource, /value: "obfuscate"/);
+  assert.match(constantsSource, /value: "off"/);
+  assert.match(constantsSource, /key: "crypt_directory_name_encryption"/);
+  assert.match(constantsSource, /key: "crypt_filename_encoding"/);
+  assert.match(constantsSource, /value: "base64"/);
+  assert.match(constantsSource, /value: "base32"/);
+  assert.match(constantsSource, /value: "base32768"/);
+  assert.match(constantsSource, /key: "crypt_suffix"/);
+  assert.match(constantsSource, /defaultValue: ".bin"/);
+  for (const kind of ["quark", "p115", "p123", "pikpak", "wopan", "guangyapan", "onedrive", "googledrive", "webdav"]) {
+    assert.match(constantsSource, new RegExp(`case "${kind}":`));
+  }
+  assert.doesNotMatch(constantsSource, /case "localstorage"[\s\S]*?cloudSecurityFields\(\)/);
   assert.match(driveFormSource, /password\|salt\|token\|secret/i);
   assert.match(driveFormSource, /<PasswordInput[\s\S]*?required=\{f\.required && !isEdit\}/);
 });

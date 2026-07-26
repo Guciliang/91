@@ -51,6 +51,7 @@ type Driver struct {
 	uploadBaseURL string
 	client        *resty.Client
 	httpClient    *http.Client
+	proxyErr      error
 	onTokenUpdate func(access, refresh string)
 
 	listMu       sync.Mutex
@@ -73,6 +74,7 @@ type Config struct {
 	OAuthURL     string
 	APIBaseURL   string
 	UploadAPIURL string
+	ProxyURL     string
 
 	OnTokenUpdate func(access, refresh string)
 }
@@ -94,30 +96,41 @@ func New(c Config) *Driver {
 	if uploadBaseURL == "" {
 		uploadBaseURL = deriveUploadBaseURL(apiBaseURL)
 	}
-	return &Driver{
-		id:            c.ID,
-		rootID:        rootID,
-		refreshToken:  strings.TrimSpace(c.RefreshToken),
-		accessToken:   strings.TrimSpace(c.AccessToken),
-		clientID:      strings.TrimSpace(c.ClientID),
-		clientSecret:  strings.TrimSpace(c.ClientSecret),
-		oauthURL:      oauthURL,
-		apiBaseURL:    apiBaseURL,
-		uploadBaseURL: uploadBaseURL,
-		onTokenUpdate: c.OnTokenUpdate,
-		client: resty.New().
-			SetTimeout(30*time.Second).
-			SetHeader("Accept", "application/json, text/plain, */*"),
-		httpClient: &http.Client{
-			Timeout: 0,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+	d := &Driver{
+		id:                   c.ID,
+		rootID:               rootID,
+		refreshToken:         strings.TrimSpace(c.RefreshToken),
+		accessToken:          strings.TrimSpace(c.AccessToken),
+		clientID:             strings.TrimSpace(c.ClientID),
+		clientSecret:         strings.TrimSpace(c.ClientSecret),
+		oauthURL:             oauthURL,
+		apiBaseURL:           apiBaseURL,
+		uploadBaseURL:        uploadBaseURL,
+		onTokenUpdate:        c.OnTokenUpdate,
 		listInterval:         defaultListInterval,
 		listCooldown:         defaultListCooldown,
 		linkCooldownDuration: defaultLinkCooldown,
 	}
+	apiClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 0, func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	})
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := streamClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.client = resty.NewWithClient(apiClient).
+		SetTimeout(30*time.Second).
+		SetHeader("Accept", "application/json, text/plain, */*")
+	d.httpClient = streamClient
+	return d
 }
 
 func deriveUploadBaseURL(apiBaseURL string) string {
@@ -136,6 +149,9 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("googledrive proxy configuration: %w", d.proxyErr)
+	}
 	if d.refreshToken == "" {
 		return errors.New("googledrive init: refresh_token is required")
 	}
@@ -258,7 +274,8 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		Headers: http.Header{
 			"Authorization": []string{"Bearer " + d.accessToken},
 		},
-		Expires: time.Now().Add(30 * time.Minute),
+		Expires:    time.Now().Add(30 * time.Minute),
+		HTTPClient: d.httpClient,
 	}, nil
 }
 

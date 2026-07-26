@@ -44,10 +44,12 @@ type Driver struct {
 	algorithms    []string
 	userAgent     string
 
-	client          *resty.Client
-	onTokenUpdate   func(access, refresh, captcha, deviceID string)
-	uploadToOSSFunc func(context.Context, *s3Params, io.Reader) error
-	uploadTempDir   string
+	client           *resty.Client
+	streamHTTPClient *http.Client
+	proxyErr         error
+	onTokenUpdate    func(access, refresh, captcha, deviceID string)
+	uploadToOSSFunc  func(context.Context, *s3Params, io.Reader) error
+	uploadTempDir    string
 
 	// captchaMu serializes captcha-token refreshes triggered by 4002 / 9
 	// recovery in requestOnce. Without it, N concurrent callers all hitting
@@ -79,6 +81,7 @@ type Config struct {
 	RootID           string
 	DisableMediaLink bool
 	UploadTempDir    string
+	ProxyURL         string
 	OnTokenUpdate    func(access, refresh, captcha, deviceID string)
 }
 
@@ -112,11 +115,25 @@ func New(c Config) *Driver {
 		disableMediaLink: c.DisableMediaLink,
 		onTokenUpdate:    c.OnTokenUpdate,
 		uploadTempDir:    strings.TrimSpace(c.UploadTempDir),
-		client: resty.New().
-			SetTimeout(30*time.Second).
-			SetHeader("Accept", "application/json, text/plain, */*"),
-		listInterval: 1 * time.Second,
+		listInterval:     1 * time.Second,
 	}
+	apiClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 0, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := streamClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.client = resty.NewWithClient(apiClient).
+		SetTimeout(30*time.Second).
+		SetHeader("Accept", "application/json, text/plain, */*")
+	d.streamHTTPClient = streamClient
 	d.applyPlatformDefaults()
 	return d
 }
@@ -126,6 +143,9 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("pikpak proxy configuration: %w", d.proxyErr)
+	}
 	clearPersistedCaptcha := func() {
 		if d.captchaToken == "" {
 			return
@@ -322,9 +342,10 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		headers.Set("User-Agent", d.userAgent)
 	}
 	return &drives.StreamLink{
-		URL:     url,
-		Headers: headers,
-		Expires: expires,
+		URL:        url,
+		Headers:    headers,
+		Expires:    expires,
+		HTTPClient: d.streamHTTPClient,
 	}, nil
 }
 

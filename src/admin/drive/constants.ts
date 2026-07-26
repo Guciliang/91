@@ -186,7 +186,125 @@ export type CredentialField = {
   defaultValue?: string;
 };
 
+function cloudSecurityFields(): CredentialField[] {
+  return [
+    {
+      key: "proxy_url",
+      label: "代理地址(可选)",
+      placeholder: "http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+    },
+    {
+      key: "crypt_enabled",
+      label: "启用 Crypt",
+      placeholder: "",
+      type: "select",
+      defaultValue: "false",
+      options: [
+        { value: "false", label: "关闭" },
+        { value: "true", label: "开启" },
+      ],
+    },
+    {
+      key: "crypt_password",
+      label: "Crypt 密码",
+      placeholder: "与 OpenList / rclone Crypt 保持一致",
+    },
+    {
+      key: "crypt_salt",
+      label: "Crypt 盐(可选)",
+      placeholder: "与 OpenList / rclone Crypt 保持一致",
+    },
+    {
+      key: "crypt_filename_encryption",
+      label: "文件名加密",
+      placeholder: "",
+      type: "select",
+      defaultValue: "standard",
+      options: [
+        { value: "standard", label: "标准" },
+        { value: "obfuscate", label: "混淆" },
+        { value: "off", label: "关闭" },
+      ],
+    },
+    {
+      key: "crypt_directory_name_encryption",
+      label: "目录名加密",
+      placeholder: "",
+      type: "select",
+      defaultValue: "true",
+      options: [
+        { value: "true", label: "开启" },
+        { value: "false", label: "关闭" },
+      ],
+    },
+    {
+      key: "crypt_filename_encoding",
+      label: "文件名编码",
+      placeholder: "",
+      type: "select",
+      defaultValue: "base64",
+      options: [
+        { value: "base64", label: "base64" },
+        { value: "base32", label: "base32" },
+        { value: "base32768", label: "base32768" },
+      ],
+    },
+    {
+      key: "crypt_suffix",
+      label: "加密文件后缀",
+      placeholder: ".bin",
+      defaultValue: ".bin",
+    },
+  ];
+}
+
 export function credentialFields(kind: Kind): CredentialField[] {
+	const cloudBaseFields = (() => {
+		switch (kind) {
+			case "quark":
+				return [{ key: "cookie", label: "Cookie", placeholder: "__pus=...; __puus=...; ...", multiline: true, required: true }];
+			case "p115":
+				return [{ key: "cookie", label: "Cookie", placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx", multiline: true, required: true }];
+			case "p123":
+				return [
+					{ key: "username", label: "手机号/邮箱", placeholder: "手机号或邮箱" },
+					{ key: "password", label: "密码", placeholder: "123 网盘密码" },
+				];
+			case "pikpak":
+				return [
+					{ key: "username", label: "用户名 / 邮箱", placeholder: "user@example.com", required: true },
+					{ key: "password", label: "密码", placeholder: "PikPak 密码", required: true },
+				];
+			case "wopan":
+				return [
+					{ key: "access_token", label: "access_token", placeholder: "", required: true },
+					{ key: "refresh_token", label: "refresh_token", placeholder: "", required: true },
+				];
+			case "guangyapan":
+				return [
+					{ key: "refresh_token", label: "refresh_token", placeholder: "推荐填写，服务端会自动刷新 access_token", multiline: true },
+					{ key: "access_token", label: "access_token", placeholder: "Bearer eyJ... 或直接粘贴 token", multiline: true },
+				];
+			case "onedrive":
+				return [{ key: "refresh_token", label: "refresh_token", placeholder: "OpenList OneDrive refresh_token", multiline: true, required: true }];
+			case "googledrive":
+				return [
+					{ key: "client_id", label: "客户端 ID", placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com", required: true },
+					{ key: "client_secret", label: "客户端密钥", placeholder: "Google OAuth client secret", required: true },
+					{ key: "refresh_token", label: "refresh_token", placeholder: "Google OAuth refresh_token", multiline: true, required: true },
+				];
+			case "webdav":
+				return [
+					{ key: "base_url", label: "WebDAV 地址", placeholder: "https://openlist.example.com/dav", required: true },
+					{ key: "username", label: "用户名", placeholder: "WebDAV 用户名", required: true },
+					{ key: "password", label: "密码", placeholder: "WebDAV 密码", required: true },
+				];
+			default:
+				return undefined;
+		}
+	})();
+	if (cloudBaseFields) return [...cloudBaseFields, ...cloudSecurityFields()];
+
   switch (kind) {
     case "quark":
       return [
@@ -197,73 +315,7 @@ export function credentialFields(kind: Kind): CredentialField[] {
           multiline: true,
           required: true,
         },
-        {
-          key: "proxy_url",
-          label: "代理地址(可选)",
-          placeholder: "http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
-        },
-        {
-          key: "crypt_enabled",
-          label: "启用 Crypt",
-          placeholder: "",
-          type: "select",
-          defaultValue: "false",
-          options: [
-            { value: "false", label: "关闭" },
-            { value: "true", label: "开启" },
-          ],
-        },
-        {
-          key: "crypt_password",
-          label: "Crypt 密码",
-          placeholder: "与 OpenList / rclone Crypt 保持一致",
-        },
-        {
-          key: "crypt_salt",
-          label: "Crypt 盐(可选)",
-          placeholder: "与 OpenList / rclone Crypt 保持一致",
-        },
-        {
-          key: "crypt_filename_encryption",
-          label: "文件名加密",
-          placeholder: "",
-          type: "select",
-          defaultValue: "standard",
-          options: [
-            { value: "standard", label: "标准" },
-            { value: "obfuscate", label: "混淆" },
-            { value: "off", label: "关闭" },
-          ],
-        },
-        {
-          key: "crypt_directory_name_encryption",
-          label: "目录名加密",
-          placeholder: "",
-          type: "select",
-          defaultValue: "true",
-          options: [
-            { value: "true", label: "开启" },
-            { value: "false", label: "关闭" },
-          ],
-        },
-        {
-          key: "crypt_filename_encoding",
-          label: "文件名编码",
-          placeholder: "",
-          type: "select",
-          defaultValue: "base64",
-          options: [
-            { value: "base64", label: "base64" },
-            { value: "base32", label: "base32" },
-            { value: "base32768", label: "base32768" },
-          ],
-        },
-        {
-          key: "crypt_suffix",
-          label: "加密文件后缀",
-          placeholder: ".bin",
-          defaultValue: ".bin",
-        },
+		...cloudSecurityFields(),
       ];
     case "p115":
       return [
@@ -273,7 +325,8 @@ export function credentialFields(kind: Kind): CredentialField[] {
           placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
           multiline: true,
           required: true,
-        },
+		},
+		...cloudSecurityFields(),
       ];
     case "p123":
       return [
@@ -281,12 +334,14 @@ export function credentialFields(kind: Kind): CredentialField[] {
           key: "username",
           label: "手机号/邮箱",
           placeholder: "手机号或邮箱",
-        },
+		},
+		...cloudSecurityFields(),
         {
           key: "password",
           label: "密码",
           placeholder: "123网盘密码",
-        },
+		},
+		...cloudSecurityFields(),
       ];
     case "pikpak":
       return [
@@ -295,13 +350,15 @@ export function credentialFields(kind: Kind): CredentialField[] {
           label: "用户名 / 邮箱",
           placeholder: "user@example.com",
           required: true,
-        },
+		},
+		...cloudSecurityFields(),
         {
           key: "password",
           label: "密码",
           placeholder: "PikPak 密码",
           required: true,
-        },
+		},
+		...cloudSecurityFields(),
       ];
     case "wopan":
       return [
@@ -310,13 +367,15 @@ export function credentialFields(kind: Kind): CredentialField[] {
           label: "access_token",
           placeholder: "",
           required: true,
-        },
+		},
+		...cloudSecurityFields(),
         {
           key: "refresh_token",
           label: "refresh_token",
           placeholder: "",
           required: true,
-        },
+		},
+		...cloudSecurityFields(),
       ];
     case "guangyapan":
       return [
@@ -325,7 +384,8 @@ export function credentialFields(kind: Kind): CredentialField[] {
           label: "refresh_token",
           placeholder: "推荐填写，服务端会自动刷新 access_token",
           multiline: true,
-        },
+		},
+		...cloudSecurityFields(),
         {
           key: "access_token",
           label: "access_token",

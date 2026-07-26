@@ -20,14 +20,17 @@ import (
 
 // Driver 封装联通网盘
 type Driver struct {
-	id            string
-	rootID        string
-	familyID      string
-	accessToken   string
-	refreshToken  string
-	client        *sdk.WoClient
-	onTokenUpdate func(access, refresh string)
-	uploadTempDir string
+	id               string
+	rootID           string
+	familyID         string
+	accessToken      string
+	refreshToken     string
+	client           *sdk.WoClient
+	apiHTTPClient    *http.Client
+	streamHTTPClient *http.Client
+	proxyErr         error
+	onTokenUpdate    func(access, refresh string)
+	uploadTempDir    string
 
 	listMu       sync.Mutex
 	lastListAt   time.Time
@@ -45,6 +48,7 @@ type Config struct {
 	FamilyID      string // 空则走个人空间，有值则走家庭空间
 	RootID        string // 根目录 ID，默认 "0"
 	UploadTempDir string
+	ProxyURL      string
 	// 当 SDK 刷新 token 时回调，便于持久化
 	OnTokenUpdate func(access, refresh string)
 }
@@ -54,7 +58,7 @@ func New(c Config) *Driver {
 	if rootID == "" {
 		rootID = "0"
 	}
-	return &Driver{
+	d := &Driver{
 		id:            c.ID,
 		rootID:        rootID,
 		familyID:      c.FamilyID,
@@ -66,6 +70,22 @@ func New(c Config) *Driver {
 		listCooldown:  5 * time.Minute,
 		fidToID:       make(map[string]string),
 	}
+	apiClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 0, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := streamClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.apiHTTPClient = apiClient
+	d.streamHTTPClient = streamClient
+	return d
 }
 
 func (d *Driver) Kind() string { return "wopan" }
@@ -75,7 +95,11 @@ func (d *Driver) RootID() string {
 }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("wopan proxy configuration: %w", d.proxyErr)
+	}
 	d.client = sdk.DefaultWithRefreshToken(d.refreshToken)
+	d.client.SetHttpClient(d.apiHTTPClient).SetUserAgent(sdk.DefaultUA)
 	d.client.SetAccessToken(d.accessToken)
 	d.client.OnRefreshToken(func(access, refresh string) {
 		d.accessToken = access
@@ -157,9 +181,10 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		return nil, fmt.Errorf("wopan download url: empty response")
 	}
 	return &drives.StreamLink{
-		URL:     data.List[0].DownloadUrl,
-		Headers: http.Header{},
-		Expires: time.Now().Add(10 * time.Minute),
+		URL:        data.List[0].DownloadUrl,
+		Headers:    http.Header{},
+		Expires:    time.Now().Add(10 * time.Minute),
+		HTTPClient: d.streamHTTPClient,
 	}, nil
 }
 

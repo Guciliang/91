@@ -47,6 +47,7 @@ type Config struct {
 	Username string
 	Password string
 	RootID   string
+	ProxyURL string
 }
 
 type Driver struct {
@@ -58,6 +59,7 @@ type Driver struct {
 	baseURL   *url.URL
 	basePath  string
 	configErr error
+	proxyErr  error
 	metadata  *http.Client
 	transfer  *http.Client
 }
@@ -66,7 +68,7 @@ func New(c Config) *Driver {
 	rootID, rootErr := normalizeRemotePath(c.RootID)
 	baseURL, basePath, baseErr := parseBaseURL(c.BaseURL)
 	configErr := errors.Join(rootErr, baseErr)
-	return &Driver{
+	d := &Driver{
 		id:        strings.TrimSpace(c.ID),
 		rootID:    rootID,
 		username:  strings.TrimSpace(c.Username),
@@ -74,20 +76,33 @@ func New(c Config) *Driver {
 		baseURL:   baseURL,
 		basePath:  basePath,
 		configErr: configErr,
-		metadata:  newHTTPClient(metadataTimeout),
-		transfer:  newHTTPClient(0),
 	}
+	metadata, err := newHTTPClient(metadataTimeout, c.ProxyURL)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	transfer, err := newHTTPClient(0, c.ProxyURL)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := transfer.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.metadata = metadata
+	d.transfer = transfer
+	return d
 }
 
-func newHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{
-		Timeout: timeout,
+func newHTTPClient(timeout time.Duration, proxyURL string) (*http.Client, error) {
+	return drives.NewHTTPClientForProxy(proxyURL, timeout,
 		// WebDAV methods must not be rewritten to GET by a 301/302 response, and
 		// credentials must never be forwarded to a different origin implicitly.
-		CheckRedirect: func(*http.Request, []*http.Request) error {
+		func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-	}
+	)
 }
 
 func parseBaseURL(raw string) (*url.URL, string, error) {
@@ -146,6 +161,9 @@ func (d *Driver) ID() string { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("webdav proxy configuration: %w", d.proxyErr)
+	}
 	if d.configErr != nil {
 		return d.configErr
 	}
@@ -245,6 +263,7 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		Headers:              headers,
 		Expires:              time.Now().Add(24 * time.Hour),
 		PassThroughRedirects: true,
+		HTTPClient:           d.transfer,
 	}, nil
 }
 

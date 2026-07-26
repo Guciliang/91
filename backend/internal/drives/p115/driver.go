@@ -46,12 +46,15 @@ type generationStreamCall struct {
 }
 
 type Driver struct {
-	id            string
-	cookie        string
-	rootID        string
-	client        *sdk.Pan115Client
-	ua            string
-	uploadTempDir string
+	id               string
+	cookie           string
+	rootID           string
+	client           *sdk.Pan115Client
+	apiHTTPClient    *http.Client
+	streamHTTPClient *http.Client
+	proxyErr         error
+	ua               string
+	uploadTempDir    string
 
 	listMu       sync.Mutex
 	lastListAt   time.Time
@@ -70,6 +73,7 @@ type Config struct {
 	Cookie        string // 形如 "UID=xxx; CID=xxx; SEID=xxx; KID=xxx"
 	RootID        string // 默认 "0"
 	UA            string // 默认 UA115Browser
+	ProxyURL      string
 	UploadTempDir string
 }
 
@@ -82,7 +86,7 @@ func New(c Config) *Driver {
 	if ua == "" {
 		ua = sdk.UA115Browser
 	}
-	return &Driver{
+	d := &Driver{
 		id:                 c.ID,
 		cookie:             c.Cookie,
 		rootID:             rootID,
@@ -92,9 +96,33 @@ func New(c Config) *Driver {
 		pickCodes:          make(map[string]string),
 		generationCache:    make(map[string]cachedGenerationStream),
 		generationInflight: make(map[string]*generationStreamCall),
-		hlsClient:          streamhttp.NewClient(20 * time.Second),
 		hlsMasterBaseURL:   p115HLSMasterBaseURL,
 	}
+	apiClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	hlsClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 20*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 0, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := hlsClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	if transport, ok := streamClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.apiHTTPClient = apiClient
+	d.hlsClient = hlsClient
+	d.streamHTTPClient = streamClient
+	return d
 }
 
 func (d *Driver) Kind() string   { return "p115" }
@@ -102,11 +130,14 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("115 proxy configuration: %w", d.proxyErr)
+	}
 	cr := &sdk.Credential{}
 	if err := cr.FromCookie(d.cookie); err != nil {
 		return fmt.Errorf("parse cookie: %w", err)
 	}
-	d.client = sdk.New(sdk.UA(d.ua)).ImportCredential(cr)
+	d.client = sdk.New(sdk.WithClient(d.apiHTTPClient), sdk.UA(d.ua)).ImportCredential(cr)
 	return d.client.LoginCheck()
 }
 
@@ -369,9 +400,10 @@ func (d *Driver) streamURLWithUA(ctx context.Context, fileID string, ua string) 
 	}
 
 	return &drives.StreamLink{
-		URL:     info.Url.Url,
-		Headers: headers,
-		Expires: time.Now().Add(25 * time.Minute), // 115 直链 30 分钟过期，留余量
+		URL:        info.Url.Url,
+		Headers:    headers,
+		Expires:    time.Now().Add(25 * time.Minute), // 115 直链 30 分钟过期，留余量
+		HTTPClient: d.streamHTTPClient,
 	}, nil
 }
 
@@ -512,7 +544,8 @@ func (d *Driver) resolveGenerationStream(ctx context.Context, fileID string) (*d
 		// Expires is a conservative local reuse deadline, not a claim about
 		// the provider signature's exact expiry. A 403 still triggers the
 		// caller's force-refresh path before this deadline.
-		Expires: time.Now().Add(p115HLSCacheTTL),
+		Expires:    time.Now().Add(p115HLSCacheTTL),
+		HTTPClient: d.streamHTTPClient,
 	}, nil
 }
 

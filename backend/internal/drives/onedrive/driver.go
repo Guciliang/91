@@ -47,6 +47,8 @@ type Driver struct {
 	apiBaseURL    string
 	renewAPIURL   string
 	client        *resty.Client
+	httpClient    *http.Client
+	proxyErr      error
 	onTokenUpdate func(access, refresh string)
 
 	listMu       sync.Mutex
@@ -67,6 +69,7 @@ type Config struct {
 
 	RenewAPIURL string
 	APIBaseURL  string
+	ProxyURL    string
 }
 
 func New(c Config) *Driver {
@@ -90,7 +93,7 @@ func New(c Config) *Driver {
 	if renewAPIURL == "" {
 		renewAPIURL = defaultRenewAPIURL
 	}
-	return &Driver{
+	d := &Driver{
 		id:            c.ID,
 		rootID:        rootID,
 		region:        region,
@@ -101,12 +104,27 @@ func New(c Config) *Driver {
 		apiBaseURL:    apiBaseURL,
 		renewAPIURL:   renewAPIURL,
 		onTokenUpdate: c.OnTokenUpdate,
-		client: resty.New().
-			SetTimeout(30*time.Second).
-			SetHeader("Accept", "application/json, text/plain, */*"),
-		listInterval: onedriveListInterval,
-		listCooldown: onedriveListCooldown,
+		listInterval:  onedriveListInterval,
+		listCooldown:  onedriveListCooldown,
 	}
+	apiClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 0, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := streamClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.client = resty.NewWithClient(apiClient).
+		SetTimeout(30*time.Second).
+		SetHeader("Accept", "application/json, text/plain, */*")
+	d.httpClient = streamClient
+	return d
 }
 
 func (d *Driver) Kind() string   { return "onedrive" }
@@ -114,6 +132,9 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("onedrive proxy configuration: %w", d.proxyErr)
+	}
 	if d.refreshToken == "" {
 		return errors.New("onedrive init: refresh_token is required")
 	}
@@ -219,9 +240,10 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		return nil, errors.New("onedrive download url: empty")
 	}
 	return &drives.StreamLink{
-		URL:     item.DownloadURL,
-		Headers: http.Header{},
-		Expires: time.Now().Add(10 * time.Minute),
+		URL:        item.DownloadURL,
+		Headers:    http.Header{},
+		Expires:    time.Now().Add(10 * time.Minute),
+		HTTPClient: d.httpClient,
 	}, nil
 }
 
@@ -381,7 +403,11 @@ func (d *Driver) putUploadSessionChunk(ctx context.Context, uploadURL string, st
 	}
 	req.ContentLength = int64(len(data))
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
-	res, err := http.DefaultClient.Do(req)
+	client := d.httpClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, true, err
 	}

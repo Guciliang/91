@@ -49,11 +49,12 @@ const (
 	cryptContentSniffBytes = 512
 )
 
-// CryptDriver keeps Quark as its public kind so scanner, catalog and crawler
-// routing do not need a second provider type. It never returns a ciphertext
-// StreamLink: plaintext is exposed only through PlaintextRangeProvider.
+// CryptDriver retains its backing drive's public kind so scanner, catalog and
+// crawler routing do not need a second provider type. It never returns a
+// ciphertext StreamLink: plaintext is exposed only through
+// PlaintextRangeProvider.
 type CryptDriver struct {
-	base   *Driver
+	base   drives.Drive
 	cipher *rclonecrypt.Cipher
 
 	mu               sync.RWMutex
@@ -107,9 +108,9 @@ const (
 	quarkCryptLookaheadTimeout           = 45 * time.Second
 )
 
-func NewCrypt(base *Driver, cfg CryptConfig) (*CryptDriver, error) {
+func NewCrypt(base drives.Drive, cfg CryptConfig) (*CryptDriver, error) {
 	if base == nil {
-		return nil, errors.New("nil quark driver")
+		return nil, errors.New("nil crypt base drive")
 	}
 	if strings.TrimSpace(cfg.Password) == "" {
 		return nil, errors.New("crypt password is required")
@@ -225,32 +226,24 @@ func (d *CryptDriver) StreamURL(_ context.Context, fileID string) (*drives.Strea
 }
 
 func (d *CryptDriver) MakeDir(ctx context.Context, parentID, name string) (string, error) {
-	return d.base.MakeDir(ctx, parentID, d.cipher.EncryptDirName(name))
+	base, ok := d.base.(interface {
+		MakeDir(context.Context, string, string) (string, error)
+	})
+	if !ok {
+		return "", drives.ErrNotSupported
+	}
+	return base.MakeDir(ctx, parentID, d.cipher.EncryptDirName(name))
 }
 
 func (d *CryptDriver) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
-	currentID := d.RootID()
-	for _, name := range splitPath(pathFromRoot) {
-		entries, err := d.List(ctx, currentID)
-		if err != nil {
-			return "", err
-		}
-		childID := ""
-		for _, entry := range entries {
-			if entry.IsDir && entry.Name == name {
-				childID = entry.ID
-				break
-			}
-		}
-		if childID == "" {
-			childID, err = d.MakeDir(ctx, currentID, name)
-			if err != nil {
-				return "", err
-			}
-		}
-		currentID = childID
+	parts := splitPath(pathFromRoot)
+	if len(parts) == 0 {
+		return d.RootID(), nil
 	}
-	return currentID, nil
+	for i, name := range parts {
+		parts[i] = d.cipher.EncryptDirName(name)
+	}
+	return d.base.EnsureDir(ctx, strings.Join(parts, "/"))
 }
 
 func (d *CryptDriver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
@@ -297,11 +290,21 @@ func (d *CryptDriver) UploadAndReportSHA1(ctx context.Context, parentID, name st
 }
 
 func (d *CryptDriver) Rename(ctx context.Context, fileID, newName string) error {
-	return d.base.Rename(ctx, fileID, d.cipher.EncryptFileName(newName))
+	base, ok := d.base.(interface {
+		Rename(context.Context, string, string) error
+	})
+	if !ok {
+		return drives.ErrNotSupported
+	}
+	return base.Rename(ctx, fileID, d.cipher.EncryptFileName(newName))
 }
 
 func (d *CryptDriver) Remove(ctx context.Context, fileID string) error {
-	return d.base.Remove(ctx, fileID)
+	base, ok := d.base.(drives.Remover)
+	if !ok {
+		return drives.ErrNotSupported
+	}
+	return base.Remove(ctx, fileID)
 }
 
 func (d *CryptDriver) PlaintextSize(ctx context.Context, fileID string) (int64, error) {
@@ -857,7 +860,7 @@ func (d *CryptDriver) runEncryptedLookaheadWithLinkOpener(fileID string, linkOpe
 	}()
 }
 
-// newDownloadLink returns a fresh Quark URL for a browser range request.
+// newDownloadLink returns a fresh backing-drive URL for a browser range request.
 func (d *CryptDriver) newDownloadLink(ctx context.Context, fileID string, trace *quarkCryptSeekTrace) (*drives.StreamLink, error) {
 	if fileID == "" {
 		return nil, errors.New("quark crypt: empty file id")

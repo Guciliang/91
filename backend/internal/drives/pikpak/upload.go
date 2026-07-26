@@ -378,7 +378,7 @@ func (d *Driver) uploadToOSS(ctx context.Context, p *s3Params, body io.Reader) e
 	if p == nil {
 		return errors.New("pikpak upload: nil s3 params")
 	}
-	client, err := newPikPakOSSClient(p)
+	client, err := newPikPakOSSClient(p, oss.HTTPClient(d.streamHTTPClient))
 	if err != nil {
 		return fmt.Errorf("oss client: %w", err)
 	}

@@ -68,6 +68,7 @@ type Driver struct {
 
 	client     *resty.Client
 	httpClient *http.Client
+	proxyErr   error
 
 	onTokenUpdate func(access string)
 	uploadTempDir string
@@ -92,6 +93,7 @@ type Config struct {
 	MainAPIBaseURL  string
 	LoginAPIBaseURL string
 	UploadTempDir   string
+	ProxyURL        string
 
 	OnTokenUpdate func(access string)
 }
@@ -113,7 +115,7 @@ func New(c Config) *Driver {
 	if loginAPIBase == "" {
 		loginAPIBase = defaultLoginAPIBase
 	}
-	return &Driver{
+	d := &Driver{
 		id:            c.ID,
 		rootID:        rootID,
 		username:      strings.TrimSpace(c.Username),
@@ -126,17 +128,28 @@ func New(c Config) *Driver {
 		userAgent:     defaultUserAgent,
 		onTokenUpdate: c.OnTokenUpdate,
 		uploadTempDir: strings.TrimSpace(c.UploadTempDir),
-		client: resty.New().
-			SetTimeout(30*time.Second).
-			SetHeader("Accept", "application/json, text/plain, */*"),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		files: make(map[string]cachedFile),
+		files:         make(map[string]cachedFile),
 	}
+	apiClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	})
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := streamClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.client = resty.NewWithClient(apiClient).
+		SetTimeout(30*time.Second).
+		SetHeader("Accept", "application/json, text/plain, */*")
+	d.httpClient = streamClient
+	return d
 }
 
 func (d *Driver) Kind() string   { return Kind }
@@ -144,6 +157,9 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("123pan proxy configuration: %w", d.proxyErr)
+	}
 	if d.currentToken() == "" {
 		if err := d.login(ctx); err != nil {
 			return err
@@ -693,9 +709,10 @@ func (d *Driver) resolveDownloadURL(ctx context.Context, downloadURL string) (*d
 	}
 	headers.Set("User-Agent", d.userAgent)
 	return &drives.StreamLink{
-		URL:     finalURL,
-		Headers: headers,
-		Expires: time.Now().Add(10 * time.Minute),
+		URL:        finalURL,
+		Headers:    headers,
+		Expires:    time.Now().Add(10 * time.Minute),
+		HTTPClient: d.httpClient,
 	}, nil
 }
 

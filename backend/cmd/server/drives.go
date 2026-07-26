@@ -38,6 +38,15 @@ func guangYaPanLegacyRootPath(rootID string, credentials map[string]string) stri
 	return strings.TrimSpace(credentials["root_path"])
 }
 
+func isCloudCryptDrive(kind string) bool {
+	switch kind {
+	case "quark", "p115", p123.Kind, "pikpak", "wopan", guangyapan.Kind, "onedrive", googledrive.Kind, webdav.Kind:
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	a.driveAttachMu.Lock()
 	defer a.driveAttachMu.Unlock()
@@ -101,7 +110,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 	var drv drives.Drive
 	switch d.Kind {
 	case "quark":
-		base := quark.New(quark.Config{
+		drv = quark.New(quark.Config{
 			ID:            d.ID,
 			Cookie:        d.Credentials["cookie"],
 			RootID:        d.RootID,
@@ -112,27 +121,12 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 				_ = a.cat.UpsertDrive(ctx, d)
 			},
 		})
-		if parseBoolDefault(d.Credentials["crypt_enabled"], false) {
-			cryptDrive, err := quark.NewCrypt(base, quark.CryptConfig{
-				Password:                d.Credentials["crypt_password"],
-				Salt:                    d.Credentials["crypt_salt"],
-				FilenameEncryption:      d.Credentials["crypt_filename_encryption"],
-				DirectoryNameEncryption: parseBoolDefault(d.Credentials["crypt_directory_name_encryption"], true),
-				FilenameEncoding:        d.Credentials["crypt_filename_encoding"],
-				Suffix:                  d.Credentials["crypt_suffix"],
-			})
-			if err != nil {
-				return fmt.Errorf("quark crypt configuration: %w", err)
-			}
-			drv = cryptDrive
-		} else {
-			drv = base
-		}
 	case "p115":
 		drv = p115.New(p115.Config{
 			ID:            d.ID,
 			Cookie:        d.Credentials["cookie"],
 			RootID:        d.RootID,
+			ProxyURL:      d.Credentials["proxy_url"],
 			UploadTempDir: a.uploadWorkDir("p115"),
 		})
 	case p123.Kind:
@@ -144,6 +138,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			Platform:      d.Credentials["platform"],
 			RootID:        d.RootID,
 			UploadTempDir: a.uploadWorkDir(p123.Kind),
+			ProxyURL:      d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -165,6 +160,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			RootID:           d.RootID,
 			DisableMediaLink: pikpak.ParseBoolDefault(d.Credentials["disable_media_link"], true),
 			UploadTempDir:    a.uploadWorkDir("pikpak"),
+			ProxyURL:         d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh, captcha, deviceID string) {
 				d.Credentials["access_token"] = access
 				d.Credentials["refresh_token"] = refresh
@@ -181,6 +177,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			FamilyID:      d.Credentials["family_id"],
 			RootID:        d.RootID,
 			UploadTempDir: a.uploadWorkDir("wopan"),
+			ProxyURL:      d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh string) {
 				d.Credentials["access_token"] = access
 				d.Credentials["refresh_token"] = refresh
@@ -206,6 +203,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			SortType:       parseIntDefault(strings.TrimSpace(d.Credentials["sort_type"]), 1),
 			AccountBaseURL: d.Credentials["account_base_url"],
 			APIBaseURL:     d.Credentials["api_base_url"],
+			ProxyURL:       d.Credentials["proxy_url"],
 			OnCredentialsUpdate: func(updated map[string]string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -226,6 +224,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			IsSharePoint: parseBoolDefault(d.Credentials["is_sharepoint"], false),
 			SiteID:       d.Credentials["site_id"],
 			RenewAPIURL:  d.Credentials["api_url_address"],
+			ProxyURL:     d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -245,6 +244,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			ClientSecret: d.Credentials["client_secret"],
 			OAuthURL:     d.Credentials["oauth_url"],
 			APIBaseURL:   d.Credentials["api_base_url"],
+			ProxyURL:     d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh string) {
 				if d.Credentials == nil {
 					d.Credentials = make(map[string]string)
@@ -261,6 +261,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			Username: d.Credentials["username"],
 			Password: d.Credentials["password"],
 			RootID:   d.RootID,
+			ProxyURL: d.Credentials["proxy_url"],
 		})
 	case localstorage.Kind:
 		drv = localstorage.New(localstorage.Config{
@@ -275,6 +276,21 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 		})
 	default:
 		return fmt.Errorf("unknown drive kind: %s", d.Kind)
+	}
+
+	if isCloudCryptDrive(d.Kind) && parseBoolDefault(d.Credentials["crypt_enabled"], false) {
+		cryptDrive, err := quark.NewCrypt(drv, quark.CryptConfig{
+			Password:                d.Credentials["crypt_password"],
+			Salt:                    d.Credentials["crypt_salt"],
+			FilenameEncryption:      d.Credentials["crypt_filename_encryption"],
+			DirectoryNameEncryption: parseBoolDefault(d.Credentials["crypt_directory_name_encryption"], true),
+			FilenameEncoding:        d.Credentials["crypt_filename_encoding"],
+			Suffix:                  d.Credentials["crypt_suffix"],
+		})
+		if err != nil {
+			return fmt.Errorf("%s crypt configuration: %w", d.Kind, err)
+		}
+		drv = cryptDrive
 	}
 
 	if err := drv.Init(ctx); err != nil {

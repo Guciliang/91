@@ -32,25 +32,29 @@ const (
 )
 
 type Driver struct {
-	id             string
-	rootID         string
-	rootPath       string
-	phoneNumber    string
-	captchaToken   string
-	sendCode       bool
-	verifyCode     string
-	verificationID string
-	accessToken    string
-	refreshToken   string
-	clientID       string
-	deviceID       string
-	pageSize       int
-	orderBy        int
-	sortType       int
-	accountBaseURL string
-	apiBaseURL     string
-	accountClient  *resty.Client
-	apiClient      *resty.Client
+	id                string
+	rootID            string
+	rootPath          string
+	phoneNumber       string
+	captchaToken      string
+	sendCode          bool
+	verifyCode        string
+	verificationID    string
+	accessToken       string
+	refreshToken      string
+	clientID          string
+	deviceID          string
+	pageSize          int
+	orderBy           int
+	sortType          int
+	accountBaseURL    string
+	apiBaseURL        string
+	accountClient     *resty.Client
+	apiClient         *resty.Client
+	accountHTTPClient *http.Client
+	apiHTTPClient     *http.Client
+	streamHTTPClient  *http.Client
+	proxyErr          error
 
 	onCredentialsUpdate func(map[string]string)
 
@@ -76,6 +80,7 @@ type Config struct {
 	SortType       int
 	AccountBaseURL string
 	APIBaseURL     string
+	ProxyURL       string
 
 	OnCredentialsUpdate func(map[string]string)
 }
@@ -134,6 +139,27 @@ func New(c Config) *Driver {
 		onCredentialsUpdate: c.OnCredentialsUpdate,
 		files:               make(map[string]drives.Entry),
 	}
+	accountHTTPClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	apiHTTPClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 30*time.Second, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	streamHTTPClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, 0, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
+	if transport, ok := streamHTTPClient.Transport.(*http.Transport); ok {
+		drives.ConfigureStreamTransport(transport)
+	}
+	d.accountHTTPClient = accountHTTPClient
+	d.apiHTTPClient = apiHTTPClient
+	d.streamHTTPClient = streamHTTPClient
 	d.accountClient = d.newAccountClient()
 	d.apiClient = d.newAPIClient()
 	return d
@@ -144,6 +170,9 @@ func (d *Driver) ID() string     { return d.id }
 func (d *Driver) RootID() string { return d.rootID }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.proxyErr != nil {
+		return fmt.Errorf("guangyapan proxy configuration: %w", d.proxyErr)
+	}
 	d.saveCredentials()
 
 	if d.accessToken != "" {
@@ -245,7 +274,7 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 	if u == "" {
 		return nil, errors.New("guangyapan stream: empty download url")
 	}
-	return &drives.StreamLink{URL: u, Headers: http.Header{}, Expires: time.Now().Add(10 * time.Minute)}, nil
+	return &drives.StreamLink{URL: u, Headers: http.Header{}, Expires: time.Now().Add(10 * time.Minute), HTTPClient: d.streamHTTPClient}, nil
 }
 
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
@@ -278,7 +307,7 @@ func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader,
 		return "", errors.New("guangyapan upload: incomplete upload token")
 	}
 
-	client, err := oss.New(normalizeOSSEndpoint(token.EndPoint, token.BucketName), token.AccessKeyID, token.SecretAccessKey, oss.SecurityToken(token.SessionToken))
+	client, err := oss.New(normalizeOSSEndpoint(token.EndPoint, token.BucketName), token.AccessKeyID, token.SecretAccessKey, oss.SecurityToken(token.SessionToken), oss.HTTPClient(d.streamHTTPClient))
 	if err != nil {
 		return "", fmt.Errorf("guangyapan upload: create oss client: %w", err)
 	}
@@ -948,7 +977,7 @@ func calcUploadPartSize(size int64) int64 {
 }
 
 func (d *Driver) newAccountClient() *resty.Client {
-	client := resty.New().
+	client := resty.NewWithClient(d.accountHTTPClient).
 		SetTimeout(30*time.Second).
 		SetBaseURL(d.accountBaseURL).
 		SetHeader("Accept", "application/json, text/plain, */*").
@@ -972,7 +1001,7 @@ func (d *Driver) newAccountClient() *resty.Client {
 }
 
 func (d *Driver) newAPIClient() *resty.Client {
-	return resty.New().
+	return resty.NewWithClient(d.apiHTTPClient).
 		SetTimeout(30*time.Second).
 		SetBaseURL(d.apiBaseURL).
 		SetHeader("Accept", "application/json, text/plain, */*").
