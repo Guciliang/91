@@ -298,6 +298,17 @@ export function credentialFields(kind: Kind): CredentialField[] {
 					{ key: "base_url", label: "WebDAV 地址", placeholder: "https://openlist.example.com/dav", required: true },
 					{ key: "username", label: "用户名", placeholder: "WebDAV 用户名", required: true },
 					{ key: "password", label: "密码", placeholder: "WebDAV 密码", required: true },
+					{
+						key: "strm_allow_outside_root",
+						label: ".strm 允许指向 WebDAV 根目录外",
+						placeholder: "",
+						type: "select",
+						defaultValue: "false",
+						options: [
+							{ value: "false", label: "关闭（默认，仅允许 WebDAV 根目录内路径）" },
+							{ value: "true", label: "开启（允许 WebDAV 根目录外路径）" },
+						],
+					},
 				];
 			default:
 				return undefined;
@@ -425,38 +436,6 @@ export function credentialFields(kind: Kind): CredentialField[] {
           required: true,
         },
       ];
-    case "webdav":
-      return [
-        {
-          key: "base_url",
-          label: "WebDAV 地址",
-          placeholder: "https://openlist.example.com/dav",
-          required: true,
-        },
-        {
-          key: "username",
-          label: "用户名",
-          placeholder: "WebDAV 用户名",
-          required: true,
-        },
-        {
-          key: "password",
-          label: "密码",
-          placeholder: "WebDAV 密码",
-          required: true,
-        },
-        {
-          key: "strm_allow_outside_root",
-          label: ".strm 允许指向 WebDAV 根目录外",
-          placeholder: "",
-          type: "select",
-          defaultValue: "false",
-          options: [
-            { value: "false", label: "关闭（默认，仅允许 WebDAV 根目录内路径）" },
-            { value: "true", label: "开启（允许 WebDAV 根目录外路径）" },
-          ],
-        },
-      ];
     case "localstorage":
       return [
         {
@@ -477,5 +456,7 @@ export function credentialFields(kind: Kind): CredentialField[] {
           ],
         },
       ];
+    default:
+      return [];
   }
 }

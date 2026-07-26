@@ -209,10 +209,10 @@ test("webdav drive form asks for a standard endpoint and basic auth credentials"
   assertDriveTypeOption("webdav", "WebDAV");
 
   const match =
-    /case "webdav":\s*return \[([\s\S]*?)\];\s*case "localstorage":/.exec(
-      combinedSource
+    /const cloudBaseFields[\s\S]*?case "webdav":\s*return \[([\s\S]*?)\];\s*default:/.exec(
+      constantsSource
     );
-  assert.ok(match, "webdav credential field block should be present");
+  assert.ok(match, "active webdav credential field block should be present");
   const fields = match[1];
 
   assert.match(fields, /key: "base_url"/);
@@ -224,6 +224,10 @@ test("webdav drive form asks for a standard endpoint and basic auth credentials"
   assert.match(fields, /type: "select"/);
   assert.match(fields, /defaultValue: "false"/);
   assert.doesNotMatch(fields, /encrypt|crypt|302/i);
+  assert.match(
+    constantsSource,
+    /if \(cloudBaseFields\) return \[\.\.\.cloudBaseFields, \.\.\.cloudSecurityFields\(\)\]/
+  );
   assert.match(
     drivesPageSource,
     /d\.kind === "localstorage" \|\| d\.kind === "webdav"/
