@@ -109,6 +109,92 @@ func TestDriverListsStatsAndStreamsWithRange(t *testing.T) {
 	}
 }
 
+func TestDriverResolvesHTTPSTRMWithoutForwardingWebDAVCredentials(t *testing.T) {
+	dav := newTestDAV(t)
+	dav.addDir("/library")
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("media Authorization = %q, want empty", got)
+		}
+		if got := r.URL.Query().Get("token"); got != "abc" {
+			t.Errorf("media token = %q, want abc", got)
+		}
+		_, _ = io.WriteString(w, "media")
+	}))
+	t.Cleanup(media.Close)
+	target := media.URL + "/movie.mp4?token=abc"
+	dav.addFile("/library/movie.strm", []byte("\ufeff\n  "+target+"\n"))
+	server := httptest.NewServer(dav)
+	t.Cleanup(server.Close)
+
+	drv := New(Config{
+		ID:       "dav-main",
+		BaseURL:  server.URL + "/dav",
+		Username: testDAVUsername,
+		Password: testDAVPassword,
+		RootID:   "/library",
+	})
+	link, err := drv.StreamURL(context.Background(), "/library/movie.strm")
+	if err != nil {
+		t.Fatalf("StreamURL: %v", err)
+	}
+	if link.URL != target {
+		t.Fatalf("URL = %q, want %q", link.URL, target)
+	}
+	if !link.PassThroughRedirects {
+		t.Fatal("STRM link must relay upstream redirects to the browser")
+	}
+	if link.Headers.Get("Authorization") != "" {
+		t.Fatalf("STRM link forwards WebDAV authorization: %#v", link.Headers)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, link.URL, nil)
+	if err != nil {
+		t.Fatalf("new media request: %v", err)
+	}
+	resp, err := link.HTTPClient.Do(req)
+	if err != nil {
+		t.Fatalf("media request: %v", err)
+	}
+	defer resp.Body.Close()
+	if body, err := io.ReadAll(resp.Body); err != nil || string(body) != "media" {
+		t.Fatalf("media response = body %q err %v", body, err)
+	}
+}
+
+func TestDriverRejectsInvalidSTRMTargets(t *testing.T) {
+	dav := newTestDAV(t)
+	dav.addDir("/library")
+	dav.addFile("/library/empty.strm", []byte("\n \r\n"))
+	dav.addFile("/library/ftp.strm", []byte("ftp://media.example/movie.mp4\n"))
+	dav.addFile("/library/large.strm", []byte(strings.Repeat("x", drives.MaxSTRMBytes+1)))
+	server := httptest.NewServer(dav)
+	t.Cleanup(server.Close)
+	drv := New(Config{
+		ID:       "dav-main",
+		BaseURL:  server.URL + "/dav",
+		Username: testDAVUsername,
+		Password: testDAVPassword,
+		RootID:   "/library",
+	})
+
+	for _, tt := range []struct {
+		file string
+		want string
+	}{
+		{file: "empty.strm", want: "empty strm target"},
+		{file: "ftp.strm", want: "strm target must be an http or https URL"},
+		{file: "large.strm", want: "strm file is too large"},
+	} {
+		t.Run(tt.file, func(t *testing.T) {
+			_, err := drv.StreamURL(context.Background(), "/library/"+tt.file)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("StreamURL error = %v, want contain %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestDriverCreatesDirectoriesUploadsRenamesAndRemoves(t *testing.T) {
 	dav := newTestDAV(t)
 	dav.addDir("/library")

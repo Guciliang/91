@@ -18,8 +18,6 @@ import (
 
 const Kind = "localstorage"
 
-const maxSTRMBytes = 64 * 1024
-
 type Config struct {
 	ID       string
 	RootPath string
@@ -193,24 +191,11 @@ func readSTRMTarget(path string) (string, error) {
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxSTRMBytes+1))
+	target, err := drives.ReadSTRMTarget(f)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("localstorage: %w", err)
 	}
-	if len(data) > maxSTRMBytes {
-		return "", errors.New("localstorage: strm file is too large")
-	}
-	lines := strings.Split(string(data), "\n")
-	for i, line := range lines {
-		if i == 0 {
-			line = strings.TrimPrefix(line, "\ufeff")
-		}
-		line = strings.TrimSpace(line)
-		if line != "" {
-			return line, nil
-		}
-	}
-	return "", errors.New("localstorage: empty strm target")
+	return target, nil
 }
 
 func (d *Driver) localSTRMLink(strmPath, target string) (*drives.StreamLink, error) {

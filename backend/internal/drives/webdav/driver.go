@@ -251,6 +251,9 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 	if fileID == d.rootID {
 		return nil, errors.New("webdav stream: root path is not a file")
 	}
+	if strings.EqualFold(path.Ext(fileID), ".strm") {
+		return d.streamURLFromSTRM(ctx, fileID)
+	}
 	u, err := d.urlFor(fileID, false)
 	if err != nil {
 		return nil, err
@@ -265,6 +268,47 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		PassThroughRedirects: true,
 		HTTPClient:           d.transfer,
 	}, nil
+}
+
+func (d *Driver) streamURLFromSTRM(ctx context.Context, fileID string) (*drives.StreamLink, error) {
+	target, err := d.readSTRMTarget(ctx, fileID)
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(target)
+	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" {
+		return nil, errors.New("webdav: strm target must be an http or https URL")
+	}
+	return &drives.StreamLink{
+		URL:                  u.String(),
+		Expires:              time.Now().Add(24 * time.Hour),
+		PassThroughRedirects: true,
+		HTTPClient:           d.transfer,
+	}, nil
+}
+
+func (d *Driver) readSTRMTarget(ctx context.Context, fileID string) (string, error) {
+	if d.proxyErr != nil {
+		return "", fmt.Errorf("webdav proxy configuration: %w", d.proxyErr)
+	}
+	req, err := d.newRequest(ctx, http.MethodGet, fileID, false, nil)
+	if err != nil {
+		return "", fmt.Errorf("webdav read strm: %w", err)
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := d.transfer.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("webdav read strm: %w", err)
+	}
+	defer resp.Body.Close()
+	if !statusAllowed(resp.StatusCode, http.StatusOK, http.StatusPartialContent) {
+		return "", d.responseError(http.MethodGet, resp)
+	}
+	target, err := drives.ReadSTRMTarget(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("webdav: %w", err)
+	}
+	return target, nil
 }
 
 func (d *Driver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {

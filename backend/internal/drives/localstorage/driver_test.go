@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/scanner"
 )
 
@@ -150,7 +151,7 @@ func TestStreamURLRejectsInvalidSTRMTargets(t *testing.T) {
 			name: "too large",
 			setup: func(t *testing.T, root string) string {
 				t.Helper()
-				writeLocalStorageTestFile(t, filepath.Join(root, "large.strm"), []byte(strings.Repeat("x", maxSTRMBytes+1)))
+				writeLocalStorageTestFile(t, filepath.Join(root, "large.strm"), []byte(strings.Repeat("x", drives.MaxSTRMBytes+1)))
 				return "large.strm"
 			},
 			want: "strm file is too large",
