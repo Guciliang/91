@@ -202,6 +202,8 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 
 		// 代理路由同样需要鉴权，防止绕过
 		r.Get("/p/stream/{driveID}/*", s.handleStream)
+		r.Post("/api/stream-seek/{driveID}/*", s.handleStreamSeek)
+		r.Post("/api/stream-seek-report/{driveID}/*", s.handleStreamSeekReport)
 		r.Get("/p/subtitle/{id}/{index}", s.handleSubtitleFile)
 		r.Get("/p/upload/{videoID}", s.handleUploadedVideo)
 		r.Get("/p/preview/{videoID}", s.handlePreview)
@@ -778,6 +780,44 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	driveID := routeParam(r, "driveID")
 	fileID := routeWildcardParam(r, "*")
 	s.Proxy.ServeStream(w, r, driveID, fileID)
+}
+
+func (s *Server) handleStreamSeek(w http.ResponseWriter, r *http.Request) {
+	driveID := routeParam(r, "driveID")
+	fileID := routeWildcardParam(r, "*")
+	s.Proxy.PrioritizeStreamSeek(driveID, fileID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleStreamSeekReport(w http.ResponseWriter, r *http.Request) {
+	driveID := routeParam(r, "driveID")
+	fileID := routeWildcardParam(r, "*")
+	query := r.URL.Query()
+	s.Proxy.ReportStreamSeekPlayback(
+		driveID,
+		fileID,
+		parseStreamSeekReportDuration(query.Get("wait_ms")),
+		parseStreamSeekReportDuration(query.Get("buffered_ms")),
+		parseStreamSeekReportReadyState(query.Get("ready_state")),
+	)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func parseStreamSeekReportDuration(value string) time.Duration {
+	const max = 10 * time.Minute
+	milliseconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || milliseconds < 0 || milliseconds > int64(max/time.Millisecond) {
+		return 0
+	}
+	return time.Duration(milliseconds) * time.Millisecond
+}
+
+func parseStreamSeekReportReadyState(value string) int {
+	readyState, err := strconv.Atoi(value)
+	if err != nil || readyState < 0 || readyState > 4 {
+		return 0
+	}
+	return readyState
 }
 
 func (s *Server) handleVideoSubtitles(w http.ResponseWriter, r *http.Request) {

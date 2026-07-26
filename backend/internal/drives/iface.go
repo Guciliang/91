@@ -124,6 +124,20 @@ type PlaintextRangeProvider interface {
 	OpenPlaintextRange(ctx context.Context, fileID string, offset, limit int64) (io.ReadCloser, error)
 }
 
+// PlaintextSeekPrioritizer is an optional capability for transformed playback
+// sources. The player invokes it after a user-initiated seek so a drive can
+// stop stale browser playback and background work that would compete with the
+// target range. Other plaintext consumers must remain uninterrupted.
+type PlaintextSeekPrioritizer interface {
+	PrioritizePlaintextSeek(fileID string)
+}
+
+// PlaintextSeekPlaybackReporter accepts one client-side result for a seek.
+// The result is diagnostic only and must not affect playback behavior.
+type PlaintextSeekPlaybackReporter interface {
+	ReportPlaintextSeekPlayback(fileID string, wait, buffered time.Duration, readyState int)
+}
+
 // ErrNotSupported 代表某家盘不支持某操作
 var ErrNotSupported = errors.New("operation not supported by this drive")
 

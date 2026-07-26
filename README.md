@@ -8,11 +8,21 @@
 
 ## 功能特性
 
-- **多网盘接入** — 支持115、PikPak、123网盘、联通网盘、光鸭网盘、OneDrive、Google Drive、WebDAV等
-- **低带宽播放** — 115、PikPak、123网盘、联通网盘、光鸭网盘、OneDrive 支持302模式，播放视频不消耗带宽
+- **多网盘接入** — 支持115、PikPak、123网盘、联通网盘、光鸭网盘、夸克云盘、OneDrive、Google Drive、WebDAV 和本地存储
+- **低带宽播放** — 115 云盘、PikPak 云盘、123网盘、联通网盘、光鸭网盘、OneDrive 支持302模式，在线播放视频时，不占用服务器带宽；WebDAV 会遵循上游响应，返回3xx时由浏览器直连，返回200/206（例如 OpenList Crypt）时由服务器中转；Google Drive 走服务器中转
+- **夸克 Crypt** — 可按 OpenList / rclone Crypt 配置在服务端透明加解密；本地和爬虫上传会加密文件内容及文件名，扫描和播放时自动解密
 - **短视频模式** — 一键切换抖音风格，沉浸刷片
 - **视频分享** — 视频支持一次性分享，"看完即焚"
 - **爬虫脚本** — 支持导入自定义脚本，但是有一些规范，具体可以参考 [SpiderFor91](https://github.com/Just-Spider/SpiderFor91)
+
+## 夸克 Crypt 与代理
+
+在后台的“网盘管理”中新增或编辑夸克网盘时，可以按需配置以下功能：
+
+- 启用 **Crypt** 后，填写与 OpenList 或 rclone Crypt 相同的密码、可选 salt、文件名加密方式、目录名加密、文件名编码及加密后缀。已有 Crypt 目录可以被扫描并播放；上传到该网盘的文件会在服务端加密后再写入夸克。
+- 每个夸克网盘可单独配置代理地址，支持 `http://`、`https://`、`socks5://` 和 `socks5h://`，例如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`。代理设置只作用于该夸克网盘，不会影响其他网盘。
+
+请妥善保管 Crypt 密码和 salt；它们是读取已加密文件所必需的配置。
 
 ## 预览图
 <img src="ReadMeImage/home.webp" alt="首页展示" width="100%" />
@@ -41,25 +51,29 @@ sudo bash install.sh
 ```
 ### 方式二：Docker Compose 部署
 
-**1. 准备目录**
+Docker Compose 会使用仓库内的 `Dockerfile` 在本机构建镜像，不依赖预构建镜像。
+
+**1. 获取源码**
+
 ```bash
-mkdir video-site-91 && cd video-site-91
+git clone https://github.com/Guciliang/91.git video-site-91
+cd video-site-91
 ```
-**2. 创建 `docker-compose.yml`**
-拉取仓库内置docker-compose.yml：
+
+**2. 构建并启动**
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nianzhibai/91/main/docker-compose.yml -o docker-compose.yml
-```
-**3. 启动**
-```bash
-docker compose up -d
+docker compose up -d --build
 ```
 **常用命令：**
 ```bash
-docker compose pull && docker compose up -d   # 更新并重启
-docker compose logs -f                        # 查看日志
+docker compose logs -f             # 查看日志
+docker compose up -d --build       # 重新构建并启动
+docker compose build --no-cache    # 完全重新构建
 ```
 
+> 所有配置、数据库、封面、预览及上传文件均保存在 `./data/` 目录下。
+> 更新源码后执行 `git pull && docker compose up -d --build`；`./data/` 不会被构建或容器更新覆盖。
 ## 数据存放位置
 
 ### 一键脚本部署

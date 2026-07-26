@@ -260,6 +260,31 @@ func (p *Proxy) ServeStream(w http.ResponseWriter, r *http.Request, driveID, fil
 	p.reportStreamResult(driveID, nil)
 }
 
+// PrioritizeStreamSeek gives drives with transformed playback a best-effort
+// signal that a browser has started a new seek. Drives without the optional
+// capability keep their existing stream behavior.
+func (p *Proxy) PrioritizeStreamSeek(driveID, fileID string) {
+	d, ok := p.Registry.Get(driveID)
+	if !ok {
+		return
+	}
+	if prioritizer, ok := d.(drives.PlaintextSeekPrioritizer); ok {
+		prioritizer.PrioritizePlaintextSeek(fileID)
+	}
+}
+
+// ReportStreamSeekPlayback forwards the browser's one-shot seek result to a
+// transformed drive that opted into diagnostics.
+func (p *Proxy) ReportStreamSeekPlayback(driveID, fileID string, wait, buffered time.Duration, readyState int) {
+	d, ok := p.Registry.Get(driveID)
+	if !ok {
+		return
+	}
+	if reporter, ok := d.(drives.PlaintextSeekPlaybackReporter); ok {
+		reporter.ReportPlaintextSeekPlayback(fileID, wait, buffered, readyState)
+	}
+}
+
 func (p *Proxy) servePlaintext(w http.ResponseWriter, r *http.Request, source drives.PlaintextRangeProvider, fileID string) error {
 	size, err := source.PlaintextSize(r.Context(), fileID)
 	if err != nil {
@@ -273,7 +298,7 @@ func (p *Proxy) servePlaintext(w http.ResponseWriter, r *http.Request, source dr
 	}
 	var body io.ReadCloser
 	if r.Method != http.MethodHead && length > 0 {
-		body, err = source.OpenPlaintextRange(r.Context(), fileID, start, length)
+		body, err = source.OpenPlaintextRange(drives.WithPlaintextPlaybackRequest(r.Context()), fileID, start, length)
 		if err != nil {
 			return err
 		}
@@ -287,7 +312,6 @@ func (p *Proxy) servePlaintext(w http.ResponseWriter, r *http.Request, source dr
 		}
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Cache-Control", "private, max-age=300")
 	if partial {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, size))
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))

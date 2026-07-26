@@ -119,6 +119,7 @@ const ARTPLAYER_CONTROL_HIDE_TIME_MS = 2_000;
 const KEYBOARD_SEEK_SECONDS = 15;
 /** 浏览器丢失 keyup 时，最后一次重复按键后的兜底提交延迟。 */
 const KEYBOARD_SEEK_IDLE_COMMIT_MS = 1_500;
+const STREAM_SEEK_PRIORITY_THROTTLE_MS = 250;
 
 Artplayer.FAST_FORWARD_VALUE = FAST_RATE;
 Artplayer.RECONNECT_TIME_MAX = ARTPLAYER_RECONNECT_TIME_MAX;
@@ -365,6 +366,41 @@ function sourcePathname(src: string) {
   return src;
 }
 
+function streamSeekPriorityURL(src: string) {
+  const cleanSrc = src.split("#")[0].split("?")[0];
+  if (cleanSrc.startsWith("/p/stream/")) {
+    return `/api/stream-seek/${cleanSrc.slice("/p/stream/".length)}`;
+  }
+  try {
+    const url = new URL(src, window.location.origin);
+    if (
+      url.origin !== window.location.origin ||
+      !url.pathname.startsWith("/p/stream/")
+    ) {
+      return null;
+    }
+    return `/api/stream-seek/${url.pathname.slice("/p/stream/".length)}`;
+  } catch {
+    return null;
+  }
+}
+
+function streamSeekPlaybackReportURL(
+  src: string,
+  waitMilliseconds: number,
+  bufferedMilliseconds: number,
+  readyState: number
+) {
+  const priorityURL = streamSeekPriorityURL(src);
+  if (!priorityURL) return null;
+  const params = new URLSearchParams({
+    wait_ms: String(Math.max(0, Math.round(waitMilliseconds))),
+    buffered_ms: String(Math.max(0, Math.round(bufferedMilliseconds))),
+    ready_state: String(readyState),
+  });
+  return `${priorityURL.replace("/api/stream-seek/", "/api/stream-seek-report/")}?${params}`;
+}
+
 function mountArtPlayer({
   mount,
   src,
@@ -404,6 +440,8 @@ function mountArtPlayer({
   let diagnosticController: AbortController | null = null;
   let diagnosticPromise: Promise<string | null> | null = null;
   let diagnosticMessage: string | null = null;
+  let lastStreamSeekPriorityAt = 0;
+  let pendingStreamSeekAt: number | null = null;
   configureArtPlayerSettingLayout(
     shouldUseCompactPlayerSettings(mount, enableOrientationControl)
   );
@@ -530,6 +568,57 @@ function mountArtPlayer({
     onError(null);
   }
 
+  function prioritizeStreamSeek() {
+    const priorityURL = streamSeekPriorityURL(src);
+    if (!priorityURL) return;
+    const now = Date.now();
+    if (now - lastStreamSeekPriorityAt < STREAM_SEEK_PRIORITY_THROTTLE_MS) {
+      return;
+    }
+    lastStreamSeekPriorityAt = now;
+    void fetch(priorityURL, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      keepalive: true,
+    }).catch(noop);
+  }
+
+  function bufferedAheadSeconds() {
+    const currentTime = video.currentTime;
+    for (let index = 0; index < video.buffered.length; index += 1) {
+      const start = video.buffered.start(index);
+      const end = video.buffered.end(index);
+      if (start <= currentTime && currentTime <= end) {
+        return Math.max(0, end - currentTime);
+      }
+    }
+    return 0;
+  }
+
+  function handleVideoSeeking() {
+    pendingStreamSeekAt = performance.now();
+    prioritizeStreamSeek();
+  }
+
+  function reportStreamSeekPlayback() {
+    if (pendingStreamSeekAt === null) return;
+    const reportURL = streamSeekPlaybackReportURL(
+      src,
+      performance.now() - pendingStreamSeekAt,
+      bufferedAheadSeconds() * 1000,
+      video.readyState
+    );
+    pendingStreamSeekAt = null;
+    if (!reportURL) return;
+    void fetch(reportURL, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      keepalive: true,
+    }).catch(noop);
+  }
+
   function handleVideoError() {
     playbackErrorActive = true;
     const fallbackMessage = mediaErrorMessage(video.error);
@@ -603,6 +692,9 @@ function mountArtPlayer({
   art.on("video:loadeddata", handleReady);
   art.on("video:canplay", handleReady);
   art.on("video:playing", handleReady);
+
+  video.addEventListener("seeking", handleVideoSeeking);
+  video.addEventListener("playing", reportStreamSeekPlayback);
   art.on("video:error", handleVideoError);
   art.on("error", handleVideoError);
   art.on("video:play", handlePlay);
@@ -629,6 +721,8 @@ function mountArtPlayer({
     unbindOrientationToggle();
     setPlayerFastRateHint(art, false);
     mount.removeEventListener("contextmenu", preventContextMenu);
+    video.removeEventListener("seeking", handleVideoSeeking);
+    video.removeEventListener("playing", reportStreamSeekPlayback);
     destroyHls(video);
     art.off("video:loadstart", handleLoadStart);
     art.off("video:loadeddata", handleReady);

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +74,580 @@ func TestCryptDriverDecryptsNonZeroPlaintextRange(t *testing.T) {
 	}
 	if string(got) != string(plain[6:15]) {
 		t.Fatalf("plaintext range = %q, want %q", got, plain[6:15])
+	}
+}
+
+func TestCryptDriverFallsBackWhenDownloadIgnoresRanges(t *testing.T) {
+	plain := bytes.Repeat([]byte("crypt-range-fallback-"), 256*1024)
+	base := New(Config{ID: "quark-crypt", Cookie: "cookie"})
+	cryptDrive, err := NewCrypt(base, CryptConfig{
+		Password:                "test password",
+		Salt:                    "test salt",
+		FilenameEncryption:      "standard",
+		DirectoryNameEncryption: true,
+		FilenameEncoding:        "base64",
+		Suffix:                  ".bin",
+	})
+	if err != nil {
+		t.Fatalf("NewCrypt: %v", err)
+	}
+	encryptedReader, err := cryptDrive.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("EncryptData: %v", err)
+	}
+	encrypted, err := io.ReadAll(encryptedReader)
+	if err != nil {
+		t.Fatalf("read encrypted data: %v", err)
+	}
+
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file/download":
+			writeQuarkTestJSON(w, map[string]any{
+				"code": 0,
+				"data": []map[string]string{{"download_url": upstream.URL + "/content"}},
+			})
+		case "/content":
+			// Deliberately ignore Range, as affected Quark CDN nodes do.
+			_, _ = w.Write(encrypted)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	base.apiBase = upstream.URL
+
+	const offset = 3*1024*1024 + 17
+	const length = 12345
+	body, err := cryptDrive.OpenPlaintextRange(context.Background(), "file-1", offset, length)
+	if err != nil {
+		t.Fatalf("OpenPlaintextRange: %v", err)
+	}
+	got, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close plaintext range: read=%v close=%v", readErr, closeErr)
+	}
+	if string(got) != string(plain[offset:offset+length]) {
+		t.Fatalf("plaintext range did not match requested bytes")
+	}
+}
+
+func TestCryptDriverRefreshesDownloadLinkForEachPlaintextRange(t *testing.T) {
+	plain := bytes.Repeat([]byte("crypt-header-cache-"), 16*1024)
+	base := New(Config{ID: "quark-crypt", Cookie: "cookie"})
+	cryptDrive, err := NewCrypt(base, CryptConfig{
+		Password:                "test password",
+		Salt:                    "test salt",
+		FilenameEncryption:      "standard",
+		DirectoryNameEncryption: true,
+		FilenameEncoding:        "base64",
+		Suffix:                  ".bin",
+	})
+	if err != nil {
+		t.Fatalf("NewCrypt: %v", err)
+	}
+	encryptedReader, err := cryptDrive.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("EncryptData: %v", err)
+	}
+	encrypted, err := io.ReadAll(encryptedReader)
+	if err != nil {
+		t.Fatalf("read encrypted data: %v", err)
+	}
+
+	contentRequests := 0
+	downloadRequests := 0
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file/download":
+			downloadRequests++
+			writeQuarkTestJSON(w, map[string]any{
+				"code": 0,
+				"data": []map[string]string{{"download_url": upstream.URL + "/content"}},
+			})
+		case "/content":
+			contentRequests++
+			http.ServeContent(w, r, "encrypted.bin", time.Time{}, bytes.NewReader(encrypted))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	base.apiBase = upstream.URL
+
+	if _, err := cryptDrive.PlaintextSize(context.Background(), "file-1"); err != nil {
+		t.Fatalf("PlaintextSize: %v", err)
+	}
+	const offset = 100 * 1024
+	const length = 1024
+	body, err := cryptDrive.OpenPlaintextRange(context.Background(), "file-1", offset, length)
+	if err != nil {
+		t.Fatalf("OpenPlaintextRange: %v", err)
+	}
+	got, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close plaintext range: read=%v close=%v", readErr, closeErr)
+	}
+	if string(got) != string(plain[offset:offset+length]) {
+		t.Fatalf("plaintext range did not match requested bytes")
+	}
+	if contentRequests != 2 {
+		t.Fatalf("content requests = %d, want 2 (size probe and first requested range)", contentRequests)
+	}
+	if downloadRequests != 2 {
+		t.Fatalf("download-link requests = %d, want 2 (size probe and first browser range)", downloadRequests)
+	}
+
+	body, err = cryptDrive.OpenPlaintextRange(context.Background(), "file-1", offset+length, length)
+	if err != nil {
+		t.Fatalf("second OpenPlaintextRange: %v", err)
+	}
+	got, readErr = io.ReadAll(body)
+	closeErr = body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close second plaintext range: read=%v close=%v", readErr, closeErr)
+	}
+	if string(got) != string(plain[offset+length:offset+2*length]) {
+		t.Fatalf("second plaintext range did not match requested bytes")
+	}
+	if downloadRequests != 3 {
+		t.Fatalf("download-link requests = %d, want a fresh link for each browser range", downloadRequests)
+	}
+}
+
+func TestCryptDriverSniffsPlaintextContentType(t *testing.T) {
+	plain := append([]byte{
+		0, 0, 0, 24, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm',
+		0, 0, 0, 1, 'i', 's', 'o', 'm', 'm', 'p', '4', '2',
+	}, bytes.Repeat([]byte{0}, 1024)...)
+	base := New(Config{ID: "quark-crypt", Cookie: "cookie"})
+	cryptDrive, err := NewCrypt(base, CryptConfig{Password: "test password", Salt: "test salt"})
+	if err != nil {
+		t.Fatalf("NewCrypt: %v", err)
+	}
+	encryptedReader, err := cryptDrive.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("EncryptData: %v", err)
+	}
+	encrypted, err := io.ReadAll(encryptedReader)
+	if err != nil {
+		t.Fatalf("read encrypted data: %v", err)
+	}
+
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file/download":
+			writeQuarkTestJSON(w, map[string]any{
+				"code": 0,
+				"data": []map[string]string{{"download_url": upstream.URL + "/content"}},
+			})
+		case "/content":
+			http.ServeContent(w, r, "encrypted.bin", time.Time{}, bytes.NewReader(encrypted))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	base.apiBase = upstream.URL
+
+	body, err := cryptDrive.OpenPlaintextRange(context.Background(), "file-1", 0, int64(len(plain)))
+	if err != nil {
+		t.Fatalf("OpenPlaintextRange: %v", err)
+	}
+	got, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close plaintext range: read=%v close=%v", readErr, closeErr)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("plaintext content did not match")
+	}
+	if gotType := cryptDrive.PlaintextContentType("file-1"); gotType != "video/mp4" {
+		t.Fatalf("PlaintextContentType = %q, want video/mp4", gotType)
+	}
+}
+
+func TestCryptDriverPrefetchesLargeEncryptedRange(t *testing.T) {
+	plain := bytes.Repeat([]byte("crypt-prefetch-range-"), 1280*1024)
+	base := New(Config{ID: "quark-crypt", Cookie: "cookie"})
+	cryptDrive, err := NewCrypt(base, CryptConfig{Password: "test password", Salt: "test salt"})
+	if err != nil {
+		t.Fatalf("NewCrypt: %v", err)
+	}
+	encryptedReader, err := cryptDrive.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("EncryptData: %v", err)
+	}
+	encrypted, err := io.ReadAll(encryptedReader)
+	if err != nil {
+		t.Fatalf("read encrypted data: %v", err)
+	}
+	cryptDrive.rememberFile("file-1", cryptFile{
+		plaintextSize: int64(len(plain)),
+		encryptedSize: int64(len(encrypted)),
+		name:          "movie.mp4",
+	})
+
+	started := make(chan struct{}, quarkCryptPartConcurrency)
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file/download":
+			writeQuarkTestJSON(w, map[string]any{
+				"code": 0,
+				"data": []map[string]string{{"download_url": upstream.URL + "/content"}},
+			})
+		case "/content":
+			parts := strings.Split(strings.TrimPrefix(r.Header.Get("Range"), "bytes="), "-")
+			if len(parts) != 2 {
+				t.Fatalf("missing range header: %q", r.Header.Get("Range"))
+			}
+			start, err := strconv.ParseInt(parts[0], 10, 64)
+			if err != nil {
+				t.Fatalf("parse range start: %v", err)
+			}
+			end, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				t.Fatalf("parse range end: %v", err)
+			}
+			if start < 0 || end < start || end >= int64(len(encrypted)) {
+				t.Fatalf("unexpected range %d-%d for %d bytes", start, end, len(encrypted))
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(encrypted)))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			part := encrypted[start : end+1]
+			if len(part) <= cryptFileHeaderSize {
+				_, _ = w.Write(part)
+				return
+			}
+			_, _ = w.Write(part[:cryptFileHeaderSize])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			started <- struct{}{}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = w.Write(part[cryptFileHeaderSize:])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	base.apiBase = upstream.URL
+
+	if _, err := cryptDrive.PlaintextSize(context.Background(), "file-1"); err != nil {
+		t.Fatalf("PlaintextSize: %v", err)
+	}
+	body, err := cryptDrive.OpenPlaintextRange(context.Background(), "file-1", 0, int64(len(plain)))
+	if err != nil {
+		t.Fatalf("OpenPlaintextRange: %v", err)
+	}
+	defer body.Close()
+
+	for i := 0; i < quarkCryptPartConcurrency; i++ {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("only %d/%d encrypted range requests started", i, quarkCryptPartConcurrency)
+		}
+	}
+	close(release)
+	released = true
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read plaintext range: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("prefetched plaintext did not match source")
+	}
+}
+
+func TestEncryptedRangePrefetchStreamsPartBeforeFullDownload(t *testing.T) {
+	prefix := bytes.Repeat([]byte("b"), 64*1024)
+	total := quarkCryptPartSize + 128*1024
+	layout := quarkCryptPartLayout(total)
+	if len(layout) != 2 {
+		t.Fatalf("layout parts = %d, want 2", len(layout))
+	}
+	first := bytes.Repeat([]byte("a"), int(layout[0]))
+	tail := bytes.Repeat([]byte("c"), int(layout[1])-len(prefix))
+	second := append(append([]byte{}, prefix...), tail...)
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+
+	open := func(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+		switch offset {
+		case 0:
+			if length != int64(len(first)) {
+				return nil, fmt.Errorf("first length = %d, want %d", length, len(first))
+			}
+			return io.NopCloser(bytes.NewReader(first)), nil
+		case int64(len(first)):
+			if length != int64(len(second)) {
+				return nil, fmt.Errorf("second length = %d, want %d", length, len(second))
+			}
+			reader, writer := io.Pipe()
+			go func() {
+				defer writer.Close()
+				if _, err := writer.Write(prefix); err != nil {
+					return
+				}
+				close(secondStarted)
+				select {
+				case <-releaseSecond:
+				case <-ctx.Done():
+					return
+				}
+				_, _ = writer.Write(tail)
+			}()
+			return reader, nil
+		default:
+			return nil, fmt.Errorf("unexpected encrypted offset %d", offset)
+		}
+	}
+
+	body, err := newEncryptedRangePrefetchReader(context.Background(), 0, total, open, nil, quarkCryptPartConcurrency-1)
+	if err != nil {
+		t.Fatalf("newEncryptedRangePrefetchReader: %v", err)
+	}
+	defer body.Close()
+
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second encrypted range did not begin downloading")
+	}
+	gotFirst := make([]byte, len(first))
+	if _, err := io.ReadFull(body, gotFirst); err != nil {
+		t.Fatalf("read first part: %v", err)
+	}
+	if !bytes.Equal(gotFirst, first) {
+		t.Fatal("first part did not match source")
+	}
+
+	readPrefix := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	go func() {
+		data := make([]byte, len(prefix))
+		_, err := io.ReadFull(body, data)
+		readPrefix <- struct {
+			data []byte
+			err  error
+		}{data: data, err: err}
+	}()
+	select {
+	case result := <-readPrefix:
+		if result.err != nil {
+			t.Fatalf("read already-downloaded second-part bytes: %v", result.err)
+		}
+		if !bytes.Equal(result.data, prefix) {
+			t.Fatal("streamed second-part prefix did not match source")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reader waited for the complete second part instead of streaming its prefix")
+	}
+
+	close(releaseSecond)
+	gotTail, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read second-part tail: %v", err)
+	}
+	if !bytes.Equal(gotTail, tail) {
+		t.Fatal("second-part tail did not match source")
+	}
+}
+
+func TestEncryptedRangePrefetchReadsSequentiallyWithoutBackgroundParts(t *testing.T) {
+	total := quarkCryptPartSize + 128*1024
+	layout := quarkCryptPartLayout(total)
+	first := bytes.Repeat([]byte("a"), int(layout[0]))
+	second := bytes.Repeat([]byte("b"), int(layout[1]))
+	var offsets []int64
+
+	open := func(_ context.Context, offset, length int64) (io.ReadCloser, error) {
+		offsets = append(offsets, offset)
+		switch offset {
+		case 0:
+			if length != int64(len(first)) {
+				return nil, fmt.Errorf("first length = %d, want %d", length, len(first))
+			}
+			return io.NopCloser(bytes.NewReader(first)), nil
+		case int64(len(first)):
+			if length != int64(len(second)) {
+				return nil, fmt.Errorf("second length = %d, want %d", length, len(second))
+			}
+			return io.NopCloser(bytes.NewReader(second)), nil
+		default:
+			return nil, fmt.Errorf("unexpected encrypted offset %d", offset)
+		}
+	}
+
+	body, err := newEncryptedRangePrefetchReader(context.Background(), 0, total, open, nil, 0)
+	if err != nil {
+		t.Fatalf("newEncryptedRangePrefetchReader: %v", err)
+	}
+	defer body.Close()
+
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("read sequential range: %v", err)
+	}
+	if !bytes.Equal(got, append(first, second...)) {
+		t.Fatal("sequential range did not match source")
+	}
+	if len(offsets) != 2 || offsets[0] != 0 || offsets[1] != int64(len(first)) {
+		t.Fatalf("opened offsets = %v, want [0 %d]", offsets, len(first))
+	}
+}
+
+func TestEncryptedRangePrefetchBuffersFirstPartBeforeClientReads(t *testing.T) {
+	total := quarkCryptPartSize + 128*1024
+	layout := quarkCryptPartLayout(total)
+	firstArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+
+	open := func(ctx context.Context, offset, length int64) (io.ReadCloser, error) {
+		switch offset {
+		case 0:
+			if length != layout[0] {
+				return nil, fmt.Errorf("first length = %d, want %d", length, layout[0])
+			}
+			reader, writer := io.Pipe()
+			go func() {
+				defer writer.Close()
+				if _, err := writer.Write(bytes.Repeat([]byte("a"), 64*1024)); err != nil {
+					return
+				}
+				close(firstArrived)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return
+				}
+				_, _ = writer.Write(bytes.Repeat([]byte("a"), int(length)-64*1024))
+			}()
+			return reader, nil
+		case layout[0]:
+			return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("b"), int(length)))), nil
+		default:
+			return nil, fmt.Errorf("unexpected encrypted offset %d", offset)
+		}
+	}
+
+	body, err := newEncryptedRangePrefetchReader(context.Background(), 0, total, open, nil, quarkCryptPartConcurrency-1)
+	if err != nil {
+		t.Fatalf("newEncryptedRangePrefetchReader: %v", err)
+	}
+	defer body.Close()
+
+	select {
+	case <-firstArrived:
+		// The producer pulled data into the first part without a client Read.
+	case <-time.After(time.Second):
+		t.Fatal("first encrypted part waited for the client instead of filling its buffer")
+	}
+	close(releaseFirst)
+}
+
+func TestCryptDriverClampsFinalEncryptedRange(t *testing.T) {
+	plain := append(bytes.Repeat([]byte("crypt-final-range-"), 16*1024), "tail"...)
+	base := New(Config{ID: "quark-crypt", Cookie: "cookie"})
+	cryptDrive, err := NewCrypt(base, CryptConfig{
+		Password:                "test password",
+		Salt:                    "test salt",
+		FilenameEncryption:      "standard",
+		DirectoryNameEncryption: true,
+		FilenameEncoding:        "base64",
+		Suffix:                  ".bin",
+	})
+	if err != nil {
+		t.Fatalf("NewCrypt: %v", err)
+	}
+	encryptedReader, err := cryptDrive.cipher.EncryptData(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("EncryptData: %v", err)
+	}
+	encrypted, err := io.ReadAll(encryptedReader)
+	if err != nil {
+		t.Fatalf("read encrypted data: %v", err)
+	}
+
+	var lastRangeEnd int64 = -1
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/file/download":
+			writeQuarkTestJSON(w, map[string]any{
+				"code": 0,
+				"data": []map[string]string{{"download_url": upstream.URL + "/content"}},
+			})
+		case "/content":
+			parts := strings.Split(strings.TrimPrefix(r.Header.Get("Range"), "bytes="), "-")
+			if len(parts) != 2 {
+				t.Fatalf("missing range header: %q", r.Header.Get("Range"))
+			}
+			start, err := strconv.ParseInt(parts[0], 10, 64)
+			if err != nil {
+				t.Fatalf("parse range start: %v", err)
+			}
+			end, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil {
+				t.Fatalf("parse range end: %v", err)
+			}
+			lastRangeEnd = end
+			if end >= int64(len(encrypted)) {
+				// Simulate strict Quark CDN nodes that ignore an overlong Range.
+				_, _ = w.Write(encrypted)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(encrypted)))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(encrypted[start : end+1])
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	base.apiBase = upstream.URL
+
+	if _, err := cryptDrive.PlaintextSize(context.Background(), "file-1"); err != nil {
+		t.Fatalf("PlaintextSize: %v", err)
+	}
+	const length = 1024
+	offset := int64(len(plain) - length)
+	body, err := cryptDrive.OpenPlaintextRange(context.Background(), "file-1", offset, length)
+	if err != nil {
+		t.Fatalf("OpenPlaintextRange: %v", err)
+	}
+	got, readErr := io.ReadAll(body)
+	closeErr := body.Close()
+	if readErr != nil || closeErr != nil {
+		t.Fatalf("read/close plaintext range: read=%v close=%v", readErr, closeErr)
+	}
+	if string(got) != string(plain[offset:]) {
+		t.Fatalf("plaintext range did not match requested bytes")
+	}
+	if lastRangeEnd != int64(len(encrypted))-1 {
+		t.Fatalf("final encrypted range end = %d, want %d", lastRangeEnd, len(encrypted)-1)
 	}
 }
 

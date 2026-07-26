@@ -136,6 +136,50 @@ func TestHandleStreamDecodesEscapedWildcardFileID(t *testing.T) {
 	}
 }
 
+func TestHandleStreamSeekDecodesEscapedWildcardFileID(t *testing.T) {
+	drv := &apiStreamFakeDrive{}
+	reg := proxy.NewRegistry()
+	reg.Set("drive-1", drv)
+	srv := &Server{Proxy: proxy.New(reg)}
+
+	router := chi.NewRouter()
+	router.Post("/api/stream-seek/{driveID}/*", srv.handleStreamSeek)
+	req := httptest.NewRequest(http.MethodPost, "/api/stream-seek/drive-1/fid%2Fwith%20space", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if drv.prioritizedFileID != "fid/with space" {
+		t.Fatalf("prioritized fileID = %q, want decoded original", drv.prioritizedFileID)
+	}
+}
+
+func TestHandleStreamSeekReportDecodesMetrics(t *testing.T) {
+	drv := &apiStreamFakeDrive{}
+	reg := proxy.NewRegistry()
+	reg.Set("drive-1", drv)
+	srv := &Server{Proxy: proxy.New(reg)}
+
+	router := chi.NewRouter()
+	router.Post("/api/stream-seek-report/{driveID}/*", srv.handleStreamSeekReport)
+	req := httptest.NewRequest(http.MethodPost, "/api/stream-seek-report/drive-1/fid%2Fwith%20space?wait_ms=1234&buffered_ms=5678&ready_state=4", nil)
+	rr := httptest.NewRecorder()
+
+	router.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusNoContent)
+	}
+	if drv.reportedFileID != "fid/with space" {
+		t.Fatalf("fileID = %q, want decoded original", drv.reportedFileID)
+	}
+	if drv.reportedWait != 1234*time.Millisecond || drv.reportedBuffered != 5678*time.Millisecond || drv.reportedReadyState != 4 {
+		t.Fatalf("metrics = wait:%s buffered:%s ready:%d", drv.reportedWait, drv.reportedBuffered, drv.reportedReadyState)
+	}
+}
+
 func TestHandleVideoSubtitlesUsesAnonymousClient(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -1967,8 +2011,13 @@ func sameStringSet(a, b []string) bool {
 }
 
 type apiStreamFakeDrive struct {
-	localPath string
-	fileID    string
+	localPath          string
+	fileID             string
+	prioritizedFileID  string
+	reportedFileID     string
+	reportedWait       time.Duration
+	reportedBuffered   time.Duration
+	reportedReadyState int
 }
 
 func (d *apiStreamFakeDrive) Kind() string { return "fake" }
@@ -1988,6 +2037,15 @@ func (d *apiStreamFakeDrive) StreamURL(_ context.Context, fileID string) (*drive
 		URL:     d.localPath,
 		Expires: time.Now().Add(time.Minute),
 	}, nil
+}
+func (d *apiStreamFakeDrive) PrioritizePlaintextSeek(fileID string) {
+	d.prioritizedFileID = fileID
+}
+func (d *apiStreamFakeDrive) ReportPlaintextSeekPlayback(fileID string, wait, buffered time.Duration, readyState int) {
+	d.reportedFileID = fileID
+	d.reportedWait = wait
+	d.reportedBuffered = buffered
+	d.reportedReadyState = readyState
 }
 func (d *apiStreamFakeDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
 	return "", drives.ErrNotSupported

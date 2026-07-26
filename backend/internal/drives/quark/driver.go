@@ -82,8 +82,13 @@ func New(c Config) *Driver {
 		// Init returns this sanitized error before contacting Quark. Keeping New
 		// non-failing preserves the driver construction contract used elsewhere.
 		d.proxyErr = err
-	} else if transport != nil {
-		d.client.SetTransport(transport)
+	} else {
+		if transport == nil {
+			transport = http.DefaultTransport.(*http.Transport).Clone()
+		} else {
+			d.client.SetTransport(transport)
+		}
+		configureStreamTransport(transport)
 		d.streamHTTPClient = &http.Client{Transport: transport}
 	}
 	return d

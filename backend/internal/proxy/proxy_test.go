@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -134,6 +135,24 @@ func TestServeStreamReportsRecoveryAndCoalescesRepeatedSuccess(t *testing.T) {
 	}
 	if updates[0].status != "error" || updates[1].status != "ok" || updates[1].lastError != "" {
 		t.Fatalf("status updates = %#v", updates)
+	}
+}
+
+func TestPrioritizeStreamSeekDelegatesOnlyToSupportingDrive(t *testing.T) {
+	reg := NewRegistry()
+	drive := &proxySeekPriorityDrive{
+		proxyFakeSimpleDrive: &proxyFakeSimpleDrive{kind: "quark"},
+	}
+	reg.Set("quark", drive)
+	reg.Set("plain", &proxyFakeSimpleDrive{kind: "plain"})
+	p := New(reg)
+
+	p.PrioritizeStreamSeek("quark", "file/with space")
+	p.PrioritizeStreamSeek("plain", "ignored")
+	p.PrioritizeStreamSeek("missing", "ignored")
+
+	if drive.fileID != "file/with space" {
+		t.Fatalf("prioritized fileID = %q", drive.fileID)
 	}
 }
 
@@ -675,6 +694,33 @@ func TestServeStreamServesLocalFilePath(t *testing.T) {
 	}
 }
 
+func TestServeStreamPlaintextRangeDoesNotSetFreshnessCacheControl(t *testing.T) {
+	reg := NewRegistry()
+	reg.Set("quark", &proxyPlaintextDrive{data: []byte("0123456789")})
+	p := New(reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/quark/file-1", nil)
+	req.Header.Set("Range", "bytes=3-6")
+	rr := httptest.NewRecorder()
+	p.ServeStream(rr, req, "quark", "file-1")
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusPartialContent)
+	}
+	if got := rr.Header().Get("Content-Range"); got != "bytes 3-6/10" {
+		t.Fatalf("Content-Range = %q", got)
+	}
+	if got := rr.Header().Get("Content-Length"); got != "4" {
+		t.Fatalf("Content-Length = %q", got)
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "" {
+		t.Fatalf("Cache-Control = %q, want no explicit freshness policy", got)
+	}
+	if got := rr.Body.String(); got != "3456" {
+		t.Fatalf("body = %q, want range bytes", got)
+	}
+}
+
 func TestLocalFilePathWindowsDrive(t *testing.T) {
 	// Unix 绝对路径在 Linux 上是合法本地文件，在 Windows 上不是
 	unixAbsWant := false
@@ -784,3 +830,42 @@ func (d *proxyFakeSimpleDrive) EnsureDir(context.Context, string) (string, error
 	return "", drives.ErrNotSupported
 }
 func (d *proxyFakeSimpleDrive) RootID() string { return "0" }
+
+type proxyPlaintextDrive struct {
+	data []byte
+}
+
+type proxySeekPriorityDrive struct {
+	*proxyFakeSimpleDrive
+	fileID string
+}
+
+func (d *proxySeekPriorityDrive) PrioritizePlaintextSeek(fileID string) {
+	d.fileID = fileID
+}
+
+func (d *proxyPlaintextDrive) Kind() string               { return "quark" }
+func (d *proxyPlaintextDrive) ID() string                 { return "quark" }
+func (d *proxyPlaintextDrive) Init(context.Context) error { return nil }
+func (d *proxyPlaintextDrive) List(context.Context, string) ([]drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *proxyPlaintextDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *proxyPlaintextDrive) StreamURL(context.Context, string) (*drives.StreamLink, error) {
+	return &drives.StreamLink{PlaintextSource: d, PlaintextFileID: "file-1"}, nil
+}
+func (d *proxyPlaintextDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *proxyPlaintextDrive) EnsureDir(context.Context, string) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *proxyPlaintextDrive) RootID() string { return "0" }
+func (d *proxyPlaintextDrive) PlaintextSize(context.Context, string) (int64, error) {
+	return int64(len(d.data)), nil
+}
+func (d *proxyPlaintextDrive) OpenPlaintextRange(_ context.Context, _ string, offset, limit int64) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(d.data[offset : offset+limit])), nil
+}

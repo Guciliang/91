@@ -1,6 +1,8 @@
 services:
   video-site-91:
-    image: ghcr.io/nianzhibai/91:stable
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: video-site-91
     ports:
       - "9191:9191"
