@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -20,17 +21,31 @@ const (
 	shortsFeedLookupChunk  = 32
 	shortsFeedTTL          = 24 * time.Hour
 	maxShortsFeedSessions  = 64
+	shortsLinkPrewarmCount = 2
+	// Slightly longer than proxy link resolution's hard timeout so a timed-out
+	// provider call keeps occupying its global slot until the detached resolver
+	// actually exits.
+	shortsLinkPrewarmTimeout = 16 * time.Second
 )
 
 var errShortsFeedExpired = errors.New("shorts feed expired")
+var shortsLinkPrewarmSlots = make(chan struct{}, 4)
 
 // ShortsItemDTO is a compact feed item that can be handed directly to a video
 // element. FeedCursor is the resume position immediately after this item.
+// SizeBytes/DurationSeconds 让前端能算出这一条的平均码率。短视频页的
+// 预加载门槛原本只按"缓冲够多少秒"判定，但带宽是按字节付的：本库平均
+// ~10 Mbps，12 秒就是 ~15 MB，网速跟不上时门槛永远达不到，预载授权
+// 一直发不出去，退化成没有预载的串行加载。有了码率才能把门槛换算成
+// 一份固定的字节预算。任一元数据缺失时两个字段会一起省略，前端需要兜底。
 type ShortsItemDTO struct {
 	VideoDTO
-	VideoSrc   string `json:"videoSrc"`
-	Poster     string `json:"poster"`
-	FeedCursor int    `json:"feedCursor,omitempty"`
+	VideoSrc         string `json:"videoSrc"`
+	Poster           string `json:"poster"`
+	BackgroundPoster string `json:"backgroundPoster,omitempty"`
+	SizeBytes        int64  `json:"sizeBytes,omitempty"`
+	DurationSeconds  int    `json:"durationSeconds,omitempty"`
+	FeedCursor       int    `json:"feedCursor,omitempty"`
 }
 
 type shortsFeedSession struct {
@@ -117,14 +132,55 @@ func (s *Server) handleShortsNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	items := s.mapShortsItems(r.Context(), videos, itemCursors)
+	s.prewarmShortsStreamLinks(videos, r.Header)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, shortsFeedResponse{
-		Items:         s.mapShortsItems(r.Context(), videos, itemCursors),
+		Items:         items,
 		Total:         len(videoIDs),
 		FeedToken:     feedToken,
 		NextCursor:    nextCursor,
 		RoundComplete: nextCursor >= len(videoIDs),
 	})
+}
+
+// Resolve only the first couple of browser-facing stream links in the background.
+// The proxy coalesces this with a real /p/stream request if playback arrives first;
+// a small global semaphore prevents several clients from flooding provider APIs.
+func (s *Server) prewarmShortsStreamLinks(videos []*catalog.Video, requestHeader http.Header) {
+	if s.Proxy == nil {
+		return
+	}
+	header := make(http.Header)
+	if userAgent := requestHeader.Get("User-Agent"); userAgent != "" {
+		header.Set("User-Agent", userAgent)
+	}
+
+	scheduled := 0
+	for _, video := range videos {
+		driveID, fileID, ok := videoStreamTarget(video)
+		if !ok {
+			continue
+		}
+		select {
+		case shortsLinkPrewarmSlots <- struct{}{}:
+		default:
+			return
+		}
+		scheduled++
+		go func(driveID, fileID string) {
+			defer func() { <-shortsLinkPrewarmSlots }()
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				shortsLinkPrewarmTimeout,
+			)
+			defer cancel()
+			_ = s.Proxy.WarmStreamLink(ctx, driveID, fileID, header)
+		}(driveID, fileID)
+		if scheduled >= shortsLinkPrewarmCount {
+			return
+		}
+	}
 }
 
 func shortsQueryInt(r *http.Request, name string, fallback int) (int, error) {
@@ -152,6 +208,12 @@ func (s *Server) shortsNow() time.Time {
 
 func (s *Server) storeShortsFeed(token string, videoIDs []string) {
 	now := s.shortsNow()
+	s.rememberShortsFeed(token, videoIDs, now)
+	s.persistShortsFeed(token, videoIDs, now)
+}
+
+// rememberShortsFeed 把快照放进内存会话表（含 TTL 清理与 LRU 淘汰）。
+func (s *Server) rememberShortsFeed(token string, videoIDs []string, now time.Time) {
 	s.shortsFeedMu.Lock()
 	defer s.shortsFeedMu.Unlock()
 
@@ -182,18 +244,79 @@ func (s *Server) storeShortsFeed(token string, videoIDs []string) {
 	}
 }
 
+// persistShortsFeed 尽力而为地把快照落盘：失败只影响重启后的续播，
+// 不影响当前内存会话，因此记录日志后继续。TTL 与数量上限的持久层
+// 清理也在写入时顺带完成。
+func (s *Server) persistShortsFeed(token string, videoIDs []string, now time.Time) {
+	if s.Catalog == nil {
+		return
+	}
+	ctx := context.Background()
+	if err := s.Catalog.SaveShortsFeed(ctx, token, videoIDs, now); err != nil {
+		log.Printf("shorts: persist feed session: %v", err)
+		return
+	}
+	if err := s.Catalog.PruneShortsFeeds(ctx, now.Add(-shortsFeedTTL), maxShortsFeedSessions); err != nil {
+		log.Printf("shorts: prune persisted feed sessions: %v", err)
+	}
+}
+
 func (s *Server) loadShortsFeed(token string) ([]string, error) {
 	now := s.shortsNow()
 	s.shortsFeedMu.Lock()
-	defer s.shortsFeedMu.Unlock()
-
 	s.pruneShortsFeedsLocked(now)
-	feed := s.shortsFeeds[token]
-	if feed == nil {
+	if feed := s.shortsFeeds[token]; feed != nil {
+		feed.lastAccess = now
+		videoIDs := feed.videoIDs
+		s.shortsFeedMu.Unlock()
+		s.touchPersistedShortsFeed(token, now)
+		return videoIDs, nil
+	}
+	s.shortsFeedMu.Unlock()
+
+	// 内存里没有（进程重启或被 LRU 淘汰）：尝试从持久化快照恢复同一轮次。
+	videoIDs := s.loadPersistedShortsFeed(token, now)
+	if videoIDs == nil {
 		return nil, errShortsFeedExpired
 	}
-	feed.lastAccess = now
-	return feed.videoIDs, nil
+	s.rememberShortsFeed(token, videoIDs, now)
+	return videoIDs, nil
+}
+
+// loadPersistedShortsFeed 读取并校验持久化快照；确定过期时顺带删除，
+// 读取出错时保留数据（等 TTL 清理），只当作会话失效处理。
+func (s *Server) loadPersistedShortsFeed(token string, now time.Time) []string {
+	if s.Catalog == nil {
+		return nil
+	}
+	ctx := context.Background()
+	videoIDs, lastAccess, err := s.Catalog.LoadShortsFeed(ctx, token)
+	if err != nil {
+		log.Printf("shorts: load persisted feed session: %v", err)
+		return nil
+	}
+	if videoIDs == nil {
+		return nil
+	}
+	if len(videoIDs) == 0 || now.Sub(lastAccess) >= shortsFeedTTL {
+		if err := s.Catalog.DeleteShortsFeed(ctx, token); err != nil {
+			log.Printf("shorts: delete expired feed session: %v", err)
+		}
+		return nil
+	}
+	if err := s.Catalog.TouchShortsFeed(ctx, token, now); err != nil {
+		log.Printf("shorts: touch persisted feed session: %v", err)
+	}
+	return videoIDs
+}
+
+func (s *Server) touchPersistedShortsFeed(token string, now time.Time) {
+	if s.Catalog == nil {
+		return
+	}
+	if err := s.Catalog.TouchShortsFeed(context.Background(), token, now); err != nil {
+		log.Printf("shorts: touch persisted feed session: %v", err)
+	}
 }
 
 func (s *Server) pruneShortsFeedsLocked(now time.Time) {
@@ -251,6 +374,14 @@ func (s *Server) mapShortsItems(
 	out := make([]ShortsItemDTO, 0, len(videos))
 	for index, video := range videos {
 		dto := mapVideo(video)
+		videoSrc, sizeBytes := s.videoSourceAndSize(video)
+		durationSeconds := video.DurationSeconds
+		// 大小与时长必须成对出现。任一缺失时把两者都省略，让前端明确
+		// 识别为"码率未知"，而不是收到一半可用的元数据。
+		if sizeBytes <= 0 || durationSeconds <= 0 {
+			sizeBytes = 0
+			durationSeconds = 0
+		}
 		if label, ok := driveLabels[video.DriveID]; ok {
 			dto.SourceLabel = label
 		} else if drive, err := s.Catalog.GetDrive(ctx, video.DriveID); err == nil {
@@ -262,12 +393,27 @@ func (s *Server) mapShortsItems(
 		if index < len(itemCursors) {
 			feedCursor = itemCursors[index]
 		}
+		poster := thumbnailURL(video)
 		out = append(out, ShortsItemDTO{
-			VideoDTO:   dto,
-			VideoSrc:   s.videoSource(video),
-			Poster:     thumbnailURL(video),
-			FeedCursor: feedCursor,
+			VideoDTO:         dto,
+			VideoSrc:         videoSrc,
+			Poster:           poster,
+			BackgroundPoster: shortsBackgroundPosterURL(poster),
+			SizeBytes:        sizeBytes,
+			DurationSeconds:  durationSeconds,
+			FeedCursor:       feedCursor,
 		})
 	}
 	return out
+}
+
+func shortsBackgroundPosterURL(poster string) string {
+	if !strings.HasPrefix(poster, "/p/thumb/") {
+		return ""
+	}
+	separator := "?"
+	if strings.ContainsRune(poster, '?') {
+		separator = "&"
+	}
+	return poster + separator + "variant=shorts-bg"
 }

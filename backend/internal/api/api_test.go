@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -71,6 +74,50 @@ func TestVideoSourceKeepsDirectStreamForMp4(t *testing.T) {
 
 	if got != "/p/stream/drive-1/file-1" {
 		t.Fatalf("video source = %q, want direct stream route", got)
+	}
+}
+
+func TestPlaybackMediaTypeDescribesSelectedResource(t *testing.T) {
+	tests := []struct {
+		name  string
+		video *catalog.Video
+		want  string
+	}{
+		{
+			name:  "mp4",
+			video: &catalog.Video{Ext: "MP4"},
+			want:  "video/mp4",
+		},
+		{
+			name:  "m4v",
+			video: &catalog.Video{Ext: ".m4v"},
+			want:  "video/mp4",
+		},
+		{
+			name: "ready transcode",
+			video: &catalog.Video{
+				Ext:              "mkv",
+				TranscodeStatus:  "ready",
+				TranscodedFileID: "transcoded.mp4",
+			},
+			want: "video/mp4",
+		},
+		{
+			name:  "untranscoded mkv",
+			video: &catalog.Video{Ext: "mkv"},
+			want:  "",
+		},
+		{
+			name: "missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := playbackMediaType(tt.video); got != tt.want {
+				t.Fatalf("media type = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -653,6 +700,22 @@ func TestThumbnailURLVersionsLocalGeneratedThumbnails(t *testing.T) {
 	})
 	if got != remote {
 		t.Fatalf("remote thumbnail URL = %q, want unchanged %q", got, remote)
+	}
+}
+
+func TestShortsBackgroundPosterURLUsesLocalThumbnailVariant(t *testing.T) {
+	if got := shortsBackgroundPosterURL("/p/thumb/video-1?v=1778863000123"); got !=
+		"/p/thumb/video-1?v=1778863000123&variant=shorts-bg" {
+		t.Fatalf("versioned shorts background URL = %q", got)
+	}
+	if got := shortsBackgroundPosterURL("/p/thumb/video-1"); got !=
+		"/p/thumb/video-1?variant=shorts-bg" {
+		t.Fatalf("unversioned shorts background URL = %q", got)
+	}
+
+	remote := "https://thumb.example/video-1.jpg"
+	if got := shortsBackgroundPosterURL(remote); got != "" {
+		t.Fatalf("remote shorts background URL = %q, want omitted", got)
 	}
 }
 
@@ -1397,6 +1460,65 @@ func TestHandleThumbServesHashedPathForLongVideoID(t *testing.T) {
 	}
 }
 
+func TestHandleThumbServesSmallPreblurredShortsBackground(t *testing.T) {
+	localDir := t.TempDir()
+	thumbPath := mediaasset.ThumbnailPath(localDir, "video-1")
+	if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
+		t.Fatalf("mkdir thumb dir: %v", err)
+	}
+	source, err := os.Create(thumbPath)
+	if err != nil {
+		t.Fatalf("create thumb: %v", err)
+	}
+	frame := image.NewRGBA(image.Rect(0, 0, 480, 270))
+	for y := 0; y < frame.Bounds().Dy(); y++ {
+		for x := 0; x < frame.Bounds().Dx(); x++ {
+			frame.SetRGBA(x, y, color.RGBA{
+				R: uint8(x % 256),
+				G: uint8(y % 256),
+				B: uint8((x + y) % 256),
+				A: 255,
+			})
+		}
+	}
+	if err := jpeg.Encode(source, frame, &jpeg.Options{Quality: 80}); err != nil {
+		_ = source.Close()
+		t.Fatalf("encode thumb: %v", err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("close thumb: %v", err)
+	}
+
+	server := &Server{
+		LocalDir: localDir,
+		Proxy:    proxy.New(proxy.NewRegistry()),
+	}
+	req := requestWithRouteParam(
+		http.MethodGet,
+		"/p/thumb/video-1?variant=shorts-bg",
+		"videoID",
+		"video-1",
+		strings.NewReader(``),
+	)
+	rr := httptest.NewRecorder()
+
+	server.handleThumb(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	generated, err := jpeg.Decode(bytes.NewReader(rr.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("decode generated background: %v", err)
+	}
+	if longest := max(generated.Bounds().Dx(), generated.Bounds().Dy()); longest > 96 {
+		t.Fatalf("generated dimensions = %v, want longest side <= 96", generated.Bounds())
+	}
+	if _, err := os.Stat(mediaasset.ShortsBackgroundPath(localDir, "video-1")); err != nil {
+		t.Fatalf("generated background cache: %v", err)
+	}
+}
+
 func TestHandleTagsReturnsUnifiedTagPool(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -1569,6 +1691,182 @@ func TestHandleShortsNextUsesStableFeedTokenAndCursor(t *testing.T) {
 	}
 }
 
+// 短视频页要用 sizeBytes/durationSeconds 算平均码率，把预加载门槛从固定
+// 秒数换算成一份固定的字节预算。两者缺一不可，且元数据缺失时必须整个省略
+// （omitempty），前端才能识别"码率未知"并退回原来的固定门槛。
+func TestHandleShortsNextCarriesBitrateMetadata(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	seed := func(id string, size int64, duration int) {
+		t.Helper()
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID:              id,
+			DriveID:         "drive",
+			FileID:          "file-" + id,
+			Title:           id,
+			Size:            size,
+			DurationSeconds: duration,
+			PublishedAt:     now,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("sized", 300<<20, 388)
+	seed("unsized", 0, 0)
+	seed("size-only", 100<<20, 0)
+	seed("duration-only", 0, 120)
+	seed("transcoded", 300<<20, 300)
+	if err := cat.UpdateVideoTranscode(
+		ctx,
+		"transcoded",
+		"ready",
+		"",
+		"file-transcoded-output",
+		30<<20,
+	); err != nil {
+		t.Fatalf("mark transcoded video ready: %v", err)
+	}
+
+	server := &Server{Catalog: cat}
+	req := httptest.NewRequest(http.MethodGet, "/api/shorts/next?count=5", nil)
+	rr := httptest.NewRecorder()
+	server.handleShortsNext(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+
+	var response shortsFeedResponse
+	if err := json.NewDecoder(strings.NewReader(body)).Decode(&response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byID := make(map[string]ShortsItemDTO, len(response.Items))
+	for _, item := range response.Items {
+		byID[item.ID] = item
+	}
+
+	sized, ok := byID["sized"]
+	if !ok {
+		t.Fatalf("feed did not return the sized video: %s", body)
+	}
+	if sized.SizeBytes != 300<<20 || sized.DurationSeconds != 388 {
+		t.Fatalf("sized item = %d bytes / %ds, want 314572800 / 388", sized.SizeBytes, sized.DurationSeconds)
+	}
+
+	transcoded, ok := byID["transcoded"]
+	if !ok {
+		t.Fatalf("feed did not return the transcoded video: %s", body)
+	}
+	if transcoded.VideoSrc != "/p/stream/drive/file-transcoded-output" {
+		t.Fatalf("transcoded video source = %q, want the transcoded asset", transcoded.VideoSrc)
+	}
+	if transcoded.SizeBytes != 30<<20 || transcoded.DurationSeconds != 300 {
+		t.Fatalf(
+			"transcoded item = %d bytes / %ds, want the 31457280-byte playback asset / 300s",
+			transcoded.SizeBytes,
+			transcoded.DurationSeconds,
+		)
+	}
+
+	var rawResponse struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &rawResponse); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	rawByID := make(map[string]map[string]json.RawMessage, len(rawResponse.Items))
+	for _, item := range rawResponse.Items {
+		var id string
+		if err := json.Unmarshal(item["id"], &id); err != nil {
+			t.Fatalf("decode raw item id: %v", err)
+		}
+		rawByID[id] = item
+	}
+	assertMetadataKeys := func(id string, want bool) {
+		t.Helper()
+		item, ok := rawByID[id]
+		if !ok {
+			t.Fatalf("feed did not return %s: %s", id, body)
+		}
+		_, hasSize := item["sizeBytes"]
+		_, hasDuration := item["durationSeconds"]
+		if hasSize != want || hasDuration != want {
+			t.Fatalf(
+				"%s metadata keys = size:%t duration:%t, want both %t: %s",
+				id,
+				hasSize,
+				hasDuration,
+				want,
+				body,
+			)
+		}
+	}
+	assertMetadataKeys("sized", true)
+	assertMetadataKeys("transcoded", true)
+	for _, id := range []string{"unsized", "size-only", "duration-only"} {
+		assertMetadataKeys(id, false)
+	}
+}
+
+func TestPrewarmShortsStreamLinksUsesFirstTwoPlaybackTargetsAndUserAgent(t *testing.T) {
+	registry := proxy.NewRegistry()
+	drive := &apiPrewarmDrive{calls: make(chan apiPrewarmCall, 3)}
+	registry.Set("drive", drive)
+	server := &Server{Proxy: proxy.New(registry)}
+	videos := []*catalog.Video{
+		{
+			ID:               "transcoded",
+			DriveID:          "drive",
+			FileID:           "original-1",
+			TranscodeStatus:  "ready",
+			TranscodedFileID: "transcoded-1",
+		},
+		{ID: "original", DriveID: "drive", FileID: "original-2"},
+		{ID: "third", DriveID: "drive", FileID: "original-3"},
+		{ID: "upload", DriveID: localUploadDriveID, FileID: "upload.mp4"},
+	}
+
+	server.prewarmShortsStreamLinks(
+		videos,
+		http.Header{"User-Agent": {"Shorts-Browser"}},
+	)
+
+	got := make([]apiPrewarmCall, 0, 2)
+	for len(got) < 2 {
+		select {
+		case call := <-drive.calls:
+			got = append(got, call)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for prewarm calls; got %#v", got)
+		}
+	}
+	targets := map[string]bool{}
+	for _, call := range got {
+		targets[call.fileID] = true
+	}
+	if !targets["transcoded-1"] || !targets["original-2"] || len(targets) != 2 {
+		t.Fatalf("prewarm calls = %#v, want the first two playback targets", got)
+	}
+	for _, call := range got {
+		if call.userAgent != "Shorts-Browser" {
+			t.Fatalf("prewarm UA = %q, want Shorts-Browser", call.userAgent)
+		}
+	}
+	select {
+	case extra := <-drive.calls:
+		t.Fatalf("unexpected third prewarm call: %#v", extra)
+	default:
+	}
+}
+
 func TestHandleShortsNextSkipsVideosHiddenAfterFeedCreation(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -1689,6 +1987,119 @@ func TestShortsFeedStoreEvictsLeastRecentlyUsedSession(t *testing.T) {
 	}
 }
 
+func TestHandleShortsNextResumesFeedAfterServerRestart(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	for index := 0; index < 7; index++ {
+		id := "restart-" + strconv.Itoa(index)
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID: id, DriveID: "drive", FileID: "file-" + id, Title: id,
+			PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	requestBatch := func(server *Server, path string) shortsFeedResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		server.handleShortsNext(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var response shortsFeedResponse
+		if err := json.NewDecoder(rr.Body).Decode(&response); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return response
+	}
+
+	serverA := &Server{Catalog: cat}
+	first := requestBatch(serverA, "/api/shorts/next?count=3")
+	if first.FeedToken == "" || len(first.Items) != 3 {
+		t.Fatalf("first response = %#v, want 3 items with token", first)
+	}
+
+	// 模拟后端重启：同一个库、新的 Server（内存会话表为空）
+	serverB := &Server{Catalog: cat}
+	resumed := requestBatch(
+		serverB,
+		"/api/shorts/next?feedToken="+first.FeedToken+"&cursor="+strconv.Itoa(first.NextCursor)+"&count=4",
+	)
+	if len(resumed.Items) != 4 || !resumed.RoundComplete {
+		t.Fatalf("resumed response = %#v, want final 4 items of the same round", resumed)
+	}
+	seen := make(map[string]struct{}, 7)
+	for _, item := range append(append([]ShortsItemDTO{}, first.Items...), resumed.Items...) {
+		if _, duplicate := seen[item.ID]; duplicate {
+			t.Fatalf("resumed round repeated video %s", item.ID)
+		}
+		seen[item.ID] = struct{}{}
+	}
+	if len(seen) != 7 {
+		t.Fatalf("round covered %d unique videos, want 7", len(seen))
+	}
+
+	// 重启后的快照顺序与重启前完全一致：重放首批得到相同条目
+	replayed := requestBatch(serverB, "/api/shorts/next?feedToken="+first.FeedToken+"&cursor=0&count=3")
+	for index := range first.Items {
+		if replayed.Items[index].ID != first.Items[index].ID {
+			t.Fatalf("replayed item %d = %s, want %s", index, replayed.Items[index].ID, first.Items[index].ID)
+		}
+	}
+}
+
+func TestHandleShortsNextExpiresPersistedFeedAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "persisted-video", DriveID: "drive", FileID: "file", Title: "persisted video",
+		PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	clock := now
+	serverA := &Server{Catalog: cat, shortsFeedNow: func() time.Time { return clock }}
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/shorts/next?count=1", nil)
+	firstRR := httptest.NewRecorder()
+	serverA.handleShortsNext(firstRR, firstReq)
+	var first shortsFeedResponse
+	if err := json.NewDecoder(firstRR.Body).Decode(&first); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+
+	// 重启后持久化快照依然要按 TTL 过期，不能变成永久令牌
+	clock = clock.Add(shortsFeedTTL)
+	serverB := &Server{Catalog: cat, shortsFeedNow: func() time.Time { return clock }}
+	expiredReq := httptest.NewRequest(
+		http.MethodGet,
+		"/api/shorts/next?feedToken="+first.FeedToken+"&cursor="+strconv.Itoa(first.NextCursor)+"&count=1",
+		nil,
+	)
+	expiredRR := httptest.NewRecorder()
+	serverB.handleShortsNext(expiredRR, expiredReq)
+	if expiredRR.Code != http.StatusGone {
+		t.Fatalf("expired status = %d, want %d; body = %s", expiredRR.Code, http.StatusGone, expiredRR.Body.String())
+	}
+	if ids, _, err := cat.LoadShortsFeed(ctx, first.FeedToken); err != nil || ids != nil {
+		t.Fatalf("expired persisted session = (%#v, %v), want pruned", ids, err)
+	}
+}
+
 func TestHandleUpdateVideoTagsRejectsUnknownTags(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
@@ -1792,6 +2203,7 @@ func TestHandleVideoDetailIncludesDriveKindLabel(t *testing.T) {
 		ID:          "video-1",
 		DriveID:     "drive-onedrive",
 		FileID:      "file-1",
+		Ext:         "mp4",
 		Title:       "Video",
 		PublishedAt: now,
 		CreatedAt:   now,
@@ -1813,6 +2225,9 @@ func TestHandleVideoDetailIncludesDriveKindLabel(t *testing.T) {
 	}
 	if got.SourceLabel != "OneDrive" {
 		t.Fatalf("sourceLabel = %q, want OneDrive", got.SourceLabel)
+	}
+	if got.MediaType != "video/mp4" {
+		t.Fatalf("mediaType = %q, want video/mp4", got.MediaType)
 	}
 }
 
@@ -2054,6 +2469,42 @@ func (d *apiStreamFakeDrive) EnsureDir(context.Context, string) (string, error) 
 	return "", drives.ErrNotSupported
 }
 func (d *apiStreamFakeDrive) RootID() string { return "root" }
+
+type apiPrewarmCall struct {
+	fileID    string
+	userAgent string
+}
+
+type apiPrewarmDrive struct {
+	calls chan apiPrewarmCall
+}
+
+func (d *apiPrewarmDrive) Kind() string               { return "p115" }
+func (d *apiPrewarmDrive) ID() string                 { return "drive" }
+func (d *apiPrewarmDrive) Init(context.Context) error { return nil }
+func (d *apiPrewarmDrive) List(context.Context, string) ([]drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *apiPrewarmDrive) Stat(context.Context, string) (*drives.Entry, error) {
+	return nil, drives.ErrNotSupported
+}
+func (d *apiPrewarmDrive) StreamURL(ctx context.Context, fileID string) (*drives.StreamLink, error) {
+	return d.StreamURLWithHeader(ctx, fileID, nil)
+}
+func (d *apiPrewarmDrive) StreamURLWithHeader(_ context.Context, fileID string, header http.Header) (*drives.StreamLink, error) {
+	d.calls <- apiPrewarmCall{fileID: fileID, userAgent: header.Get("User-Agent")}
+	return &drives.StreamLink{
+		URL:     "https://cdn.example/" + fileID,
+		Expires: time.Now().Add(10 * time.Minute),
+	}, nil
+}
+func (d *apiPrewarmDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *apiPrewarmDrive) EnsureDir(context.Context, string) (string, error) {
+	return "", drives.ErrNotSupported
+}
+func (d *apiPrewarmDrive) RootID() string { return "root" }
 
 type apiFakeSubtitleClient struct {
 	subtitles     []subtitles.Subtitle
