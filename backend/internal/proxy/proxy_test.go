@@ -592,6 +592,9 @@ func TestServeStreamRelaysWebDAV302ToBrowser(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Basic dmlkZW86c2VjcmV0" {
 			t.Errorf("OpenList Authorization = %q", got)
 		}
+		if got := r.Header.Get("User-Agent"); got != "Browser-A" {
+			t.Errorf("OpenList User-Agent = %q, want browser User-Agent", got)
+		}
 		if got := r.Header.Get("Cookie"); got != "dav_session=secret" {
 			t.Errorf("OpenList Cookie = %q", got)
 		}
@@ -617,6 +620,7 @@ func TestServeStreamRelaysWebDAV302ToBrowser(t *testing.T) {
 	p := New(reg)
 	req := httptest.NewRequest(http.MethodGet, "/p/stream/webdav/video.mp4", nil)
 	req.Header.Set("Range", "bytes=2-5")
+	req.Header.Set("User-Agent", "Browser-A")
 	rr := httptest.NewRecorder()
 	p.ServeStream(rr, req, "webdav", "/video.mp4")
 

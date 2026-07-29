@@ -410,6 +410,14 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, link *drives.Strea
 			req.Header.Add(k, v)
 		}
 	}
+	// Some OpenList-backed download URLs are bound to the User-Agent used to
+	// obtain the redirect. Keep the browser and the first hop aligned when the
+	// redirect will be passed through to that browser.
+	if link.PassThroughRedirects {
+		if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
+			req.Header.Set("User-Agent", userAgent)
+		}
+	}
 	// 透传 Range
 	if rng := r.Header.Get("Range"); rng != "" {
 		req.Header.Set("Range", rng)
