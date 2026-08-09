@@ -43,6 +43,39 @@ func TestHashPasswordCommandProducesBcryptHash(t *testing.T) {
 	}
 }
 
+func TestLoadApplicationConfigSeparatesFileAndRuntimeStoragePaths(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+storage:
+  db_path: "./data/video-site.db"
+  local_preview_dir: "./data/previews"
+logging:
+  directory: "./data/logs"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workingDir := t.TempDir()
+
+	fileConfig, runtimeConfig, err := loadApplicationConfig(configPath, workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileConfig.Storage.DBPath != "./data/video-site.db" ||
+		fileConfig.Storage.LocalPreviewDir != "./data/previews" {
+		t.Fatalf("file storage paths changed: %+v", fileConfig.Storage)
+	}
+	if fileConfig.Logging.Directory != "./data/logs" {
+		t.Fatalf("file logging path changed: %+v", fileConfig.Logging)
+	}
+	if runtimeConfig.Storage.DBPath != filepath.Join(workingDir, "data", "video-site.db") ||
+		runtimeConfig.Storage.LocalPreviewDir != filepath.Join(workingDir, "data", "previews") {
+		t.Fatalf("runtime storage paths = %+v", runtimeConfig.Storage)
+	}
+	if runtimeConfig.Logging.Directory != filepath.Join(workingDir, "data", "logs") {
+		t.Fatalf("runtime logging path = %+v", runtimeConfig.Logging)
+	}
+}
+
 func TestGuangYaPanLegacyRootPath(t *testing.T) {
 	credentials := map[string]string{"root_path": "  影视/电影  "}
 	if got := guangYaPanLegacyRootPath("", credentials); got != "影视/电影" {
@@ -1392,10 +1425,26 @@ func TestCleanupMissingPikPakVideosRemovesDatabaseRowsAndLocalAssets(t *testing.
 	}
 	removed, err := app.cleanupMissingDriveVideos(ctx, "PikPak", map[string]struct{}{"kept": {}}, nil, true)
 	if err != nil {
-		t.Fatalf("cleanup missing videos: %v", err)
+		t.Fatalf("first cleanup missing videos: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("first removed = %d, want 0 before confirmation", removed)
+	}
+	if _, err := cat.GetVideo(ctx, "pikpak-PikPak-obsolete"); err != nil {
+		t.Fatalf("obsolete video removed after one scan: %v", err)
+	}
+	for _, path := range []string{obsoletePreview, obsoleteThumb} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("asset %s removed after one scan: %v", path, err)
+		}
+	}
+
+	removed, err = app.cleanupMissingDriveVideos(ctx, "PikPak", map[string]struct{}{"kept": {}}, nil, true)
+	if err != nil {
+		t.Fatalf("confirmed cleanup missing videos: %v", err)
 	}
 	if removed != 1 {
-		t.Fatalf("removed = %d, want 1", removed)
+		t.Fatalf("confirmed removed = %d, want 1", removed)
 	}
 	if _, err := cat.GetVideo(ctx, "pikpak-PikPak-obsolete"); err != sql.ErrNoRows {
 		t.Fatalf("obsolete video lookup error = %v, want sql.ErrNoRows", err)

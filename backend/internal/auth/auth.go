@@ -8,16 +8,14 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"net"
 	"net/http"
-	"net/netip"
-	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/requestmeta"
 )
 
 const (
@@ -59,7 +57,7 @@ func SessionIdentityFromContext(ctx context.Context) (string, bool) {
 
 func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request, user, pass string) (bool, error) {
 	expectedUser, expectedPass := a.Credentials()
-	ip := clientIP(r)
+	ip := requestmeta.ClientIP(r)
 	if ip != "" {
 		banned, err := a.Catalog.IsLoginIPBanned(r.Context(), ip)
 		if err != nil {
@@ -104,6 +102,45 @@ func (a *Authenticator) SetCredentials(username, password string) {
 	defer a.credMu.Unlock()
 	a.Username = username
 	a.Password = password
+}
+
+// CheckCurrentPassword re-authenticates the administrator represented by the
+// request's current session. Database-backed administrators are checked
+// against their bcrypt hash; a legacy user_id=0 session is checked against the
+// configured administrator password.
+func (a *Authenticator) CheckCurrentPassword(r *http.Request, password string) (bool, error) {
+	if a == nil || a.Catalog == nil || r == nil {
+		return false, nil
+	}
+	cookie, err := r.Cookie(sessionCookie)
+	if err != nil {
+		if errors.Is(err, http.ErrNoCookie) {
+			return false, nil
+		}
+		return false, err
+	}
+	session, found, err := a.Catalog.GetSession(r.Context(), cookie.Value)
+	if err != nil || !found {
+		return false, err
+	}
+	if !a.now().Before(session.ExpiresAt) {
+		return false, nil
+	}
+	if session.UserID == 0 {
+		_, expected := a.Credentials()
+		return subtle.ConstantTimeCompare([]byte(password), []byte(expected)) == 1, nil
+	}
+	user, err := a.Catalog.GetUserByID(r.Context(), session.UserID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	if user.Banned || user.Role != "admin" {
+		return false, nil
+	}
+	return checkPassword(password, user.Password), nil
 }
 
 func (a *Authenticator) recordFailure(r *http.Request, ip string) error {
@@ -226,80 +263,11 @@ func randomToken() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func clientIP(r *http.Request) string {
-	remote := remoteIP(r.RemoteAddr)
-	if remote.IsValid() && isTrustedProxy(remote) {
-		if ip := forwardedClientIP(r.Header.Get("X-Forwarded-For")); ip != "" {
-			return ip
-		}
-		if ip := parseIPHeader(r.Header.Get("X-Real-IP")); ip != "" {
-			return ip
-		}
-	}
-	if remote.IsValid() {
-		return remote.String()
-	}
-	return ""
-}
-
-func remoteIP(remoteAddr string) netip.Addr {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err == nil {
-		if ip, err := netip.ParseAddr(strings.TrimSpace(host)); err == nil {
-			return ip.Unmap()
-		}
-	}
-	ip, err := netip.ParseAddr(strings.TrimSpace(remoteAddr))
-	if err != nil {
-		return netip.Addr{}
-	}
-	return ip.Unmap()
-}
-
-func isTrustedProxy(ip netip.Addr) bool {
-	return ip.Unmap().IsLoopback()
-}
-
-func forwardedClientIP(header string) string {
-	parts := forwardedIPs(header)
-	for i := len(parts) - 1; i >= 0; i-- {
-		if ip := parseIPHeader(parts[i]); ip != "" {
-			return ip
-		}
-	}
-	return ""
-}
-
-func parseIPHeader(value string) string {
-	ip, err := netip.ParseAddr(strings.TrimSpace(value))
-	if err != nil {
-		return ""
-	}
-	return ip.Unmap().String()
-}
-
-func forwardedIPs(header string) []string {
-	if strings.TrimSpace(header) == "" {
-		return nil
-	}
-	parts := strings.Split(header, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		out = append(out, strings.TrimSpace(part))
-	}
-	return out
-}
-
-func isValidIP(ip string) bool {
-	_, err := netip.ParseAddr(strings.TrimSpace(ip))
-	return err == nil
-}
-
 // UserLogin authenticates a user (admin or regular) from the users table.
 // Falls back to config-based credentials for backward compatibility.
 // Returns the role on success, empty string on failure.
 func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, pass string) (string, error) {
-	ip := clientIP(r)
+	ip := requestmeta.ClientIP(r)
 	if ip != "" {
 		banned, err := a.Catalog.IsLoginIPBanned(r.Context(), ip)
 		if err != nil {

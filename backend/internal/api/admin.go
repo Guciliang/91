@@ -7,14 +7,24 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/auth"
+	"github.com/video-site/backend/internal/backup"
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives/quark"
 )
 
 type AdminServer struct {
 	Catalog *catalog.Catalog
 	Auth    *auth.Authenticator
+	Backups *backup.Manager
+	// Logs is the durable runtime log store exposed only through the
+	// administrator-authenticated routes below.
+	Logs *applog.Store
+	// ConfigManager owns the real config.yaml management surface. Both visual
+	// and source editors read and write this same document.
+	ConfigManager *config.Manager
 	// VersionFilePath points to the installer-written .version file.
 	VersionFilePath string
 	// ImageVersion is the Docker image version injected at build/runtime.
@@ -50,17 +60,16 @@ type AdminServer struct {
 	// 处理完候选列表后任务自然结束。
 	OnStartDriveTranscode func(driveID string) (bool, string)
 	// OnStopDriveTranscode 手动停止某盘正在进行的转码任务。返回是否有任务被停。
-	OnStopDriveTranscode func(driveID string) bool
-	OnDeleteVideo        func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
-	// OnMergeDuplicateVideo 疑似重复复核的合并动作：保留 keepID，把 removeID
-	// 按重复墓碑删除并清理本地资产（与夜间自动去重同一条删除路径）。
-	OnMergeDuplicateVideo          func(ctx context.Context, keepID, removeID string) error
+	OnStopDriveTranscode           func(driveID string) bool
+	OnDeleteVideo                  func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
 	OnStartBlacklistSourceDelete   func(BlacklistSourceDeleteRequest) bool
 	GetBlacklistSourceDeleteStatus func() BlacklistSourceDeleteStatus
 	OnStartTagRetag                func() bool
-	GetTagJobStatus                func() TagJobStatus
-	GetDriveGenerationStatuses     func() map[string]DriveGenerationStatuses
-	GetPreviewGenerationVideoIDs   func() map[string]bool
+	// OnTagsChanged invalidates read-side tag caches after a catalog mutation.
+	OnTagsChanged                func()
+	GetTagJobStatus              func() TagJobStatus
+	GetDriveGenerationStatuses   func() map[string]DriveGenerationStatuses
+	GetPreviewGenerationVideoIDs func() map[string]bool
 	// OnTeaserEnabledChanged 在 per-drive 预览视频开关被切换后调用。
 	// enabled=true 时上层应该重新把 pending 预览视频入队（类似旧的全局开关从关到开）；
 	// enabled=false 时通常不用做事 —— worker 入队前会再次查 catalog，自然停止。
@@ -68,11 +77,12 @@ type AdminServer struct {
 	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
 	SetTheme func(theme string) error
-	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 爬虫 +
-	// Phase3 上传）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
-	// 看进度。若流水线正在跑或已排队，Runner 会拒绝重复触发。
-	OnRunNightlyJob func() bool
-	// GetNightlyJobStatus 返回凌晨流水线当前状态，用于前端禁用重复触发按钮。
+	// OnRunScanAllJob 触发一次手动全量扫盘：只扫描配置的真实云盘、等待新视频
+	// 资产生成并运行视频去重。爬虫、迁移和恢复只属于定时 nightly 流水线。
+	// 立即返回；若共享 Runner 正在跑或已排队，会拒绝重复触发。
+	OnRunScanAllJob func() bool
+	// GetNightlyJobStatus 返回共享维护 Runner 的状态，用于避免手动扫盘、单盘任务
+	// 和定时 nightly 流水线互相重叠。
 	GetNightlyJobStatus func() NightlyJobStatus
 	// ListDriveDirChildren 列出某个 drive 在 parentID 目录下的直接子目录。
 	// parentID 为空时使用 drive 的 RootID。返回 (子目录列表, error)。
@@ -237,9 +247,6 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Delete("/videos/{id}", a.handleDeleteVideo)
 			r.Post("/videos/regen-preview", a.handleRegenAllPreviews)
 			r.Post("/videos/{id}/regen-preview", a.handleRegenPreview)
-			// 疑似重复复核（夜间内容级查重的 near-miss 队列）
-			r.Get("/duplicate-reviews", a.handleListDuplicateReviews)
-			r.Post("/duplicate-reviews/{id}/resolve", a.handleResolveDuplicateReview)
 			// 黑名单（被拉黑/手动删除、扫盘不再入库的视频）
 			r.Get("/blacklist", a.handleListBlacklist)
 			r.Get("/blacklist/source-delete/status", a.handleBlacklistSourceDeleteStatus)
@@ -266,12 +273,30 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/banned-ips", a.handleListBannedIPs)
 			r.Delete("/banned-ips/{ip}", a.handleUnbanIP)
 
-			// 运行时设置
+			// 配置文件与其它独立设置
+			r.Get("/config.yaml", a.handleGetConfigYAML)
+			r.Put("/config.yaml", a.handlePutConfigYAML)
 			r.Get("/settings", a.handleGetSettings)
 			r.Put("/settings", a.handlePutSettings)
 
 			// 运维任务
 			r.Get("/update/check", a.handleCheckUpdate)
+			r.Get("/logs", a.handleLogs)
+			r.Delete("/logs", a.handleClearLogs)
+			r.Get("/backups", a.handleListBackups)
+			r.Post("/backups", a.handleCreateBackup)
+			r.Post("/backups/current/cancel", a.handleCancelBackup)
+			r.Get("/backups/{id}/download", a.handleDownloadBackup)
+			r.Delete("/backups/{id}", a.handleDeleteBackup)
+			r.Post("/backups/{id}/restore", a.handleRestoreBackup)
+			r.Post("/backup-uploads", a.handleBeginBackupUpload)
+			r.Get("/backup-uploads/{id}", a.handleBackupUploadStatus)
+			r.Put("/backup-uploads/{id}/chunks/{index}", a.handleBackupUploadChunk)
+			r.Post("/backup-uploads/{id}/finalize", a.handleFinalizeBackupUpload)
+			r.Delete("/backup-uploads/{id}", a.handleCancelBackupUpload)
+			r.Get("/jobs/scan-all/status", a.handleScanAllJobStatus)
+			r.Post("/jobs/scan-all/run", a.handleRunScanAllJob)
+			// 兼容旧前端缓存；旧路径现在也遵循“只扫盘 + 去重”的语义。
 			r.Get("/jobs/nightly/status", a.handleNightlyJobStatus)
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
 			r.Post("/tasks/stop", a.handleStopAllTasks)

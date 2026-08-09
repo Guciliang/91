@@ -211,6 +211,9 @@ func (d *CryptDriver) decryptEntry(entry drives.Entry) (drives.Entry, int64, err
 	entry.Name = name
 	entry.Size = size
 	entry.MimeType = guessMime(name)
+	// The provider hash describes ciphertext and must not be persisted as the
+	// plaintext video's content hash during upload reconciliation.
+	entry.Hash = ""
 	return entry, size, nil
 }
 
@@ -236,6 +239,10 @@ func (d *CryptDriver) MakeDir(ctx context.Context, parentID, name string) (strin
 }
 
 func (d *CryptDriver) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	uploader, ok := d.base.(drives.Uploader)
+	if !ok {
+		return "", drives.ErrNotSupported
+	}
 	parts := splitPath(pathFromRoot)
 	if len(parts) == 0 {
 		return d.RootID(), nil
@@ -243,10 +250,14 @@ func (d *CryptDriver) EnsureDir(ctx context.Context, pathFromRoot string) (strin
 	for i, name := range parts {
 		parts[i] = d.cipher.EncryptDirName(name)
 	}
-	return d.base.EnsureDir(ctx, strings.Join(parts, "/"))
+	return uploader.EnsureDir(ctx, strings.Join(parts, "/"))
 }
 
 func (d *CryptDriver) Upload(ctx context.Context, parentID, name string, r io.Reader, size int64) (string, error) {
+	uploader, ok := d.base.(drives.Uploader)
+	if !ok {
+		return "", drives.ErrNotSupported
+	}
 	if size < 0 {
 		return "", errors.New("quark crypt: upload size is required")
 	}
@@ -254,7 +265,7 @@ func (d *CryptDriver) Upload(ctx context.Context, parentID, name string, r io.Re
 	if err != nil {
 		return "", fmt.Errorf("quark crypt: encrypt upload: %w", err)
 	}
-	fileID, err := d.base.Upload(ctx, parentID, d.cipher.EncryptFileName(name), encrypted, d.cipher.EncryptedSize(size))
+	fileID, err := uploader.Upload(ctx, parentID, d.cipher.EncryptFileName(name), encrypted, d.cipher.EncryptedSize(size))
 	if err != nil {
 		return "", err
 	}
@@ -267,7 +278,11 @@ func (d *CryptDriver) Upload(ctx context.Context, parentID, name string, r io.Re
 	return fileID, nil
 }
 
-func (d *CryptDriver) UploadAndReportSHA1(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+func (d *CryptDriver) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	uploader, ok := d.base.(drives.Uploader)
+	if !ok {
+		return UploadResult{}, drives.ErrNotSupported
+	}
 	if size < 0 {
 		return UploadResult{}, errors.New("quark crypt: upload size is required")
 	}
@@ -276,7 +291,7 @@ func (d *CryptDriver) UploadAndReportSHA1(ctx context.Context, parentID, name st
 	if err != nil {
 		return UploadResult{}, fmt.Errorf("quark crypt: encrypt upload: %w", err)
 	}
-	fileID, err := d.base.Upload(ctx, parentID, d.cipher.EncryptFileName(name), encrypted, d.cipher.EncryptedSize(size))
+	fileID, err := uploader.Upload(ctx, parentID, d.cipher.EncryptFileName(name), encrypted, d.cipher.EncryptedSize(size))
 	if err != nil {
 		return UploadResult{}, err
 	}
@@ -286,7 +301,7 @@ func (d *CryptDriver) UploadAndReportSHA1(ctx context.Context, parentID, name st
 		name:          name,
 		contentType:   guessMime(name),
 	})
-	return UploadResult{FileID: fileID, SHA1: hex.EncodeToString(hash.Sum(nil)), Size: size}, nil
+	return UploadResult{FileID: fileID, Hash: hex.EncodeToString(hash.Sum(nil)), Size: size}, nil
 }
 
 func (d *CryptDriver) Rename(ctx context.Context, fileID, newName string) error {

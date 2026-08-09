@@ -21,7 +21,9 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/video-site/backend/internal/api"
+	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/auth"
+	"github.com/video-site/backend/internal/backup"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/crawlerupload"
@@ -32,6 +34,7 @@ import (
 	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
+	"github.com/video-site/backend/internal/remoteupload"
 	"github.com/video-site/backend/internal/subtitles"
 )
 
@@ -54,14 +57,48 @@ func main() {
 		}
 		return
 	}
+	// stderr is always kept as the operational log sink. The durable admin log
+	// file is attached after configuration paths have been resolved.
+	log.SetOutput(os.Stderr)
 
 	cfgPath := "./config.yaml"
 	if v := os.Getenv("VIDEO_CONFIG"); v != "" {
 		cfgPath = v
 	}
-	cfg, err := config.Load(cfgPath)
+	workingDir, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("resolve startup directory: %v", err)
+	}
+	fileConfig, cfg, err := loadApplicationConfig(cfgPath, workingDir)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+
+	// A restore is activated before SQLite is opened. The switch itself only
+	// uses same-directory renames; opening and migrating the restored catalog
+	// below is the commit check. If that check fails, every switched path is
+	// returned to its pre-restore value.
+	dataRoot := filepath.Dir(cfg.Storage.DBPath)
+	_, pendingRestoreStatErr := os.Stat(backup.PendingMarkerPath(dataRoot))
+	pendingRestoreAtStartup := pendingRestoreStatErr == nil
+	appliedRestore, err := backup.ApplyPendingRestore(dataRoot)
+	if err != nil {
+		log.Fatalf("apply pending restore: %v", err)
+	}
+	// Reload after either applying a restore or resuming an interrupted
+	// rollback. The config read before ApplyPendingRestore may have belonged to
+	// the opposite side of the directory switch.
+	if appliedRestore != nil || pendingRestoreAtStartup {
+		fileConfig, cfg, err = loadApplicationConfig(cfgPath, workingDir)
+		if err != nil {
+			if appliedRestore != nil {
+				if rollbackErr := backup.RollbackAppliedRestore(appliedRestore, err); rollbackErr != nil {
+					log.Fatalf("reload restored config: %v (rollback failed: %v)", err, rollbackErr)
+				}
+				log.Fatalf("reload restored config: %v; old data restored", err)
+			}
+			log.Fatalf("reload config after restore rollback: %v", err)
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(cfg.Storage.DBPath), 0o755); err != nil {
@@ -73,13 +110,77 @@ func main() {
 
 	cat, err := catalog.Open(cfg.Storage.DBPath)
 	if err != nil {
+		if appliedRestore != nil {
+			if rollbackErr := backup.RollbackAppliedRestore(appliedRestore, err); rollbackErr != nil {
+				log.Fatalf("open restored catalog: %v (rollback failed: %v)", err, rollbackErr)
+			}
+			log.Fatalf("open restored catalog: %v; old data restored and will be used after restart", err)
+		}
 		log.Fatalf("open catalog: %v", err)
 	}
 	defer cat.Close()
+	if appliedRestore != nil {
+		if err := backup.CommitAppliedRestore(appliedRestore); err != nil {
+			log.Printf("[restore] restored catalog opened, but rollback cleanup/report write failed: %v", err)
+		} else {
+			log.Printf("[restore] backup restored successfully; previous sessions were cleared")
+		}
+	}
+	configManager, err := config.NewManager(cfgPath)
+	if err != nil {
+		log.Fatalf("configure config manager: %v", err)
+	}
+	legacyRuntimeSettings, err := loadLegacyRuntimeSettings(context.Background(), cat)
+	if err != nil {
+		log.Fatalf("load legacy runtime settings: %v", err)
+	}
+	configMigrated, err := configManager.MigrateLegacyRuntimeSettings(legacyRuntimeSettings)
+	if err != nil {
+		log.Fatalf("migrate config.yaml runtime settings: %v", err)
+	}
+	if err := cat.DeleteSettings(
+		context.Background(),
+		legacyNightlyStartTimeSetting,
+		legacyBuiltinTagsEnabledSetting,
+		obsoleteDuplicateReviewEnabledSetting,
+	); err != nil {
+		log.Fatalf("remove migrated SQLite configuration: %v", err)
+	}
+	if configMigrated {
+		fileConfig, cfg, err = loadApplicationConfig(cfgPath, workingDir)
+		if err != nil {
+			log.Fatalf("reload migrated config: %v", err)
+		}
+		log.Printf("[config] migrated runtime settings into config.yaml")
+	}
+
+	var logStore *applog.Store
+	if cfg.Logging.IsFileEnabled() {
+		logStore, err = applog.Open(applog.Config{
+			Directory:         cfg.Logging.Directory,
+			MaxLineBytes:      applog.DefaultMaxLineBytes,
+			MaxFileSizeBytes:  int64(cfg.Logging.MaxFileSizeMB) * 1024 * 1024,
+			MaxTotalSizeBytes: int64(cfg.Logging.MaxTotalSizeMB) * 1024 * 1024,
+		})
+		if err != nil {
+			log.Printf("[logging] file logging unavailable: %v", err)
+			logStore = nil
+		} else {
+			defer func() {
+				if closeErr := logStore.Close(); closeErr != nil {
+					fmt.Fprintf(os.Stderr, "close runtime log: %v\n", closeErr)
+				}
+			}()
+			log.SetOutput(io.MultiWriter(os.Stderr, logStore.Writer(applog.SourceApplication)))
+			log.Printf("[logging] durable runtime log enabled dir=%s max_file_mb=%d max_total_mb=%d",
+				logStore.Directory(), cfg.Logging.MaxFileSizeMB, cfg.Logging.MaxTotalSizeMB)
+		}
+	}
 
 	app := &App{
 		cfg:                cfg,
 		cat:                cat,
+		configManager:      configManager,
 		registry:           proxy.NewRegistry(),
 		workers:            make(map[string]*preview.Worker),
 		thumbWorkers:       make(map[string]*preview.ThumbWorker),
@@ -100,7 +201,15 @@ func main() {
 	// 登录态校验拖慢端口监听。
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if err := configManager.SetApply(func(settings config.LiveSettings) error {
+		return app.applyLiveConfig(ctx, settings)
+	}); err != nil {
+		log.Fatalf("apply initial live configuration: %v", err)
+	}
 
+	if _, err := app.normalizeLegacyThumbnailFiles(ctx); err != nil {
+		log.Printf("[thumbnail-maintenance] migration failed: %v", err)
+	}
 	app.loadTheme(ctx)
 	if removed, err := app.cleanupOrphanDriveVideos(ctx); err != nil {
 		log.Printf("[cleanup] orphan drive videos: %v", err)
@@ -111,6 +220,23 @@ func main() {
 		log.Printf("[local-upload] attach failed: %v", err)
 	}
 	go app.runFingerprintReconciler(ctx)
+
+	remoteUploader, err := remoteupload.New(remoteupload.Config{
+		Catalog:     cat,
+		UploadDir:   app.localUploadDir(),
+		FFprobePath: cfg.Preview.FFprobePath,
+		DiskReserve: cfg.RemoteUpload.DiskReserveBytes,
+		IdleTimeout: time.Duration(cfg.RemoteUpload.IdleTimeoutSeconds) * time.Second,
+		OnVideoUploaded: func(v *catalog.Video) {
+			app.enqueueUploadedVideo(ctx, v)
+		},
+	})
+	if err != nil {
+		log.Fatalf("configure remote upload: %v", err)
+	}
+	if err := remoteUploader.Start(ctx); err != nil {
+		log.Fatalf("start remote upload: %v", err)
+	}
 
 	authr := &auth.Authenticator{
 		Username: cfg.Server.Admin.Username,
@@ -128,10 +254,28 @@ func main() {
 	if versionFilePath == "" {
 		versionFilePath = filepath.Join(filepath.Dir(cfgPath), ".version")
 	}
+	imageVersion := strings.TrimSpace(os.Getenv("VIDEO_IMAGE_VERSION"))
+	appVersion := imageVersion
+	if appVersion == "" {
+		appVersion = readVersionFile(versionFilePath)
+	}
 	githubRepo := strings.TrimSpace(os.Getenv("VIDEO_GITHUB_REPO"))
 	if githubRepo == "" {
 		githubRepo = strings.TrimSpace(os.Getenv("GITHUB_REPO"))
 	}
+	backupManager, err := backup.NewManager(backup.Config{
+		Catalog:        cat,
+		AppConfig:      fileConfig,
+		RuntimeStorage: cfg.Storage,
+		ConfigPath:     cfgPath,
+		AppVersion:     appVersion,
+		RestartManaged: restartIsManaged(),
+	})
+	if err != nil {
+		log.Fatalf("configure backup service: %v", err)
+	}
+	backupManager.Start(ctx)
+	defer backupManager.Close()
 
 	apiServer := &api.Server{
 		Catalog:        cat,
@@ -142,6 +286,7 @@ func main() {
 		OnVideoUploaded: func(v *catalog.Video) {
 			app.enqueueUploadedVideo(ctx, v)
 		},
+		RemoteUploads: remoteUploader,
 		// 前台「不再展示」走拉黑逻辑：删记录 + 删本地封面/预览 + 写墓碑，
 		// 保留网盘源文件（deleteSource=false）。后续任务不再入库；可重新发现的
 		// 普通网盘/爬虫来源可在后台解除墓碑，操作本身不会立即触发扫盘或爬取。
@@ -151,12 +296,16 @@ func main() {
 		},
 		GetTheme: func() string { return app.Theme() },
 	}
+	app.onTagsChanged = apiServer.InvalidateTagCache
 
 	adminServer := &api.AdminServer{
 		Catalog:         cat,
 		Auth:            authr,
+		Backups:         backupManager,
+		Logs:            logStore,
+		ConfigManager:   configManager,
 		VersionFilePath: versionFilePath,
-		ImageVersion:    strings.TrimSpace(os.Getenv("VIDEO_IMAGE_VERSION")),
+		ImageVersion:    imageVersion,
 		GitHubRepo:      githubRepo,
 		SetupRequired: func() bool {
 			setupMu.Lock()
@@ -169,7 +318,7 @@ func main() {
 			if !setupRequired {
 				return nil
 			}
-			if err := config.WriteAdminCredentials(cfgPath, username, password); err != nil {
+			if err := configManager.UpdateAdminCredentials(username, password); err != nil {
 				return err
 			}
 			hashed, err := auth.HashPassword(password)
@@ -179,6 +328,8 @@ func main() {
 			if _, err := cat.CreateUser(ctx, username, hashed, "admin"); err != nil {
 				return err
 			}
+			fileConfig.Server.Admin.Username = username
+			fileConfig.Server.Admin.Password = password
 			cfg.Server.Admin.Username = username
 			cfg.Server.Admin.Password = password
 			authr.SetCredentials(username, password)
@@ -255,9 +406,6 @@ func main() {
 		OnDeleteVideo: func(reqCtx context.Context, videoID string, deleteSource bool) (api.DeleteVideoResult, error) {
 			return app.deleteVideo(reqCtx, videoID, deleteSource)
 		},
-		OnMergeDuplicateVideo: func(reqCtx context.Context, keepID, removeID string) error {
-			return app.mergeDuplicateVideo(reqCtx, keepID, removeID)
-		},
 		OnStartBlacklistSourceDelete: func(req api.BlacklistSourceDeleteRequest) bool {
 			return app.startBlacklistSourceDelete(ctx, req)
 		},
@@ -267,6 +415,7 @@ func main() {
 		OnStartTagRetag: func() bool {
 			return app.startTagRetag(ctx)
 		},
+		OnTagsChanged: apiServer.InvalidateTagCache,
 		GetTagJobStatus: func() api.TagJobStatus {
 			return app.tagJobStatus()
 		},
@@ -292,9 +441,9 @@ func main() {
 		SetTheme: func(theme string) error {
 			return app.SetTheme(ctx, theme)
 		},
-		OnRunNightlyJob: func() bool {
+		OnRunScanAllJob: func() bool {
 			if app.nightlyRunner != nil {
-				return app.nightlyRunner.TriggerNow()
+				return app.nightlyRunner.TriggerScanAll()
 			}
 			return false
 		},
@@ -307,7 +456,12 @@ func main() {
 	}
 
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
+	accessLogger := log.New(
+		os.Stdout,
+		"",
+		log.LstdFlags,
+	)
+	r.Use(requestLogMiddleware(accessLogger, log.Default(), logStore))
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware(cfg.Server.AllowedOrigins))
 
@@ -315,17 +469,18 @@ func main() {
 	adminServer.Register(r)
 	mountFrontend(r)
 
-	// 凌晨流水线：每天 cron_hour 触发一次，串行跑
+	// 凌晨流水线：每天按后台可热更新的 HH:mm 触发一次，串行跑
 	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 删除检测 + 入队封面/预览视频
 	//   Phase 2 脚本爬虫 + 入队预览视频
 	//   Phase 3 爬虫本地视频 → 云盘上传
 	//   Phase 4 扫描爬虫本地目录并恢复已取消拉黑的视频
 	//   Phase 5 全库重复视频维护：精确指纹去重 + 标题/时长/封面近似去重
 	// 标签匹配不在夜间流水线中全库重算；新视频入库和管理员修改标签规则时按事件刷新。
-	// 也响应 admin "扫描所有网盘" 按钮（POST /admin/api/jobs/nightly/run → TriggerNow）。
+	// admin "扫描所有网盘" 使用同一个 Runner 的独立 scan-all 模式，只运行
+	// Phase 1 和 Phase 5，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
 	app.nightlyRunner = nightly.New(nightly.Config{
 		Settings:              cat,
-		CronHour:              cfg.Nightly.CronHour,
+		StartTime:             app.liveConfigSettings().NightlyStartTime,
 		ListScanTargets:       app.listScanTargetIDs,
 		RunScan:               app.runScan,
 		ListCrawlerDrives:     app.listCrawlerDriveIDs,
@@ -335,6 +490,7 @@ func main() {
 		RestoreCrawlerVideos:  app.restoreScriptCrawlerVideos,
 		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
 	})
+	go configManager.Watch(ctx)
 	go app.nightlyRunner.Run(ctx)
 
 	srv := &http.Server{
@@ -354,14 +510,75 @@ func main() {
 	go app.attachExistingDrives(ctx)
 	go app.migrateHiddenVideosToTombstone(ctx)
 
-	// 等待退出信号
+	// 等待退出信号或恢复任务要求的受控重启。
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	<-sigs
+	restoreRestart := false
+	select {
+	case <-sigs:
+	case <-backupManager.RestartRequested():
+		restoreRestart = true
+	}
+	signal.Stop(sigs)
 	log.Println("shutting down...")
+	cancel()
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = srv.Shutdown(shutCtx)
+	remoteShutCtx, remoteShutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer remoteShutCancel()
+	if err := remoteUploader.Shutdown(remoteShutCtx); err != nil {
+		log.Printf("[remote-upload] shutdown: %v", err)
+	}
+	if restoreRestart {
+		// Keep the restore maintenance barrier held until process exit. Releasing
+		// it here would let canceled background workers write after the target
+		// snapshot that is about to replace the live database.
+		log.Printf("[restore] pending restore staged; exiting with restart code %d", backup.RestartExitCode)
+		os.Exit(backup.RestartExitCode)
+	}
+	backupManager.Close()
+}
+
+func loadApplicationConfig(path, workingDir string) (*config.Config, *config.Config, error) {
+	fileConfig, err := config.Load(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	runtimeStorage, err := config.ResolveStoragePaths(fileConfig.Storage, workingDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	runtimeConfig := *fileConfig
+	runtimeConfig.Storage = runtimeStorage
+	runtimeLogging, err := config.ResolveLoggingPaths(fileConfig.Logging, workingDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	runtimeConfig.Logging = runtimeLogging
+	return fileConfig, &runtimeConfig, nil
+}
+
+func readVersionFile(path string) string {
+	data, err := os.ReadFile(strings.TrimSpace(path))
+	if err != nil {
+		return ""
+	}
+	line := strings.SplitN(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n", 2)[0]
+	return strings.TrimSpace(line)
+}
+
+func restartIsManaged() bool {
+	if raw := strings.TrimSpace(os.Getenv("VIDEO_RESTART_MANAGED")); raw != "" {
+		return parseBoolDefault(raw, false)
+	}
+	if strings.TrimSpace(os.Getenv("INVOCATION_ID")) != "" {
+		return true
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	return false
 }
 
 func runHashPasswordCommand(r io.Reader, w io.Writer) error {

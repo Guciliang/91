@@ -26,6 +26,8 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/localupload"
+	"github.com/video-site/backend/internal/localpath"
+	"github.com/video-site/backend/internal/persistence"
 	"github.com/video-site/backend/internal/proxy"
 	"github.com/video-site/backend/internal/subtitles"
 	"github.com/video-site/backend/internal/tagging"
@@ -42,16 +44,6 @@ var allowedUploadExtensions = map[string]struct{}{
 	".webm": {},
 }
 
-var allowedUploadTags = map[string]struct{}{
-	"奶子": {},
-	"女大": {},
-	"人妻": {},
-	"后入": {},
-	"制服": {},
-	"美臀": {},
-	"口交": {},
-}
-
 const maxSubtitleBytes = 20 << 20
 
 type Server struct {
@@ -61,14 +53,16 @@ type Server struct {
 	LocalDir        string
 	UploadDir       string
 	OnVideoUploaded func(*catalog.Video)
+	RemoteUploads   RemoteUploadService
 	// OnHideVideo 处理前台「不再展示」。隐藏机制已废弃，改走拉黑逻辑：
 	// 删除库中记录 + 本地封面/预览，保留网盘源文件，并写黑名单墓碑
 	// （扫盘不再入库）。未注入时回退为旧的 hidden 标记。
 	OnHideVideo func(ctx context.Context, videoID string) error
 
-	tagCacheMu    sync.Mutex
-	tagCacheUntil time.Time
-	tagCache      []TagDTO
+	tagCacheMu      sync.Mutex
+	tagCacheUntil   time.Time
+	tagCache        []TagDTO
+	tagCacheVersion uint64
 
 	shortsFeedMu  sync.Mutex
 	shortsFeeds   map[string]*shortsFeedSession
@@ -89,6 +83,19 @@ type Server struct {
 	subtitleCacheMu  sync.Mutex
 	subtitleCache    map[string]subtitleCacheEntry
 	subtitleCacheNow func() time.Time
+}
+
+// InvalidateTagCache makes catalog mutations visible to the public tag list
+// immediately instead of waiting for the short response cache to expire.
+func (s *Server) InvalidateTagCache() {
+	if s == nil {
+		return
+	}
+	s.tagCacheMu.Lock()
+	s.tagCacheVersion++
+	s.tagCache = nil
+	s.tagCacheUntil = time.Time{}
+	s.tagCacheMu.Unlock()
 }
 
 type subtitleCacheEntry struct {
@@ -215,7 +222,11 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 		r.Use(a.AdminRequired)
 		r.Put("/api/video/{id}/tags", s.handleUpdateVideoTags)
 		r.Post("/api/video/{id}/hide", s.handleHideVideo)
+		r.Get("/api/upload/tags", s.handleUploadTags)
 		r.Post("/api/upload", s.handleUploadVideo)
+		r.Post("/api/upload/remote", s.handleCreateRemoteUpload)
+		r.Get("/api/upload/remote", s.handleListRemoteUploads)
+		r.Post("/api/upload/remote/{jobId}/cancel", s.handleCancelRemoteUpload)
 	})
 }
 
@@ -484,6 +495,7 @@ func appendRandomRelated(picked []*catalog.Video, pool []*catalog.Video, targetL
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	s.tagCacheMu.Lock()
+	cacheVersion := s.tagCacheVersion
 	if s.tagCache != nil && now.Before(s.tagCacheUntil) {
 		out := append([]TagDTO(nil), s.tagCache...)
 		s.tagCacheMu.Unlock()
@@ -503,11 +515,27 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		out = append(out, TagDTO{ID: stat.Label, Label: stat.Label, Count: stat.Count})
 	}
 	s.tagCacheMu.Lock()
-	s.tagCache = append([]TagDTO(nil), out...)
-	s.tagCacheUntil = now.Add(30 * time.Second)
+	if cacheVersion == s.tagCacheVersion {
+		s.tagCache = append([]TagDTO(nil), out...)
+		s.tagCacheUntil = now.Add(30 * time.Second)
+	}
 	s.tagCacheMu.Unlock()
 
 	w.Header().Set("Cache-Control", "private, max-age=15")
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleUploadTags(w http.ResponseWriter, r *http.Request) {
+	tags, err := s.Catalog.ListUserSelectableTags(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]TagDTO, 0, len(tags))
+	for _, tag := range tags {
+		out = append(out, TagDTO{ID: tag.Label, Label: tag.Label, Count: tag.Count})
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -664,26 +692,14 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tags, err := parseUploadTags(uploadTagValues(r))
+	tags, err := s.canonicalUploadTags(r.Context(), uploadTagValues(r))
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	if len(tags) > 0 {
-		canonicalTags := make([]string, 0, len(tags))
-		for _, tag := range tags {
-			label, ok, err := s.Catalog.LookupTagLabel(r.Context(), tag)
-			if err != nil {
-				writeErr(w, http.StatusInternalServerError, err)
-				return
-			}
-			if !ok {
-				writeErr(w, http.StatusBadRequest, fmt.Errorf("unknown upload tag: %s", tag))
-				return
-			}
-			canonicalTags = append(canonicalTags, label)
+		status := http.StatusInternalServerError
+		if isUploadTagValidationError(err) {
+			status = http.StatusBadRequest
 		}
-		tags = canonicalTags
+		writeErr(w, status, err)
+		return
 	}
 
 	now := time.Now()
@@ -712,12 +728,25 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if _, statErr := os.Lstat(dst); statErr == nil {
+		storedName = videoname.UploadFileName(title, ext, uploadID, true)
+		dst, err = s.localUploadFilePath(storedName)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+	} else if !os.IsNotExist(statErr) {
+		writeErr(w, http.StatusInternalServerError, statErr)
+		return
+	}
+	partPath := dst + ".part"
+	out, err := os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
 		storedName = videoname.UploadFileName(title, ext, uploadID, true)
 		dst, err = s.localUploadFilePath(storedName)
 		if err == nil {
-			out, err = os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+			partPath = dst + ".part"
+			out, err = os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		}
 	}
 	if err != nil {
@@ -728,18 +757,48 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 	size, copyErr := io.Copy(out, file)
 	closeErr := out.Close()
 	if copyErr != nil {
-		_ = os.Remove(dst)
+		_ = os.Remove(partPath)
 		writeErr(w, http.StatusInternalServerError, copyErr)
 		return
 	}
 	if closeErr != nil {
-		_ = os.Remove(dst)
+		_ = os.Remove(partPath)
 		writeErr(w, http.StatusInternalServerError, closeErr)
 		return
 	}
 	if size <= 0 {
-		_ = os.Remove(dst)
+		_ = os.Remove(partPath)
 		writeErr(w, http.StatusBadRequest, errors.New("uploaded video is empty"))
+		return
+	}
+	if err := os.Chmod(partPath, 0o644); err != nil {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// The potentially long request-body copy above writes an excluded .part
+	// file. Only publication of the final file and its catalog rows needs to be
+	// atomic with respect to a backup snapshot.
+	persistence.RLock()
+	mutationLocked := true
+	defer func() {
+		if mutationLocked {
+			persistence.RUnlock()
+		}
+	}()
+	if _, err := os.Lstat(dst); err == nil {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusConflict, errors.New("目标视频文件已存在，请重试"))
+		return
+	} else if !os.IsNotExist(err) {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := os.Rename(partPath, dst); err != nil {
+		_ = os.Remove(partPath)
+		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -772,6 +831,8 @@ func (s *Server) handleUploadVideo(w http.ResponseWriter, r *http.Request) {
 			video = saved
 		}
 	}
+	persistence.RUnlock()
+	mutationLocked = false
 	if s.OnVideoUploaded != nil {
 		s.OnVideoUploaded(video)
 	}
@@ -1365,15 +1426,8 @@ func (s *Server) localUploadFilePath(fileID string) (string, error) {
 		return "", errors.New("local upload storage is not configured")
 	}
 	path := filepath.Join(root, fileID)
-	cleanRoot, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	cleanPath, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	if cleanPath != cleanRoot && !strings.HasPrefix(cleanPath, cleanRoot+string(os.PathSeparator)) {
+	cleanPath, ok := localpath.Within(root, path)
+	if !ok {
 		return "", errors.New("invalid upload file id")
 	}
 	return cleanPath, nil
@@ -1412,14 +1466,11 @@ func uploadTitleFromFileName(fileName string) string {
 	return "upload-" + time.Now().Format("20060102150405")
 }
 
-func parseUploadTags(values []string) ([]string, error) {
+func parseUploadTags(values []string) []string {
 	seen := make(map[string]struct{})
 	out := make([]string, 0, len(values))
 	for _, value := range values {
 		for _, label := range splitUploadTags(value) {
-			if _, ok := allowedUploadTags[label]; !ok {
-				return nil, fmt.Errorf("unsupported upload tag: %s", label)
-			}
 			if _, ok := seen[label]; ok {
 				continue
 			}
@@ -1427,7 +1478,40 @@ func parseUploadTags(values []string) ([]string, error) {
 			out = append(out, label)
 		}
 	}
-	return out, nil
+	return out
+}
+
+func (s *Server) canonicalUploadTags(ctx context.Context, values []string) ([]string, error) {
+	tags := parseUploadTags(values)
+	if len(tags) == 0 {
+		return tags, nil
+	}
+	if s.Catalog == nil {
+		return nil, errors.New("catalog is not configured")
+	}
+	canonicalTags := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		label, ok, err := s.Catalog.LookupUserSelectableTagLabel(ctx, tag)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, uploadTagValidationError{
+				fmt.Errorf("unknown upload tag: %s", tag),
+			}
+		}
+		canonicalTags = append(canonicalTags, label)
+	}
+	return canonicalTags, nil
+}
+
+type uploadTagValidationError struct {
+	error
+}
+
+func isUploadTagValidationError(err error) bool {
+	var target uploadTagValidationError
+	return errors.As(err, &target)
 }
 
 func splitUploadTags(value string) []string {

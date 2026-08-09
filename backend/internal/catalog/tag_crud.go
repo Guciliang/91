@@ -454,7 +454,7 @@ ORDER BY cnt DESC, t.label ASC`)
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Tag
+	out := make([]Tag, 0)
 	for rows.Next() {
 		var tag Tag
 		var aliasesJSON, rulesJSON string
@@ -467,6 +467,23 @@ ORDER BY cnt DESC, t.label ASC`)
 		tag.MatchRules = effectiveRule(tag.Label, tag.Aliases, tag.MatchRules)
 		tag.CrawlerOwned = crawlerOwned != 0
 		out = append(out, tag)
+	}
+	return out, nil
+}
+
+// ListUserSelectableTags returns the part of the managed tag catalog intended
+// for explicit user assignment. Keeping this policy beside lookup validation
+// makes the picker and upload write path use the same source of truth.
+func (c *Catalog) ListUserSelectableTags(ctx context.Context) ([]Tag, error) {
+	tags, err := c.ListTags(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Tag, 0, len(tags))
+	for _, tag := range tags {
+		if isUserSelectableTag(tag) {
+			out = append(out, tag)
+		}
 	}
 	return out, nil
 }

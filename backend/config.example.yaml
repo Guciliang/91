@@ -20,9 +20,19 @@ storage:
   # 本地预览视频和封面目录
   local_preview_dir: "./data/previews"
 
+logging:
+  # 后台日志同时保留在磁盘；stdout/stderr 仍继续交给 Docker 或 systemd 收集。
+  file_enabled: true
+  # 放在 data 下可随 Docker 数据卷持久化，但不会进入业务备份包。
+  directory: "./data/logs"
+  # 单个日志文件达到此大小后轮转。
+  max_file_size_mb: 10
+  # 超过总量后从最旧的轮转文件开始清理。
+  max_total_size_mb: 50
+
 scanner:
   # 已废弃：旧版的"每天 02:00-07:00 按 IntervalSeconds 间隔重复扫盘"已被移除。
-  # 现在所有定时任务统一由 nightly 块控制（每天 01:00 跑一条完整流水线）。
+  # 现在所有定时任务统一由 nightly 调度器控制（默认每天 01:00 跑一条完整流水线）。
   # 字段保留仅为兼容旧 yaml，运行时被忽略。
   interval_seconds: 0
   # 单次扫描每家网盘目录递归层数上限
@@ -31,9 +41,13 @@ scanner:
   video_extensions: [".mp4", ".mkv", ".mov", ".webm", ".avi", ".strm"]
 
 nightly:
-  # 凌晨流水线触发整点，默认 1 即每天 01:00；需要改时间直接改这个值。
+  # 凌晨流水线的每日启动时间，24 小时制 HH:mm；后台保存后会热更新。
   # 运行时会统一编排扫描、媒体资产生成和后续清理任务。
-  cron_hour: 1
+  start_time: "01:00"
+
+tags:
+  # 是否启用系统内置标签包；后台保存后会热更新。
+  builtin_pack_enabled: true
 
 preview:
   # 是否启用 ffmpeg 抽帧生成预览视频
@@ -52,6 +66,12 @@ proxy:
   # 是否允许播放器为“三屏画面”请求服务端全量中转视频流。
   # 关闭后，支持直链的网盘仍保持 302，避免客户端主动消耗服务端上行带宽。
   allow_forced_relay: true
+
+remote_upload:
+  # 视频直链后台下载时始终保留的数据盘空间，默认 1 GiB。
+  disk_reserve_bytes: 1073741824
+  # 已收到响应头后，正文连续无数据多久判定失败。
+  idle_timeout_seconds: 120
 
 # 盘列表。上线后请通过管理后台添加，本文件可留空。
 # kind 支持 quark / p115 / p123 / pikpak / wopan / guangyapan / onedrive / googledrive / webdav / localstorage。

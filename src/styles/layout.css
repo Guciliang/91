@@ -22,11 +22,11 @@
 .container {
   max-width: var(--container-max);
   margin: 0 auto;
-  padding: 0 var(--container-pad-x);
+  padding-inline: var(--container-pad-x);
 }
 
 .page-section {
-  padding: var(--space-6) 0;
+  padding-block: var(--space-6);
 }
 
 .page-section + .page-section {
@@ -272,6 +272,36 @@
   margin-top: var(--space-4);
 }
 
+.upload-mode-switch {
+  display: inline-flex;
+  justify-self: center;
+  padding: 3px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+}
+
+.upload-mode-switch button {
+  min-height: 34px;
+  padding: 0 var(--space-4);
+  border-radius: calc(var(--radius-sm) - 2px);
+  color: var(--text-muted);
+  font-size: var(--font-sm);
+  font-weight: var(--weight-semibold);
+  transition: background var(--transition-fast), color var(--transition-fast),
+    box-shadow var(--transition-fast);
+}
+
+.upload-mode-switch button:hover {
+  color: var(--text-strong);
+}
+
+.upload-mode-switch button.is-active {
+  color: var(--text-on-accent);
+  background: var(--accent-gradient);
+  box-shadow: var(--shadow-inset);
+}
+
 .upload-drop {
   position: relative;
   display: grid;
@@ -353,6 +383,30 @@
   color: var(--text-faint);
 }
 
+.upload-field small {
+  color: var(--text-faint);
+  font-size: var(--font-xs);
+  line-height: 1.5;
+}
+
+.upload-input-with-icon {
+  position: relative;
+}
+
+.upload-input-with-icon > svg {
+  position: absolute;
+  left: var(--space-3);
+  top: 50%;
+  z-index: 1;
+  color: var(--text-faint);
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.upload-input-with-icon input {
+  padding-left: 42px;
+}
+
 .upload-tags {
   display: flex;
   flex-wrap: wrap;
@@ -428,24 +482,194 @@
   justify-content: center;
   height: 36px;
   padding: 0 var(--space-4);
+  border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
-  background: var(--accent-gradient);
-  color: var(--text-on-accent);
+  background: var(--bg-elevated);
+  color: var(--text-default);
   font-weight: var(--weight-semibold);
   font-size: var(--font-md);
-  box-shadow: 0 6px 16px var(--accent-glow), var(--shadow-inset);
 }
 
 .upload-submit:hover:not(:disabled) {
-  filter: brightness(1.05);
-  box-shadow: 0 10px 22px var(--accent-glow), var(--shadow-inset);
+  border-color: var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-strong);
 }
 
 .upload-submit:disabled {
   opacity: 0.55;
   cursor: not-allowed;
-  filter: grayscale(0.3);
-  box-shadow: none;
+}
+
+.remote-upload-section {
+  margin-top: var(--space-5);
+}
+
+.remote-upload-list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.remote-upload-empty {
+  padding: var(--space-6);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.remote-upload-job {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+  padding: var(--space-4);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.remote-upload-job.is-failed {
+  border-color: rgba(241, 85, 108, 0.3);
+}
+
+.remote-upload-job.is-completed {
+  border-color: rgba(63, 207, 142, 0.28);
+}
+
+.remote-upload-job__main {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+}
+
+.remote-upload-job__heading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.remote-upload-job__heading strong {
+  min-width: 0;
+  color: var(--text-strong);
+  font-size: var(--font-md);
+  font-weight: var(--weight-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-upload-job__state {
+  flex: 0 0 auto;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--font-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.remote-upload-job.is-completed .remote-upload-job__state {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.remote-upload-job.is-failed .remote-upload-job__state {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.remote-upload-job.is-canceled .remote-upload-job__state {
+  background: var(--bg-sunken);
+  color: var(--text-faint);
+}
+
+.remote-upload-job__source,
+.remote-upload-job__progress-copy,
+.remote-upload-job time {
+  min-width: 0;
+  color: var(--text-faint);
+  font-size: var(--font-xs);
+  overflow-wrap: anywhere;
+}
+
+.remote-upload-job__meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.remote-upload-job__meta time {
+  flex: 0 0 auto;
+}
+
+.remote-upload-job__error {
+  color: var(--danger);
+  font-size: var(--font-sm);
+  overflow-wrap: anywhere;
+}
+
+.remote-upload-progress {
+  height: 6px;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+}
+
+.remote-upload-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-gradient);
+  transition: width var(--transition-normal);
+}
+
+.remote-upload-job__actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.remote-upload-cancel,
+.remote-upload-detail {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 34px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-default);
+  font-size: var(--font-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.remote-upload-cancel:hover:not(:disabled) {
+  border-color: rgba(241, 85, 108, 0.5);
+  color: var(--danger);
+}
+
+.remote-upload-cancel:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.remote-upload-detail {
+  border-color: var(--border-accent);
+  color: var(--accent);
+}
+
+.remote-upload-detail:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 /* =========================================================
@@ -453,11 +677,11 @@
  * ========================================================= */
 @media (max-width: 640px) {
   .container {
-    padding: 0 14px;
+    padding-inline: 14px;
   }
 
   .page-section {
-    padding: var(--space-4) 0;
+    padding-block: var(--space-4);
   }
 
   .promo-strip {
@@ -492,6 +716,31 @@
   .upload-drop {
     min-height: 160px;
     padding: var(--space-4);
+  }
+
+  .upload-mode-switch {
+    display: grid;
+    justify-self: stretch;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .remote-upload-job {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .remote-upload-job__heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .remote-upload-job__heading strong {
+    max-width: 100%;
+  }
+
+  .remote-upload-job__actions {
+    justify-content: flex-end;
   }
 
   .back-to-top {

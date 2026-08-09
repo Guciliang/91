@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import { AppShell } from "@/components/AppShell";
 import { PromoStrip } from "@/components/PromoStrip";
 import { SearchPanel } from "@/components/SearchPanel";
@@ -282,7 +282,13 @@ export default function HomePage() {
     <AppShell mobileAutoHideNav>
       <div className="container page-section home-discovery-section">
         <PromoStrip />
-        <SearchPanel value={activeSearchQuery} onSearch={handleSearch} />
+        <SearchPanel
+          value={activeSearchQuery}
+          onSearch={handleSearch}
+          variant="uiverse"
+          placeholder=""
+          className="search-panel--public search-panel--transparent"
+        />
         {!hasActiveSearch && (
           hasAnyVideos || hasActiveTag ? (
             <TagCloud linkBasePath="/" onTagSelect={resetSearchResults} />

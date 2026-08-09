@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
-import { Film, RefreshCw, Search } from "lucide-react";
+import { Film, Plus, RefreshCw } from "lucide-react";
+import { SearchPanel } from "@/components/SearchPanel";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { ConfirmModal } from "./ConfirmModal";
 import { Modal } from "./Modal";
 import { AdminEmptyVisual } from "./AdminEmptyVisual";
+import { AdminPagination } from "./AdminPagination";
+import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
+import { useAdminRouteRevalidation } from "./AdminRouteCache";
 
 const DESKTOP_TAGS_PAGE_SIZE = 24;
 const MOBILE_TAGS_PAGE_SIZE = 8;
 const TAGS_MOBILE_QUERY = "(max-width: 640px)";
-const ADMIN_SEARCH_DEBOUNCE_MS = 500;
 const TAG_SOURCE_FILTERS = ["builtin", "user", "generated"];
 const TAG_DISPLAY_GROUP_ORDER: Record<string, number> = {
   builtin: 0,
@@ -24,6 +27,7 @@ type DeleteConfirmState =
   | null;
 
 export function TagsPage() {
+  const floatingActionPageRef = useAdminFloatingActionSpace<HTMLElement>();
   const [tags, setTags] = useState<api.AdminTag[]>([]);
   const [label, setLabel] = useState("");
   const [loading, setLoading] = useState(true);
@@ -31,7 +35,6 @@ export function TagsPage() {
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState>(null);
-  const [searchInput, setSearchInput] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [filterSource, setFilterSource] = useState<string>("all");
   const [selectMode, setSelectMode] = useState(false);
@@ -44,23 +47,32 @@ export function TagsPage() {
   const [page, setPage] = useState(1);
   const { show } = useToast();
 
-  async function refresh() {
-    setLoading(true);
-    setLoadError("");
+  async function refresh(silent = false) {
+    if (!silent) {
+      setLoading(true);
+      setLoadError("");
+    }
     try {
       setTags(await api.listTags());
+      setLoadError("");
     } catch (e) {
       const message = e instanceof Error ? e.message : "加载标签失败";
-      setLoadError(message);
-      show(message, "error");
+      if (!silent) {
+        setLoadError(message);
+        show(message, "error");
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
   useEffect(() => {
     refresh();
   }, []);
+
+  useAdminRouteRevalidation(() => {
+    void refresh(true);
+  });
 
   async function handleCreate() {
     const cleanLabel = label.trim();
@@ -194,7 +206,9 @@ export function TagsPage() {
       .map(({ tag }) => tag);
   }, [tags, searchQuery, filterSource]);
   const hasActiveSearch = searchQuery.trim().length > 0;
-  const searchEmpty = hasActiveSearch && !loading && !loadError && filteredTags.length === 0;
+  const tagsEmpty = !loading && !loadError && stats.total === 0;
+  const resultsEmpty = !tagsEmpty && !loading && !loadError && filteredTags.length === 0;
+  const searchEmpty = hasActiveSearch && resultsEmpty;
 
   const totalPages = Math.max(1, Math.ceil(filteredTags.length / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -205,15 +219,6 @@ export function TagsPage() {
     [filteredTags, pageStartIndex, pageEndIndex]
   );
   const showPagination = filteredTags.length > pageSize;
-  const placeholderTags = showPagination ? Math.max(0, pageSize - pagedTags.length) : 0;
-
-  useEffect(() => {
-    if (searchInput === searchQuery) return;
-    const timer = window.setTimeout(() => {
-      setSearchQuery(searchInput);
-    }, ADMIN_SEARCH_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
-  }, [searchInput, searchQuery]);
 
   useEffect(() => {
     setPage(1);
@@ -255,21 +260,13 @@ export function TagsPage() {
   }
 
   return (
-    <section className={`admin-tags-page${selectMode ? " has-bulk-actions" : ""}${searchEmpty ? " is-search-empty" : ""}`}>
+    <section
+      ref={floatingActionPageRef}
+      className={`admin-page admin-page--with-floating-actions admin-tags-page${searchEmpty ? " is-search-empty" : ""}`}
+    >
       <div className="admin-tags-layout">
         <div className="admin-tags-main">
           <div className="admin-tags-toolbar">
-            <div className="admin-tags-search">
-              <Search className="admin-tags-search__icon" size={14} />
-              <input
-                aria-label="搜索标签名或包含词"
-                type="text"
-                value={searchInput}
-                onChange={(e) => setSearchInput(e.target.value)}
-                placeholder="搜索标签名或包含词"
-              />
-            </div>
-
             <aside className="admin-tags-filter-panel" aria-label="标签分类">
               <div className="admin-tags-filter-tabs">
                 <button
@@ -297,52 +294,63 @@ export function TagsPage() {
               </div>
             </aside>
 
-            <div className="admin-tags-toolbar-actions">
-              <button
-                type="button"
-                className="admin-btn"
-                onClick={openCreateModal}
-              >
-                新增标签
-              </button>
-              <button
-                type="button"
-                className={`admin-btn ${selectMode ? "is-primary" : ""}`}
-                onClick={toggleSelectMode}
-              >
-                {selectMode ? "退出批量" : "批量删除"}
-              </button>
-            </div>
+            <SearchPanel
+              className="admin-tags-search search-panel--transparent"
+              value={searchQuery}
+              onSearch={setSearchQuery}
+              variant="uiverse"
+              placeholder=""
+            />
+
+            {!selectMode && (
+              <div className="admin-tags-toolbar-actions" data-admin-floating-actions>
+                <button
+                  data-admin-floating-actions
+                  type="button"
+                  className="admin-btn admin-create-fab admin-tags-toolbar-actions__create"
+                  onClick={openCreateModal}
+                >
+                  <Plus size="1em" aria-hidden="true" />
+                  新增标签
+                </button>
+                {stats.total > 0 && (
+                  <button
+                    type="button"
+                    className="admin-btn admin-tags-toolbar-actions__toggle"
+                    onClick={toggleSelectMode}
+                  >
+                    批量删除
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
-          {searchEmpty ? (
+          {tagsEmpty ? (
+            <AdminEmptyVisual
+              variant="empty"
+              text="当前没有标签"
+              className="admin-empty-state admin-empty-state--plain admin-tags-empty-state"
+            />
+          ) : resultsEmpty ? (
             <AdminEmptyVisual
               variant="no-results"
               text="未查询到"
-              className="admin-empty-state admin-empty-state--plain admin-tags-empty-search"
+              className="admin-empty-state admin-empty-state--plain admin-tags-empty-state"
             />
           ) : (
-            <div className="admin-tags-board">
+            <div className="admin-tags-board" aria-busy={loading || undefined}>
               <div className="admin-tags-cards">
-                {loading ? (
-                  <div className="admin-loading-state admin-page-loading" role="status" aria-live="polite">
-                    <RefreshCw size={20} className="admin-spin" />
-                    <span>加载中...</span>
-                  </div>
-                ) : loadError ? (
+                {loading ? null : loadError ? (
                   <div className="admin-error-state">
                     <strong>标签加载失败</strong>
                     <span>{loadError}</span>
-                    <button type="button" className="admin-btn" onClick={refresh}>
+                    <button type="button" className="admin-btn" onClick={() => void refresh()}>
                       <RefreshCw size={13} /> 重试
                     </button>
                   </div>
-                ) : filteredTags.length === 0 ? (
-                  <div className="admin-card admin-empty">
-                    没有找到匹配的标签。
-                  </div>
                 ) : (
-                <>
+                  <>
                   <div className="admin-tags-grid">
                     {pagedTags.map((tag) => {
                       const selectable = selectMode;
@@ -423,69 +431,18 @@ export function TagsPage() {
                         </div>
                       );
                     })}
-                    {Array.from({ length: placeholderTags }, (_, index) => (
-                      <div
-                        key={`placeholder-${index}`}
-                        className="admin-tag-card admin-tag-card--placeholder"
-                        aria-hidden="true"
-                      >
-                        <div className="admin-tag-card__head">
-                          <span className="admin-tag-card__title">placeholder</span>
-                          <span className="admin-tag-card__source-badge">placeholder</span>
-                        </div>
-                        <div className="admin-tag-card__footer">
-                          <span className="admin-tag-card__count">
-                            <Film size={13} />
-                            <strong>0</strong> 视频
-                          </span>
-                          <div className="admin-tag-card__footer-actions">
-                            <span className="admin-tag-card__edit">placeholder</span>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
                   </div>
 
                   {showPagination && (
-                    <div className="admin-table-pagination admin-tags-pagination">
-                      <button
-                        type="button"
-                        className="admin-btn"
-                        onClick={() => setPage(1)}
-                        disabled={currentPage <= 1}
-                      >
-                        首页
-                      </button>
-                      <button
-                        type="button"
-                        className="admin-btn"
-                        onClick={() => setPage((p) => Math.max(1, p - 1))}
-                        disabled={currentPage <= 1}
-                      >
-                        上一页
-                      </button>
-                      <span className="admin-table-pagination__info">
-                        第 {currentPage} / {totalPages} 页
-                      </span>
-                      <button
-                        type="button"
-                        className="admin-btn"
-                        onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                        disabled={currentPage >= totalPages}
-                      >
-                        下一页
-                      </button>
-                      <button
-                        type="button"
-                        className="admin-btn"
-                        onClick={() => setPage(totalPages)}
-                        disabled={currentPage >= totalPages}
-                      >
-                        末页
-                      </button>
-                    </div>
+                    <AdminPagination
+                      page={currentPage}
+                      totalPages={totalPages}
+                      total={filteredTags.length}
+                      itemLabel="标签"
+                      onPage={setPage}
+                    />
                   )}
-                </>
+                  </>
                 )}
               </div>
             </div>
@@ -493,7 +450,12 @@ export function TagsPage() {
         </div>
       </div>
       {selectMode && (
-        <div className="admin-tags-bulk-toolbar" role="region" aria-label="标签批量操作">
+        <div
+          className="admin-tags-bulk-toolbar"
+          data-admin-floating-actions
+          role="region"
+          aria-label="标签批量操作"
+        >
           <div className="admin-tags-bulk-actions">
             <span className="admin-tags-bulk-actions__count">已选择 {selected.size} 项</span>
             <button
@@ -522,10 +484,10 @@ export function TagsPage() {
             </button>
             <button
               type="button"
-              className="admin-btn admin-tags-bulk-actions__btn admin-tags-bulk-actions__mobile-exit"
+              className="admin-btn admin-tags-bulk-actions__btn"
               onClick={toggleSelectMode}
             >
-              退出选择
+              退出批量
             </button>
           </div>
         </div>
@@ -604,6 +566,7 @@ export function TagsPage() {
         }
         confirmText="确认"
         danger
+        hideIcon
         centerMessage
         modalClassName="admin-modal--delete-confirm admin-modal--tag-dialog admin-modal--tag-delete-confirm"
         loading={deletingId !== null || bulkDeleting}

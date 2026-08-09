@@ -42,25 +42,7 @@
 
 ## 快速开始
 
-### 方式一：一键安装脚本（推荐）
-
-```bash
-sudo apt update && sudo apt install -y curl ca-certificates
-curl -fsSL https://raw.githubusercontent.com/nianzhibai/91/main/install.sh -o install.sh
-sudo bash install.sh
-```
-部署完成后访问：`http://服务器IP:9191/`
-
-安装后自动注册 `91` 管理命令：
-```bash
-91            # 打开管理菜单
-91 status     # 查看运行状态
-91 logs       # 查看日志
-91 update     # 更新到最新版本
-91 restart    # 重启服务
-91 stop       # 停止服务
-```
-### 方式二：Docker Compose 部署
+### Docker Compose 部署
 
 Docker Compose 会使用仓库内的 `Dockerfile` 在本机构建镜像，不依赖预构建镜像。
 
@@ -83,18 +65,13 @@ docker compose up -d --build       # 重新构建并启动
 docker compose build --no-cache    # 完全重新构建
 ```
 
+部署完成后访问：`http://服务器IP:9191/`
+
 > 所有配置、数据库、封面、预览及上传文件均保存在 `./data/` 目录下。
 > 更新源码后执行 `git pull && docker compose up -d --build`；`./data/` 不会被构建或容器更新覆盖。
+
 ## 数据存放位置
 
-### 一键脚本部署
-| 路径 | 内容 |
-|------|------|
-| `/opt/video-site-91/config.yaml` | 配置文件、管理员账号、网盘凭证 |
-| `/opt/video-site-91/data/video-site.db` | SQLite 数据库 |
-| `/opt/video-site-91/data/previews/` | 封面图和预览片段 |
-
-### Docker Compose 部署
 | 路径 | 内容 |
 |------|------|
 | `./data/config.yaml` | 配置文件、管理员账号、网盘凭证 |

@@ -10,8 +10,20 @@ const driveComponentsSource = readFileSync(
   new URL("../src/admin/drive/DriveComponents.tsx", import.meta.url),
   "utf8"
 );
+const storageSummarySource = readFileSync(
+  new URL("../src/admin/drive/StorageSummary.tsx", import.meta.url),
+  "utf8"
+);
+const drivesPageLoadingSource = readFileSync(
+  new URL("../src/admin/DrivesPageLoading.tsx", import.meta.url),
+  "utf8"
+);
 const skipDirsPanelSource = readFileSync(
   new URL("../src/admin/drive/SkipDirsPanel.tsx", import.meta.url),
+  "utf8"
+);
+const skipDirsLoadingIndicatorSource = readFileSync(
+  new URL("../src/admin/drive/SkipDirsLoadingIndicator.tsx", import.meta.url),
   "utf8"
 );
 const deleteDriveModalSource = readFileSync(
@@ -22,8 +34,16 @@ const crawlerPageSource = readFileSync(
   new URL("../src/admin/CrawlersPage.tsx", import.meta.url),
   "utf8"
 );
+const crawlerPageLoadingSource = readFileSync(
+  new URL("../src/admin/CrawlersPageLoading.tsx", import.meta.url),
+  "utf8"
+);
 const adminLayoutSource = readFileSync(
   new URL("../src/admin/AdminLayout.tsx", import.meta.url),
+  "utf8"
+);
+const spiderIconSource = readFileSync(
+  new URL("../src/admin/icons/SpiderIcon.tsx", import.meta.url),
   "utf8"
 );
 const confirmModalSource = readFileSync(
@@ -122,9 +142,9 @@ test("crawler upload target uses explicit local-save option instead of auto targ
   assert.match(combinedSource, /本地保存，不上传/);
   assert.match(
     crawlerPageSource,
-    /UPLOAD_TARGET_KINDS\s*=\s*new Set\(\["p115", "pikpak", "p123", "googledrive", "onedrive", "wopan", "guangyapan", "quark", "webdav"\]\)/
+    /drives\.filter\(\(d\) => d\.canUpload\)/
   );
-  assert.match(crawlerPageSource, /drives\.filter\(\(d\) => UPLOAD_TARGET_KINDS\.has\(d\.kind\)\)/);
+  assert.match(apiSource, /canUpload: boolean/);
   assert.doesNotMatch(combinedSource, /自动：唯一/);
   assert.doesNotMatch(combinedSource, /自动模式/);
   assert.doesNotMatch(combinedSource, /较早的视频会上传到该云盘根目录下/);
@@ -300,6 +320,7 @@ test("quark drive form supports qr login and manual cookie fallback", () => {
   assert.ok(match, "quark credential field block should be present");
   assert.match(match[1], /key: "cookie"/);
   assert.match(match[1], /__pus=\.\.\.; __puus=\.\.\.; \.\.\./);
+  assert.doesNotMatch(match[1], /use_transcoding_address|客户端 302/);
 });
 
 test("cloud drive forms expose optional proxy and OpenList-compatible Crypt settings", () => {
@@ -339,10 +360,8 @@ test("Crypt detail fields are rendered and validated only after Crypt is enabled
 });
 
 test("quark is available as a crawler upload target", () => {
-  assert.match(
-    crawlerPageSource,
-    /UPLOAD_TARGET_KINDS\s*=\s*new Set\([^\n]*"quark"[^\n]*\)/
-  );
+  assert.match(crawlerPageSource, /drives\.filter\(\(d\) => d\.canUpload\)/);
+  assert.match(apiSource, /canUpload: boolean/);
 });
 
 test("p123 drive form exposes qr login and phone or email password login", () => {
@@ -476,9 +495,24 @@ test("crawler management is a separate admin section", () => {
   assert.match(adminLayoutSource, /import \{ SpiderIcon \} from "\.\/icons\/SpiderIcon";/);
   assert.match(adminLayoutSource, /<SpiderIcon size=\{15\} \/>/);
   assert.doesNotMatch(adminLayoutSource, /<Bot\b/);
+  assert.match(spiderIconSource, /Font Awesome Pro 7\.3\.1 by @fontawesome/);
+  assert.match(spiderIconSource, /Commercial License, Copyright 2026 Fonticons, Inc\./);
+  assert.match(spiderIconSource, /xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.match(spiderIconSource, /viewBox="0 0 512 512"/);
+  assert.match(spiderIconSource, /fill="currentColor"/);
+  assert.match(spiderIconSource, /M362\.7-30\.9c7\.2-2\.8 15\.2 0 19\.2 6\.2/);
+  assert.match(spiderIconSource, /zM256\.5 128c-26\.5 0-48 21\.5-48 48/);
+  assert.doesNotMatch(spiderIconSource, /stroke(?:Width|Linecap|Linejoin)?=/);
   assert.match(
     appSource,
-    /path="crawlers"[\s\S]*<PageSuspense>[\s\S]*<CrawlersPage \/>[\s\S]*<\/PageSuspense>/
+    /path="crawlers"[\s\S]*<PageSuspense fallback=\{<CrawlersPageLoading \/>\}>[\s\S]*<CrawlersPage \/>[\s\S]*<\/PageSuspense>/
+  );
+  assert.doesNotMatch(crawlerPageSource, /SpiderWebAnimation/);
+  assert.doesNotMatch(crawlerPageLoadingSource, /SpiderWebAnimation/);
+  assert.doesNotMatch(adminCss, /admin-spider-animation/);
+  assert.equal(
+    existsSync(new URL("../spider-web-animation.html", import.meta.url)),
+    false
   );
   assert.match(crawlerPageSource, /export function CrawlersPage/);
   assert.match(crawlerPageSource, /SpiderIcon/);
@@ -486,9 +520,14 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /<h1 className="admin-page__title">爬虫管理<\/h1>/);
   assert.doesNotMatch(crawlerPageSource, /<RefreshCw size=\{14\}[\s\S]*刷新/);
   assert.doesNotMatch(crawlerPageSource, /<Plus size=\{1[34]\}/);
-  assert.match(crawlerPageSource, /<header className="admin-page__header">\s*<div className="admin-crawler-global-teaser">/);
-  assert.match(crawlerPageSource, /className="admin-detail-actions-inline admin-crawler-page-actions"/);
-  assert.match(adminCss, /\.admin-crawler-page-actions\s*\{[^}]*margin-left\s*:\s*auto/s);
+  assert.match(
+    crawlerPageSource,
+    /className="admin-btn admin-create-fab"\s*onClick=\{\(\) => setEditorTarget\(null\)\}\s*>\s*<Plus size="1em" aria-hidden="true" \/>\s*添加爬虫/
+  );
+  assert.doesNotMatch(crawlerPageSource, /admin-crawler-page-actions|<header className="admin-page__header">/);
+  assert.match(crawlerPageSource, /useAdminFloatingActionSpace<HTMLElement>\(\)/);
+  assert.match(crawlerPageSource, /data-admin-floating-actions/);
+  assert.match(adminCss, /\.admin-page--with-floating-actions\s*\{[^}]*--admin-floating-actions-space/s);
   assert.doesNotMatch(crawlerPageSource, /className="admin-btn is-primary"[\s\S]*添加爬虫/);
   assert.doesNotMatch(crawlerPageSource, /导入脚本 → 测试运行 → 保存启用，三步接入一个新片源/);
   assert.doesNotMatch(crawlerPageSource, /导入脚本后才能保存/);
@@ -555,6 +594,8 @@ test("crawler management is a separate admin section", () => {
   const crawlerRowSource = crawlerPageSource.match(/function CrawlerRow[\s\S]*?(?=function CrawlerDetail\()/)?.[0] ?? "";
   assert.ok(crawlerRowSource, "crawler row component should exist");
   assert.match(crawlerRowSource, /const crawling = running \|\| crawler\.scanGenerationStatus\?\.state === "scanning"/);
+  assert.match(crawlerRowSource, /<SpiderIcon size=\{20\} className="admin-crawler-row__icon" \/>/);
+  assert.doesNotMatch(crawlerRowSource, /admin-crawler-row__brand/);
   assert.match(crawlerRowSource, /className="admin-crawler-row__title-line"/);
   assert.match(crawlerRowSource, /className="admin-crawler-row__meta"/);
   assert.match(crawlerRowSource, /admin-status admin-generation-state is-generating[\s\S]*正在抓取/);
@@ -583,6 +624,9 @@ test("crawler management is a separate admin section", () => {
     adminCss,
     /\.admin-crawler-row__title-line\s*\{[^}]*display\s*:\s*flex;[^}]*flex-wrap\s*:\s*wrap/s
   );
+  assert.match(adminCss, /\.admin-crawler-row__main\s*\{[^}]*grid-template-columns\s*:\s*20px minmax\(160px,\s*1fr\)/s);
+  assert.match(adminCss, /\.admin-crawler-row__icon\s*\{[^}]*color\s*:\s*var\(--accent\)/s);
+  assert.doesNotMatch(adminCss, /\.admin-crawler-row__brand/);
   assert.match(
     adminCss,
     /\.admin-crawler-row__meta\s*\{[^}]*overflow\s*:\s*hidden;[^}]*text-overflow\s*:\s*ellipsis;[^}]*white-space\s*:\s*nowrap/s
@@ -656,8 +700,14 @@ test("crawler management is a separate admin section", () => {
   assert.match(crawlerPageSource, /api\.setDriveTeaserEnabled/);
   assert.match(crawlerPageSource, /toggleCrawlerTeasers/);
   assert.match(crawlerPageSource, /className="admin-crawler-global-teaser"/);
-  assert.match(crawlerPageSource, /const allCrawlerTeasersEnabled = !hasCrawlers \|\| list\.every/);
-  assert.match(crawlerPageSource, /暂无爬虫，新增后默认开启预览视频生成/);
+  assert.equal(crawlerPageSource.match(/className="admin-crawler-global-teaser"/g)?.length, 1);
+  assert.match(crawlerPageSource, /const allCrawlerTeasersEnabled = list\.every/);
+  assert.doesNotMatch(crawlerPageSource, /暂无爬虫，新增后默认开启预览视频生成/);
+  assert.match(
+    crawlerPageSource,
+    /\{hasCrawlers && \(\s*<div className="admin-crawler-list__controls">\s*<div className="admin-crawler-global-teaser">/
+  );
+  assert.doesNotMatch(crawlerPageSource, /admin-crawler-row__preview-toggle|onToggleTeaser/);
   assert.match(crawlerPageSource, /className=\{`toggle-switch \$\{allCrawlerTeasersEnabled \? "is-on" : ""\}/);
   assert.match(crawlerPageSource, /role="switch"/);
   assert.match(crawlerPageSource, /aria-checked=\{allCrawlerTeasersEnabled\}/);
@@ -683,6 +733,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /label: "本轮总数"/);
   assert.doesNotMatch(crawlerPageSource, /admin-crawler-preview-card-toggle \$\{crawler\.teaserEnabled/);
   assert.doesNotMatch(adminCss, /admin-crawler-preview-card-toggle\.is-on/);
+  assert.match(adminCss, /\.admin-crawler-list__controls\s*\{[^}]*align-items\s*:\s*flex-start;[^}]*justify-content\s*:\s*flex-start/s);
   assert.match(adminCss, /\.admin-crawler-global-teaser\s*\{[^}]*display\s*:\s*inline-grid;[^}]*justify-items\s*:\s*center/s);
   assert.match(adminCss, /\.admin-crawler-console\s*\{[^}]*width\s*:\s*min\(100%,\s*920px\);[^}]*margin-inline\s*:\s*auto/s);
   assert.match(adminCss, /\.admin-crawler-list\s*\{[^}]*border\s*:\s*0;[^}]*background\s*:\s*transparent;[^}]*box-shadow\s*:\s*none/s);
@@ -692,7 +743,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(adminCss, /admin-crawler-(pipeline|stage)/);
   assert.doesNotMatch(crawlerPageSource, /teaserEnabled: form\.teaserEnabled/);
   assert.doesNotMatch(crawlerPageSource, /aria-pressed=\{form\.teaserEnabled\}/);
-  assert.match(crawlerPageSource, /UPLOAD_TARGET_KINDS/);
+  assert.match(crawlerPageSource, /drives\.filter\(\(d\) => d\.canUpload\)/);
   assert.doesNotMatch(crawlerPageSource, /新建脚本/);
   assert.doesNotMatch(crawlerPageSource, /爬虫 ID/);
   assert.doesNotMatch(crawlerPageSource, /crawler-id/);
@@ -722,27 +773,41 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(driveFormSource, /scriptcrawler/);
 });
 
-test("desktop system group contains update and logout while mobile menu stays unchanged", () => {
+test("system sidebar contains navigation only while global actions live in the layout", () => {
   assert.match(
     adminLayoutSource,
-    /admin-nav__group-label">系统[\s\S]*?admin-nav__title">主题外观[\s\S]*?className="admin-nav__link admin-nav__action"[\s\S]*?检查更新[\s\S]*?className="admin-nav__link admin-nav__action admin-nav__action--danger"[\s\S]*?退出登录/
+    /admin-nav__group-label">系统[\s\S]*?to="\/admin\/backup"[\s\S]*?to="\/admin\/logs"[\s\S]*?to="\/admin\/settings"/
   );
-  assert.doesNotMatch(adminLayoutSource, /admin-sidebar__footer/);
-  assert.match(
-    adminLayoutSource,
-    /admin-sidebar__mobile-panel[\s\S]*?admin-sidebar__home[\s\S]*?admin-sidebar__check-update[\s\S]*?admin-sidebar__logout/
-  );
+  assert.doesNotMatch(adminLayoutSource, /to="\/admin\/theme"/);
+  assert.doesNotMatch(adminLayoutSource, /admin-nav__action|admin-sidebar__mobile-panel/);
+  assert.match(adminLayoutSource, /<AdminGlobalActions[\s\S]*?onCheckUpdate=[\s\S]*?onLogout=/);
 });
 
 test("admin shell stays mounted while lazy admin pages load", () => {
   assert.match(appSource, /import \{ AdminLayout \} from "@\/admin\/AdminLayout";/);
+  assert.match(
+    appSource,
+    /import \{ DrivesPageLoading \} from "@\/admin\/DrivesPageLoading";/
+  );
+  assert.match(
+    appSource,
+    /import \{ CrawlersPageLoading \} from "@\/admin\/CrawlersPageLoading";/
+  );
   assert.doesNotMatch(appSource, /const AdminLayout\s*=\s*lazy/);
   assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>\s*<Routes>/);
-  assert.match(appSource, /function PageSuspense\(\{ children \}: \{ children: ReactNode \}\)/);
+  assert.match(appSource, /function PageSuspense\(\{[\s\S]*fallback = null,[\s\S]*fallback\?: ReactNode/);
   assert.match(appSource, /path="\/admin"[\s\S]*<AdminLayout \/>/);
   assert.match(
     appSource,
-    /path="drives"[\s\S]*<PageSuspense>[\s\S]*<DrivesPage \/>[\s\S]*<\/PageSuspense>/
+    /path="drives"[\s\S]*<PageSuspense fallback=\{<DrivesPageLoading \/>\}>[\s\S]*<DrivesPage \/>[\s\S]*<\/PageSuspense>/
+  );
+  assert.match(
+    appSource,
+    /path="crawlers"[\s\S]*<PageSuspense fallback=\{<CrawlersPageLoading \/>\}>[\s\S]*<CrawlersPage \/>[\s\S]*<\/PageSuspense>/
+  );
+  assert.match(
+    drivesPageLoadingSource,
+    /<StorageSummary storage=\{null\} loading \/>[\s\S]*<DriveListSkeleton \/>/
   );
 });
 
@@ -791,6 +856,8 @@ test("drive management exposes stop task controls", () => {
   assert.match(apiSource, /stopAllTasks/);
   assert.match(apiSource, /"\/tasks\/stop"/);
   assert.match(drivesPageSource, /停止所有任务/);
+  assert.match(drivesPageSource, /停止所有存储当前的扫描、封面、预览视频和视频指纹生成任务/);
+  assert.doesNotMatch(drivesPageSource, /停止所有网盘当前的扫描、封面、预览视频和视频指纹生成任务。/);
   assert.doesNotMatch(drivesPageSource, /停止所有网盘任务/);
 });
 
@@ -801,38 +868,83 @@ test("drive list actions use ordinary text buttons in the requested positions", 
   );
   assert.match(
     drivesPageSource,
-    /<header className="admin-page__header">\s*<div className="admin-page__actions admin-drive-list-actions">/
+    /<AdminPageActions>\s*<div className="admin-page__actions admin-drive-list-actions">[\s\S]*?<\/AdminPageActions>\s*\{\(storage \|\| loading\) && \(\s*<StorageSummary storage=\{storage\} loading=\{!storage\} \/>\s*\)\}/
   );
   assert.match(
     drivesPageSource,
-    /className="admin-page__actions admin-drive-list-actions"[\s\S]*aria-label="所有网盘任务控制"[\s\S]*onClick=\{handleRunNightly\}[\s\S]*onClick=\{handleStopAllTasks\}[\s\S]*onClick=\{openCreate\}/
+    /className="admin-page__actions admin-drive-list-actions"[\s\S]*aria-label="所有网盘任务控制"[\s\S]*onClick=\{handleScanAll\}[\s\S]*onClick=\{handleStopAllTasks\}/
   );
   assert.match(
     drivesPageSource,
-    /<button type="button" className="admin-btn" onClick=\{openCreate\}>\s*添加网盘\s*<\/button>/
+    /className="admin-btn admin-create-fab"\s*onClick=\{openCreate\}\s*>\s*<Plus size="1em" aria-hidden="true" \/>\s*添加网盘/
   );
   assert.doesNotMatch(drivesPageSource, /className="admin-drive-footer-actions"/);
   assert.doesNotMatch(drivesPageSource, /PlayCircle/);
   assert.doesNotMatch(drivesPageSource, /<CircleStop size=\{14\}/);
-  assert.doesNotMatch(drivesPageSource, /<Plus size=\{14\}/);
   assert.match(
     drivesPageSource,
-    /className="admin-btn"\s+onClick=\{handleRunNightly\}/
+    /className="admin-btn"\s+onClick=\{handleScanAll\}[\s\S]*?<Search size="1em" aria-hidden="true" \/>\s*\{scanAllButtonText\(maintenanceStatus, scanningAll\)\}/
   );
   assert.match(
     drivesPageSource,
-    /className="admin-btn"\s+onClick=\{handleStopAllTasks\}/
+    /className="admin-btn"\s+onClick=\{handleStopAllTasks\}[\s\S]*?<Ban size="1em" aria-hidden="true" \/>\s*\{stoppingAll \? "停止中\.\.\." : "停止所有任务"\}/
   );
   assert.match(
     drivesPageSource,
     /title=\{form\.id && list\.find\(\(x\) => x\.id === form\.id\) \? "编辑网盘" : "添加网盘"\}/
   );
-  assert.match(adminCss, /\.admin-drive-list-actions\s*\{[^}]*justify-content\s*:\s*space-between/s);
   assert.match(
     adminCss,
-    /@media \(max-width: 640px\)\s*\{[\s\S]*?\.admin-drive-list-actions \.admin-btn\s*\{[^}]*background\s*:\s*var\(--bg-surface\);[^}]*border-color\s*:\s*var\(--border-subtle\)/s
+    /\.admin-current-page-header\s*\{[^}]*display\s*:\s*flex[^}]*align-items\s*:\s*center[^}]*justify-content\s*:\s*space-between[^}]*flex-wrap\s*:\s*wrap/s
   );
+  assert.match(
+    adminCss,
+    /\.admin-current-page-actions\s*\{[^}]*display\s*:\s*flex[^}]*justify-content\s*:\s*flex-end[^}]*margin-left\s*:\s*auto/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-drive-list-actions \.admin-task-controls \.admin-btn\s*\{[^}]*padding-inline\s*:\s*var\(--space-4\)[^}]*border-radius\s*:\s*var\(--radius-pill\)[^}]*background\s*:\s*transparent/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-drive-list-actions \.admin-task-controls \.admin-btn:hover:not\(:disabled\)\s*\{[^}]*background\s*:\s*color-mix\(in srgb, var\(--text-default\) 8%, transparent\)[^}]*box-shadow\s*:\s*none/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-create-fab\s*\{[^}]*position\s*:\s*fixed[^}]*right\s*:\s*var\(--space-7\)[^}]*bottom\s*:\s*var\(--space-5\)[^}]*width\s*:\s*fit-content[^}]*min-width\s*:\s*0[^}]*min-height\s*:\s*44px[^}]*box-shadow\s*:\s*0 12px 32px/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-btn\.admin-create-fab\s*\{[^}]*background\s*:\s*transparent/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-btn\.admin-create-fab:hover:not\(:disabled\)\s*\{[^}]*background\s*:\s*transparent/s
+  );
+  assert.match(
+    adminCss,
+    /@media \(max-width: 640px\)\s*\{[\s\S]*?\.admin-drive-list-actions \.admin-btn\s*\{[^}]*background\s*:\s*transparent;[^}]*border-color\s*:\s*var\(--border-subtle\)/s
+  );
+  assert.match(
+    adminCss,
+    /@media \(max-width: 640px\)\s*\{[\s\S]*?\.admin-create-fab\s*\{[^}]*right\s*:\s*var\(--space-3\)[^}]*bottom\s*:\s*calc\(var\(--space-3\) \+ env\(safe-area-inset-bottom\)\)/s
+  );
+  assert.doesNotMatch(drivesPageSource, /admin-drive-list-toolbar|driveListSummary/);
+  assert.doesNotMatch(adminCss, /--admin-drives-content-width|\.admin-drive-list-toolbar/);
   assert.doesNotMatch(adminCss, /\.admin-drive-footer-actions/);
+});
+
+test("drive loading keeps the storage summary shell and labels without value skeletons", () => {
+  for (const label of ["封面占用", "预览视频占用", "本地媒体合计", "磁盘可用"]) {
+    assert.match(storageSummarySource, new RegExp(`label: "${label}"`));
+  }
+  assert.match(storageSummarySource, /aria-busy=\{loading \|\| undefined\}/);
+  assert.match(
+    storageSummarySource,
+    /<strong aria-hidden=\{loading \|\| undefined\}>\s*\{loading \? "\\u00a0" : metric\.value\}\s*<\/strong>/
+  );
+  assert.doesNotMatch(storageSummarySource, /admin-storage-summary__value-skeleton/);
+  assert.doesNotMatch(adminCss, /admin-storage-summary__value-skeleton/);
 });
 
 test("empty drive list renders the shared empty visual and prompt", () => {
@@ -852,15 +964,23 @@ test("empty drive list renders the shared empty visual and prompt", () => {
 });
 
 test("empty crawler list renders the shared empty visual", () => {
-  assert.match(crawlerPageSource, /<section className="admin-page admin-crawlers-page">/);
+  assert.match(crawlerPageSource, /className="admin-page admin-page--with-floating-actions admin-crawlers-page"/);
   assert.match(
     crawlerPageSource,
     /<AdminEmptyVisual[\s\S]*?variant="empty"[\s\S]*?text="暂无爬虫"[\s\S]*?className="admin-crawler-empty"/
   );
+  assert.match(
+    crawlerPageSource,
+    /\{hasCrawlers && \([\s\S]*?className="admin-crawler-list__controls"[\s\S]*?\)\}\s*\{loading \? \(/
+  );
   assert.doesNotMatch(crawlerPageSource, /<SpiderIcon size=\{28\} \/>/);
   assert.match(
     adminCss,
-    /\.admin-crawlers-page\s*\{[^}]*display\s*:\s*flex;[^}]*flex-direction\s*:\s*column;[^}]*min-height\s*:\s*calc\(100vh - \(var\(--space-7\) \* 2\)\)/s
+    /\.admin-page\s*\{[^}]*display\s*:\s*flex;[^}]*flex\s*:\s*1 1 auto;[^}]*flex-direction\s*:\s*column;[^}]*min-height\s*:\s*0/s
+  );
+  assert.doesNotMatch(
+    adminCss,
+    /\.admin-crawlers-page\s*\{[^}]*min-height\s*:\s*calc\(100(?:d)?vh/s
   );
   assert.match(
     adminCss,
@@ -869,7 +989,7 @@ test("empty crawler list renders the shared empty visual", () => {
 });
 
 test("drive management status pills omit the leading status dot", () => {
-  assert.match(drivesPageSource, /<section className="admin-drives-page">/);
+  assert.match(drivesPageSource, /<section className="admin-page admin-drives-page">/);
   assert.match(adminCss, /\.admin-drives-page \.admin-status\s*\{[^}]*gap\s*:\s*0/s);
   assert.match(
     adminCss,
@@ -965,7 +1085,7 @@ test("drive credential editor loads stored values on demand", () => {
     drivesPageSource,
     /async function openEdit\(d: api\.AdminDrive\)[\s\S]*?await api\.getDriveCredentials\(d\.id\)[\s\S]*?creds,/
   );
-  assert.match(drivesPageSource, /editingCredentialsId === d\.id \? "加载中\.\.\." : "编辑凭证"/);
+  assert.match(drivesPageSource, /editingCredentialsId === d\.id \? \([\s\S]*?<Loader2 size=\{14\} className="admin-spin" \/>[\s\S]*?加载中[\s\S]*?编辑凭证/);
 });
 
 test("drive detail actions use ordinary text buttons", () => {
@@ -991,7 +1111,7 @@ test("drive detail actions use ordinary text buttons", () => {
     /className="admin-btn admin-detail-actions__danger"\s+onClick=\{\(\) => setDeleteTarget\(d\)\}/
   );
   assert.match(drivesPageSource, /stoppingDriveId === d\.id \? "停止中\.\.\." : "停止任务"/);
-  assert.match(drivesPageSource, /editingCredentialsId === d\.id \? "加载中\.\.\." : "编辑凭证"/);
+  assert.match(drivesPageSource, /editingCredentialsId === d\.id \? \([\s\S]*?<Loader2 size=\{14\} className="admin-spin" \/>[\s\S]*?加载中[\s\S]*?编辑凭证/);
   assert.match(drivesPageSource, />\s*删除网盘\s*<\/button>/);
   assert.doesNotMatch(drivesPageSource, /编辑配置凭证/);
   assert.doesNotMatch(
@@ -1038,10 +1158,17 @@ test("drive rescan reports busy storage tasks instead of queueing duplicates", (
   assert.doesNotMatch(drivesPageSource, /disabled=\{!!scanningDriveId\}/);
 });
 
-test("nightly scan duplicate trigger uses full-scan busy message", () => {
-  assert.match(apiSource, /status:\s*NightlyJobStatus;\s*message\?:\s*string/);
+test("scan-all uses its dedicated endpoint and full-scan busy message", () => {
+  assert.match(apiSource, /status:\s*MaintenanceJobStatus;\s*message\?:\s*string/);
+  assert.match(
+    apiSource,
+    /function runScanAllJob\(\)[\s\S]*"\/jobs\/scan-all\/run"/
+  );
+  assert.doesNotMatch(apiSource, /function runNightlyJob\(/);
+  assert.match(drivesPageSource, /扫描已配置的存储、处理新视频并执行视频去重/);
+  assert.doesNotMatch(drivesPageSource, /扫描已配置网盘、处理新视频并执行视频去重。/);
   assert.match(drivesPageSource, /当前有全量扫描任务正在进行，请稍后重试/);
-  assert.match(drivesPageSource, /resp\.message \|\| NIGHTLY_BUSY_MESSAGE/);
+  assert.match(drivesPageSource, /resp\.message \|\| MAINTENANCE_BUSY_MESSAGE/);
   assert.match(constantsSource, /当前有全量扫描任务正在进行，请稍后重试/);
 });
 
@@ -1072,17 +1199,36 @@ test("drive detail selection is stored in the URL history", () => {
   assert.doesNotMatch(drivesPageSource, /setSelectedDriveId/);
 });
 
-test("drive detail refresh state does not render list actions", () => {
+test("drive detail refresh state uses the detail skeleton without list actions", () => {
   const pendingDetailStart = drivesPageSource.indexOf("if (selectedDriveId && !selectedDrive)");
   const listViewStart = drivesPageSource.indexOf("// --- List view ---");
   assert.ok(pendingDetailStart > -1, "pending detail branch should be present");
   assert.ok(listViewStart > pendingDetailStart, "pending detail branch should precede list view");
 
   const pendingDetailSource = drivesPageSource.slice(pendingDetailStart, listViewStart);
-  assert.match(pendingDetailSource, /admin-drive-detail__header-bar/);
-  assert.match(pendingDetailSource, /admin-loading-state/);
+  assert.match(
+    pendingDetailSource,
+    /if \(loading\) \{[\s\S]*<DriveDetailLoading[\s\S]*onBack=\{\(\) => closeDriveDetail\(\{ replace: true \}\)\}/
+  );
+  assert.doesNotMatch(pendingDetailSource, /<AdminLoading \/>/);
   assert.match(pendingDetailSource, /网盘不存在/);
   assert.doesNotMatch(pendingDetailSource, /扫描所有网盘|停止所有任务|添加网盘/);
+  assert.match(
+    drivesPageLoadingSource,
+    /className="admin-detail-tree-container"[\s\S]*<SkipDirsLoadingIndicator \/>/
+  );
+  assert.doesNotMatch(
+    drivesPageLoadingSource,
+    /保存更改|修改后自动保存|admin-skipdirs-autosave/
+  );
+  assert.doesNotMatch(drivesPageLoadingSource, /admin-drive-detail-loading__tree/);
+  assert.doesNotMatch(adminCss, /admin-drive-detail-loading__tree/);
+  assert.match(skipDirsPanelSource, /const showLoading = open && !loaded && !error/);
+  assert.match(skipDirsPanelSource, /\{showLoading && <SkipDirsLoadingIndicator \/>\}/);
+  assert.match(
+    skipDirsLoadingIndicatorSource,
+    /className="lds-ellipsis is-xs"/
+  );
 });
 
 test("drive discard confirmation matches delete confirmation modal styling", () => {
@@ -1175,11 +1321,39 @@ test("drive preview generation uses an accessible slider switch", () => {
   assert.doesNotMatch(driveComponentsSource, /预览视频：开|预览视频：关|PowerOff/);
 });
 
-test("drive skip directory tree only displays directory names", () => {
+test("drive skip directory tree uses a solid selection box without status pills", () => {
   assert.doesNotMatch(skipDirsPanelSource, /SelectedDirsChips/);
   assert.doesNotMatch(skipDirsPanelSource, /admin-mono-cell/);
   assert.doesNotMatch(skipDirsPanelSource, /根目录/);
   assert.match(skipDirsPanelSource, /\{name\}/);
+  assert.doesNotMatch(skipDirsPanelSource, /admin-skipdirs-flag|已跳过/);
+  assert.doesNotMatch(adminCss, /\.admin-skipdirs-checkbox(?::checked)?::before/);
+  assert.match(
+    adminCss,
+    /\.admin-skipdirs-checkbox:checked\s*\{[^}]*border-color:\s*var\(--accent\)[^}]*background:\s*var\(--accent\)/s
+  );
+  assert.doesNotMatch(adminCss, /\.admin-skipdirs-flag\s*\{/);
+});
+
+test("drive skip directory selections auto-save without polling away local edits", () => {
+  assert.doesNotMatch(skipDirsPanelSource, /保存更改|handleSave/);
+  assert.match(skipDirsPanelSource, /const AUTO_SAVE_DELAY_MS = 300/);
+  assert.match(
+    skipDirsPanelSource,
+    /saveChainRef\.current = saveChainRef\.current\.then/
+  );
+  assert.match(
+    skipDirsPanelSource,
+    /draftRevisionRef\.current !== savedRevisionRef\.current/
+  );
+  assert.match(skipDirsPanelSource, /保存失败，正在重试…/);
+  assert.doesNotMatch(skipDirsPanelSource, /修改后自动保存/);
+  assert.match(skipDirsPanelSource, /saveStatus === "idle"[\s\S]*\? null/);
+  assert.match(drivesPageSource, /driveListRequestVersion\.current \+= 1/);
+  assert.doesNotMatch(
+    drivesPageSource,
+    /onSaved=\{\(saved\)[\s\S]*?refreshDriveList\(\);[\s\S]*?\}\}/
+  );
 });
 
 test("drive cards label fingerprint count as video fingerprint count", () => {

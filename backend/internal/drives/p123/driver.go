@@ -709,10 +709,11 @@ func (d *Driver) resolveDownloadURL(ctx context.Context, downloadURL string) (*d
 	}
 	headers.Set("User-Agent", d.userAgent)
 	return &drives.StreamLink{
-		URL:        finalURL,
-		Headers:    headers,
-		Expires:    time.Now().Add(10 * time.Minute),
-		HTTPClient: d.httpClient,
+		URL:                finalURL,
+		Headers:            headers,
+		Expires:            time.Now().Add(10 * time.Minute),
+		HTTPClient:         d.httpClient,
+		ClientRedirectSafe: true,
 	}, nil
 }
 

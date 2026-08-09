@@ -67,6 +67,11 @@ type Driver struct {
 	listMu       sync.Mutex
 	lastListAt   time.Time
 	listInterval time.Duration
+
+	// EnsureDir is a read-then-create operation. Serialize the whole operation
+	// per drive so concurrent uploads cannot both observe a missing folder and
+	// create duplicate directory trees.
+	ensureDirMu sync.Mutex
 }
 
 type Config struct {
@@ -342,10 +347,11 @@ func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLi
 		headers.Set("User-Agent", d.userAgent)
 	}
 	return &drives.StreamLink{
-		URL:        url,
-		Headers:    headers,
-		Expires:    expires,
-		HTTPClient: d.streamHTTPClient,
+		URL:                url,
+		Headers:            headers,
+		Expires:            expires,
+		HTTPClient:         d.streamHTTPClient,
+		ClientRedirectSafe: true,
 	}, nil
 }
 
@@ -385,6 +391,9 @@ func (d *Driver) Remove(ctx context.Context, fileID string) error {
 }
 
 func (d *Driver) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
+	d.ensureDirMu.Lock()
+	defer d.ensureDirMu.Unlock()
+
 	currentID := d.rootID
 	for _, name := range splitPath(pathFromRoot) {
 		childID, err := d.findChildDir(ctx, currentID, name)
@@ -416,7 +425,7 @@ func (d *Driver) findChildDir(ctx context.Context, parentID, name string) (strin
 }
 
 func (d *Driver) makeDir(ctx context.Context, parentID, name string) (string, error) {
-	var out file
+	var out newFileResponse
 	err := d.request(ctx, filesURL, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(map[string]any{
 			"kind":      "drive#folder",
@@ -427,10 +436,22 @@ func (d *Driver) makeDir(ctx context.Context, parentID, name string) (string, er
 	if err != nil {
 		return "", fmt.Errorf("pikpak mkdir %s: %w", name, err)
 	}
-	if out.ID == "" {
-		return "", fmt.Errorf("pikpak mkdir %s: empty folder id", name)
+	if folderID := strings.TrimSpace(out.File.ID); folderID != "" {
+		return folderID, nil
 	}
-	return out.ID, nil
+
+	// A successful create request may still omit file.id. Treat directory
+	// creation as an idempotent ensure operation: verify the postcondition by
+	// listing the parent once instead of reporting failure after PikPak has
+	// already created the folder remotely.
+	folderID, lookupErr := d.findChildDir(ctx, parentID, name)
+	if lookupErr != nil {
+		return "", fmt.Errorf("pikpak mkdir %s: response missing file.id; verify created folder: %w", name, lookupErr)
+	}
+	if folderID == "" {
+		return "", fmt.Errorf("pikpak mkdir %s: response missing file.id and created folder was not found", name)
+	}
+	return folderID, nil
 }
 
 func splitPath(p string) []string {

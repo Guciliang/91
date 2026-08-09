@@ -1,10 +1,21 @@
 // 管理后台 API 客户端
 // 所有请求都带 cookie，401 会抛错让路由守卫跳登录
 const BASE = "/admin/api";
+export const ADMIN_LOG_REQUEST_TIMEOUT_MS = 15000;
 
 export class UnauthorizedError extends Error {
   constructor() {
     super("unauthorized");
+  }
+}
+
+export class APIResponseError extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = "APIResponseError";
   }
 }
 
@@ -26,7 +37,14 @@ async function request<T>(
   }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(text || `HTTP ${res.status}`);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Keep a plain-text error response as-is.
+    }
+    throw new APIResponseError(res.status, message || `HTTP ${res.status}`);
   }
   if (res.status === 204) return undefined as T;
   const ct = res.headers.get("content-type") ?? "";
@@ -75,6 +93,298 @@ export function checkUpdate() {
   return request<UpdateCheck>("/update/check");
 }
 
+// ---------- Runtime logs ----------
+
+export type AdminLogSource = "application" | "http";
+export type AdminLogLevel = "info" | "warning" | "error";
+export type AdminLogMethod =
+  | "GET"
+  | "POST"
+  | "PUT"
+  | "PATCH"
+  | "DELETE"
+  | "OPTIONS"
+  | "HEAD";
+
+export type AdminLogEntry = {
+  id: number;
+  timestamp: string;
+  source: AdminLogSource;
+  level: AdminLogLevel;
+  method?: AdminLogMethod;
+  status?: number;
+  path?: string;
+  remote?: string;
+  bytes?: number;
+  elapsed?: string;
+  requestId?: string;
+  message: string;
+};
+
+export type AdminLogSnapshot = {
+  entries: AdminLogEntry[];
+  matched: number;
+  storageBytes: number;
+  maxStorageBytes: number;
+  nextCursor?: string;
+  reset?: boolean;
+};
+
+export function listLogs(
+  filters: {
+    source?: AdminLogSource;
+    level?: AdminLogLevel;
+    method?: AdminLogMethod;
+    query?: string;
+    limit?: number;
+    cursor?: string;
+  } = {},
+  signal?: AbortSignal
+) {
+  const params = new URLSearchParams();
+  params.set("limit", String(filters.limit ?? 500));
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  if (filters.source) params.set("source", filters.source);
+  if (filters.level) params.set("level", filters.level);
+  if (filters.method) params.set("method", filters.method);
+  if (filters.query?.trim()) params.set("q", filters.query.trim());
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const abortFromCaller = () => timeoutController.abort();
+  if (signal?.aborted) timeoutController.abort();
+  else signal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timeout = globalThis.setTimeout(() => {
+    timedOut = true;
+    timeoutController.abort();
+  }, ADMIN_LOG_REQUEST_TIMEOUT_MS);
+
+  return request<AdminLogSnapshot>(`/logs?${params.toString()}`, {
+    signal: timeoutController.signal,
+  })
+    .catch((error: unknown) => {
+      if (timedOut) throw new Error("日志请求超时，请稍后重试");
+      throw error;
+    })
+    .finally(() => {
+      globalThis.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortFromCaller);
+    });
+}
+
+export function clearLogs() {
+  return request<{ success: boolean }>("/logs", { method: "DELETE" });
+}
+
+// ---------- Full backup / migration restore ----------
+
+export type BackupEstimate = {
+  fileCount: number;
+  totalBytes: number;
+  availableBytes: number;
+  requiredBytes: number;
+};
+
+export type BackupTask = {
+  id: string;
+  state: string;
+  phase?: string;
+  name?: string;
+  startedAt: string;
+  finishedAt?: string;
+  fileCount: number;
+  processedFiles: number;
+  totalBytes: number;
+  processedBytes: number;
+  bytesPerSecond: number;
+  error?: string;
+  cancellable: boolean;
+};
+
+export type BackupRecord = {
+  id: string;
+  name: string;
+  size: number;
+  sha256?: string;
+  createdAt: string;
+  verificationStatus: "verified" | "unchecked" | "invalid" | string;
+  verificationError?: string;
+  imported: boolean;
+  appVersion?: string;
+  sourceDataRoot?: string;
+  fileCount?: number;
+  expandedSize?: number;
+  included?: string[];
+  selection?: BackupSelection;
+};
+
+export type BackupList = {
+  backups: BackupRecord[];
+  current?: BackupTask;
+  restoreProgress?: BackupOperationProgress;
+  estimate: BackupEstimate;
+  restartManaged: boolean;
+  pendingRestore: boolean;
+};
+
+export type BackupOperationProgress = {
+  phase: string;
+  processedBytes: number;
+  totalBytes: number;
+  processedFiles: number;
+  totalFiles: number;
+};
+
+export type BackupUploadChunk = {
+  index: number;
+  size: number;
+  sha256: string;
+};
+
+export type BackupUploadSession = {
+  id: string;
+  fileName: string;
+  size: number;
+  sha256?: string;
+  chunkSize: number;
+  totalChunks: number;
+  received: BackupUploadChunk[];
+  state: string;
+  progress?: BackupOperationProgress;
+  createdAt: string;
+  expiresAt: string;
+};
+
+export type BackupManifest = {
+  formatVersion: number;
+  appVersion: string;
+  createdAt: string;
+  sourceDataRoot: string;
+  fileCount: number;
+  totalSize: number;
+  included: string[];
+  selection: BackupSelection;
+};
+
+export type BackupSelection = {
+  cloudDrives: boolean;
+  crawlerScripts: boolean;
+  uploadStorage: boolean;
+  localStorage: boolean;
+  userInfo: boolean;
+};
+
+export type RestoreReport = {
+  manifest: BackupManifest;
+  verificationStatus: string;
+  pathRewrites?: string[];
+  localStorageWarnings?: string[];
+  missingAssets?: string[];
+  warnings?: string[];
+};
+
+export function listBackups() {
+  return request<BackupList>("/backups");
+}
+
+export function createBackup(selection?: BackupSelection) {
+  return request<BackupTask>("/backups", {
+    method: "POST",
+    body: selection ? JSON.stringify(selection) : undefined,
+  });
+}
+
+export function cancelBackup() {
+  return request<{ ok: boolean }>("/backups/current/cancel", { method: "POST" });
+}
+
+export function deleteBackup(id: string) {
+  return request<{ ok: boolean }>(`/backups/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function backupDownloadURL(id: string) {
+  return `${BASE}/backups/${encodeURIComponent(id)}/download`;
+}
+
+export function beginBackupUpload(input: {
+  fileName: string;
+  size: number;
+  sha256?: string;
+}) {
+  return request<BackupUploadSession>("/backup-uploads", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getBackupUpload(id: string) {
+  return request<BackupUploadSession>(`/backup-uploads/${encodeURIComponent(id)}`);
+}
+
+export async function putBackupUploadChunk(
+  id: string,
+  index: number,
+  chunk: Blob,
+  sha256: string,
+  signal?: AbortSignal
+): Promise<BackupUploadSession> {
+  const res = await fetch(
+    `${BASE}/backup-uploads/${encodeURIComponent(id)}/chunks/${index}`,
+    {
+      method: "PUT",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Chunk-SHA256": sha256,
+      },
+      body: chunk,
+      signal,
+    }
+  );
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let message = text;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Keep plain text.
+    }
+    throw new Error(message || `HTTP ${res.status}`);
+  }
+  return (await res.json()) as BackupUploadSession;
+}
+
+export function finalizeBackupUpload(id: string) {
+  return request<BackupRecord>(
+    `/backup-uploads/${encodeURIComponent(id)}/finalize`,
+    { method: "POST" }
+  );
+}
+
+export function cancelBackupUpload(id: string) {
+  return request<{ ok: boolean }>(`/backup-uploads/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function restoreBackup(
+  id: string,
+  input: { confirmation: string }
+) {
+  return request<{
+    ok: boolean;
+    restarting: boolean;
+    restartManaged: boolean;
+    report: RestoreReport;
+  }>(`/backups/${encodeURIComponent(id)}/restore`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 // ---------- Drives ----------
 
 export type AdminDrive = {
@@ -85,6 +395,8 @@ export type AdminDrive = {
   status: string;
   lastError?: string;
   hasCredential: boolean;
+  /** 后端能力表声明该挂载可写入文件；爬虫目标与转码入口据此展示。 */
+  canUpload: boolean;
   /** 当前是否给该盘生成预览视频（per-drive 开关，替代旧的全局 preview.enabled；封面不受影响）。 */
   teaserEnabled: boolean;
   /**
@@ -187,7 +499,7 @@ export function deleteDrive(id: string, body: DeleteDriveInput) {
 }
 
 export function rescan(id: string) {
-  return request<{ ok: boolean; accepted: boolean; message?: string; status?: NightlyJobStatus }>(
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: MaintenanceJobStatus }>(
     `/drives/${encodeURIComponent(id)}/rescan`,
     { method: "POST" }
   );
@@ -311,14 +623,14 @@ export function testCrawlerScript(body: { scriptPath: string; proxy?: string }) 
 }
 
 export function runCrawler(id: string) {
-  return request<{ ok: boolean; accepted: boolean; message?: string; status?: NightlyJobStatus }>(
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: MaintenanceJobStatus }>(
     `/crawlers/${encodeURIComponent(id)}/run`,
     { method: "POST" }
   );
 }
 
 export function uploadCrawlerVideos(id: string) {
-  return request<{ ok: boolean; accepted: boolean; message?: string; status?: NightlyJobStatus }>(
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: MaintenanceJobStatus }>(
     `/crawlers/${encodeURIComponent(id)}/upload`,
     { method: "POST" }
   );
@@ -761,49 +1073,6 @@ export function regenPreview(id: string) {
   );
 }
 
-// ---------- 疑似重复复核 ----------
-
-export type DuplicateReviewVideo = {
-  id: string;
-  title: string;
-  driveId: string;
-  size: number;
-  durationSeconds: number;
-  thumbnailUrl: string;
-  views: number;
-  likes: number;
-  createdAt: number;
-};
-
-export type DuplicateReviewPair = {
-  id: number;
-  medianSsim: number;
-  minSsim: number;
-  comparisons: number;
-  status: "pending" | "merged" | "dismissed";
-  createdAt: number;
-  updatedAt: number;
-  left: DuplicateReviewVideo | null;
-  right: DuplicateReviewVideo | null;
-};
-
-export function listDuplicateReviews(status: string, page: number) {
-  const params = new URLSearchParams({ status, page: String(page) });
-  return request<{ items: DuplicateReviewPair[]; total: number }>(
-    `/duplicate-reviews?${params.toString()}`
-  );
-}
-
-export function resolveDuplicateReview(
-  id: number,
-  action: "keep-left" | "keep-right" | "dismiss"
-) {
-  return request<{ ok: boolean }>(
-    `/duplicate-reviews/${id}/resolve`,
-    { method: "POST", body: JSON.stringify({ action }) }
-  );
-}
-
 // ---------- Tags ----------
 
 export type AdminTag = {
@@ -821,8 +1090,13 @@ export type AdminTag = {
 
 export type TagMatchRules = NonNullable<AdminTag["matchRules"]>;
 
-export function listTags() {
-  return request<AdminTag[]>("/tags");
+export async function listTags(): Promise<AdminTag[]> {
+  const tags = await request<AdminTag[] | null>("/tags");
+  if (tags === null) return [];
+  if (!Array.isArray(tags)) {
+    throw new Error("Invalid /admin/api/tags response");
+  }
+  return tags;
 }
 
 export function createTag(label: string) {
@@ -874,16 +1148,88 @@ export function updateSettings(body: Partial<Settings>) {
   });
 }
 
+export type ConfigYAMLDocument = {
+  content: string;
+  version: string;
+};
+
+export type ConfigSaveResult = {
+  version: string;
+  restartRequired: boolean;
+  settings: {
+    nightlyStartTime: string;
+    builtinTagsEnabled: boolean;
+  };
+};
+
+export class ConfigConflictError extends Error {
+  constructor(message = "config.yaml 已被其他操作修改") {
+    super(message);
+    this.name = "ConfigConflictError";
+  }
+}
+
+function etagVersion(value: string | null) {
+  return (value ?? "").replace(/^W\//, "").replace(/^"|"$/g, "");
+}
+
+async function configResponseError(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown };
+    if (typeof parsed.error === "string") return parsed.error;
+  } catch {
+    // Keep a plain-text response as-is.
+  }
+  return text || `HTTP ${res.status}`;
+}
+
+export async function getConfigYAML(): Promise<ConfigYAMLDocument> {
+  const res = await fetch(`${BASE}/config.yaml`, {
+    credentials: "include",
+    headers: { Accept: "application/yaml" },
+    cache: "no-store",
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(await configResponseError(res));
+  return {
+    content: await res.text(),
+    version: etagVersion(res.headers.get("ETag")),
+  };
+}
+
+export async function updateConfigYAML(
+  content: string,
+  version: string
+): Promise<ConfigSaveResult> {
+  const headers = new Headers({
+    "Content-Type": "application/yaml; charset=utf-8",
+    Accept: "application/json",
+  });
+  if (version) headers.set("If-Match", `"${version}"`);
+  const res = await fetch(`${BASE}/config.yaml`, {
+    method: "PUT",
+    credentials: "include",
+    headers,
+    body: content,
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 409) {
+    throw new ConfigConflictError(await configResponseError(res));
+  }
+  if (!res.ok) throw new Error(await configResponseError(res));
+  return (await res.json()) as ConfigSaveResult;
+}
+
 
 // ---------- Jobs ----------
 
 /**
- * 立即触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 + Phase3 迁移），
- * 不论当前时间或今日是否已跑。立即返回 202；进度通过任务状态和 backend 日志观察。
- *
- * 流水线已在跑或已排队时，后端会拒绝重复触发。
+ * 扫描所有已配置的真实网盘，等待新视频资产处理完成后执行全库视频去重。
+ * 不触发脚本爬虫、爬虫上传或恢复，也不占用当天的定时 nightly 执行标记。
+ * 任务已在跑或已排队时，后端会拒绝重复触发。
  */
-export type NightlyJobStatus = {
+export type MaintenanceJobStatus = {
   state: "idle" | "queued" | "running" | "running_queued";
   running: boolean;
   queued: boolean;
@@ -891,19 +1237,19 @@ export type NightlyJobStatus = {
   lastFinishedAt?: string;
 };
 
-export function getNightlyJobStatus() {
-  return request<NightlyJobStatus>("/jobs/nightly/status");
+export function getScanAllJobStatus() {
+  return request<MaintenanceJobStatus>("/jobs/scan-all/status");
 }
 
-export function runNightlyJob() {
-  return request<{ ok: boolean; accepted: boolean; status: NightlyJobStatus; message?: string }>(
-    "/jobs/nightly/run",
+export function runScanAllJob() {
+  return request<{ ok: boolean; accepted: boolean; status: MaintenanceJobStatus; message?: string }>(
+    "/jobs/scan-all/run",
     { method: "POST" }
   );
 }
 
 export function stopAllTasks() {
-  return request<{ ok: boolean; stoppedDrives: number; status: NightlyJobStatus }>(
+  return request<{ ok: boolean; stoppedDrives: number; status: MaintenanceJobStatus }>(
     "/tasks/stop",
     { method: "POST" }
   );

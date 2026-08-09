@@ -3,7 +3,7 @@ import {
   Ban,
   ChevronDown,
   Key,
-  RefreshCw,
+  Plus,
   ShieldOff,
   Trash2,
 } from "lucide-react";
@@ -12,11 +12,14 @@ import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
 import { ConfirmModal } from "./ConfirmModal";
 import { PasswordInput } from "./PasswordInput";
+import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
+import { useAdminRouteRevalidation } from "./AdminRouteCache";
 
 type Tab = "users" | "ips";
 const MIN_PASSWORD_LENGTH = 6;
 
 export function UsersPage() {
+  const floatingActionPageRef = useAdminFloatingActionSpace<HTMLDivElement>();
   const [tab, setTab] = useState<Tab>("users");
   const [users, setUsers] = useState<api.AdminUser[]>([]);
   const [ips, setIps] = useState<api.BannedIP[]>([]);
@@ -42,31 +45,35 @@ export function UsersPage() {
       ? `密码至少 ${MIN_PASSWORD_LENGTH} 位`
       : "";
 
-  async function refreshUsers() {
+  async function refreshUsers(silent = false) {
     try {
       setUsers(await api.listUsers());
     } catch (e) {
-      show(e instanceof Error ? e.message : "加载用户失败", "error");
+      if (!silent) show(e instanceof Error ? e.message : "加载用户失败", "error");
     }
   }
 
-  async function refreshIPs() {
+  async function refreshIPs(silent = false) {
     try {
       setIps(await api.listBannedIPs());
     } catch (e) {
-      show(e instanceof Error ? e.message : "加载封禁IP失败", "error");
+      if (!silent) show(e instanceof Error ? e.message : "加载封禁IP失败", "error");
     }
   }
 
-  async function refresh() {
-    setLoading(true);
-    await Promise.all([refreshUsers(), refreshIPs()]);
-    setLoading(false);
+  async function refresh(silent = false) {
+    if (!silent) setLoading(true);
+    await Promise.all([refreshUsers(silent), refreshIPs(silent)]);
+    if (!silent) setLoading(false);
   }
 
   useEffect(() => {
     refresh();
   }, []);
+
+  useAdminRouteRevalidation(() => {
+    void refresh(true);
+  });
 
   async function handleCreate() {
     if (!createUsername.trim() || !createPassword || createPasswordError) return;
@@ -157,7 +164,11 @@ export function UsersPage() {
   }
 
   return (
-    <div className="admin-page">
+    <div
+      ref={floatingActionPageRef}
+      className="admin-page admin-page--with-floating-actions"
+      aria-busy={loading || undefined}
+    >
       <div className="admin-users-toolbar">
         <div className="admin-users-tabs admin-tags-filter-tabs" role="tablist" aria-label="用户分组">
           <button
@@ -179,21 +190,21 @@ export function UsersPage() {
             <span className="admin-tags-filter-tab__text">封禁IP</span>
           </button>
         </div>
-        <div className="admin-users-toolbar-actions">
-          {tab === "users" && (
-            <button className="admin-btn admin-users-create-fab" onClick={() => setShowCreate(true)}>
-              新建用户
-            </button>
-          )}
-        </div>
       </div>
 
-      {loading ? (
-        <div className="admin-loading-state admin-page-loading" role="status" aria-live="polite">
-          <RefreshCw size={20} className="admin-spin" />
-          <span>加载中...</span>
-        </div>
-      ) : tab === "users" ? (
+      {tab === "users" && (
+        <button
+          data-admin-floating-actions
+          type="button"
+          className="admin-btn admin-create-fab"
+          onClick={() => setShowCreate(true)}
+        >
+          <Plus size="1em" aria-hidden="true" />
+          新建用户
+        </button>
+      )}
+
+      {!loading && tab === "users" && (
         <div className="admin-table-wrap admin-users-table-wrap">
           <table className="admin-table admin-users-table">
             <thead>
@@ -265,7 +276,9 @@ export function UsersPage() {
             </tbody>
           </table>
         </div>
-      ) : (
+      )}
+
+      {!loading && tab === "ips" && (
         <div className="admin-table-wrap admin-users-table-wrap">
           <table className="admin-table admin-banned-ips-table">
             <thead>

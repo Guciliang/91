@@ -49,6 +49,41 @@ CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_videos_duration ON videos(duration_seconds);
 CREATE INDEX IF NOT EXISTS idx_videos_views ON videos(views DESC);
 
+-- 管理员提交的视频直链后台任务。source_url 只在任务排队或执行期间保留；
+-- 进入 completed / failed / canceled 后由状态更新语句立即清空。
+CREATE TABLE IF NOT EXISTS remote_upload_jobs (
+    sequence           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                 TEXT NOT NULL UNIQUE,
+    source_url         TEXT NOT NULL DEFAULT '',
+    source_label       TEXT NOT NULL DEFAULT '',
+    requested_title    TEXT NOT NULL DEFAULT '',
+    resolved_title     TEXT NOT NULL DEFAULT '',
+    tags               TEXT NOT NULL DEFAULT '[]',
+    state              TEXT NOT NULL
+                           CHECK (state IN (
+                               'queued', 'downloading', 'validating', 'saving',
+                               'completed', 'failed', 'canceled'
+                           )),
+    bytes_downloaded   INTEGER NOT NULL DEFAULT 0,
+    total_bytes        INTEGER NOT NULL DEFAULT 0,
+    cancel_requested   INTEGER NOT NULL DEFAULT 0,
+    error_message      TEXT NOT NULL DEFAULT '',
+    temp_file          TEXT NOT NULL DEFAULT '',
+    final_file         TEXT NOT NULL DEFAULT '',
+    completed_video_id TEXT NOT NULL DEFAULT '',
+    created_at         INTEGER NOT NULL,
+    started_at         INTEGER NOT NULL DEFAULT 0,
+    updated_at         INTEGER NOT NULL,
+    finished_at        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_upload_jobs_queue
+    ON remote_upload_jobs(state, sequence);
+CREATE INDEX IF NOT EXISTS idx_remote_upload_jobs_recent
+    ON remote_upload_jobs(sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_remote_upload_jobs_finished
+    ON remote_upload_jobs(finished_at);
+
 -- 视频详情页按“本次访问”记录的一张匿名临时选票。visit_id 由每次页面实例
 -- 随机生成，不关联账号、Cookie 或设备；刷新/重新进入会生成新的 visit_id。
 -- 保留 none 行可以让取消操作和重复请求保持幂等。
@@ -170,6 +205,35 @@ CREATE TABLE IF NOT EXISTS scans (
     error       TEXT
 );
 
+-- A provider listing is not authoritative enough to delete catalog data after
+-- one empty response. Missing files are confirmed across complete successful
+-- scans; seeing the file again clears the counter immediately.
+CREATE TABLE IF NOT EXISTS drive_scan_misses (
+    drive_id            TEXT NOT NULL,
+    file_id             TEXT NOT NULL,
+    consecutive_misses  INTEGER NOT NULL DEFAULT 0,
+    last_missing_at     INTEGER NOT NULL,
+    PRIMARY KEY (drive_id, file_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_drive_scan_misses_threshold
+    ON drive_scan_misses(drive_id, consecutive_misses);
+
+CREATE TRIGGER IF NOT EXISTS cleanup_drive_scan_miss_after_video_delete
+AFTER DELETE ON videos
+WHEN NOT EXISTS (
+    SELECT 1 FROM videos WHERE drive_id = OLD.drive_id AND file_id = OLD.file_id
+)
+BEGIN
+    DELETE FROM drive_scan_misses WHERE drive_id = OLD.drive_id AND file_id = OLD.file_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS cleanup_drive_scan_misses_after_drive_delete
+AFTER DELETE ON drives
+BEGIN
+    DELETE FROM drive_scan_misses WHERE drive_id = OLD.id;
+END;
+
 -- 管理后台 session（简单 token 存储）
 CREATE TABLE IF NOT EXISTS admin_sessions (
     token      TEXT PRIMARY KEY,
@@ -217,24 +281,6 @@ CREATE TABLE IF NOT EXISTS users (
     banned     INTEGER NOT NULL DEFAULT 0,       -- 1 = 被封禁
     created_at INTEGER NOT NULL
 );
-
--- 内容级查重疑似区（near-miss）复核队列：夜间维护写入，管理后台裁决。
--- (left_video_id, right_video_id) 按字典序归一化，同一对只存一行；
--- status=dismissed 的对不会被夜间维护重新写回。
-CREATE TABLE IF NOT EXISTS duplicate_review_pairs (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    left_video_id  TEXT NOT NULL,
-    right_video_id TEXT NOT NULL,
-    median_ssim    REAL NOT NULL DEFAULT 0,
-    min_ssim       REAL NOT NULL DEFAULT 0,
-    comparisons    INTEGER NOT NULL DEFAULT 0,
-    status         TEXT NOT NULL DEFAULT 'pending', -- pending / merged / dismissed
-    created_at     INTEGER NOT NULL,
-    updated_at     INTEGER NOT NULL,
-    UNIQUE(left_video_id, right_video_id)
-);
-CREATE INDEX IF NOT EXISTS idx_duplicate_review_pairs_status
-    ON duplicate_review_pairs(status, updated_at DESC);
 
 -- 短视频随机 feed 会话快照：token → 洗牌后的可见视频 id 列表（JSON 数组）。
 -- 持久化让后端重启/更新不再使旧 token 失效，前端可从上次游标续播同一轮。

@@ -93,13 +93,116 @@
   display: none;
 }
 
+/* From uiverse.io by @satyamchaudharydev */
+/* removing default style of button */
+.search-panel--uiverse button {
+  border: none;
+  background: none;
+  color: var(--text-muted);
+}
+
+/* styling of whole input container */
+.search-panel--uiverse {
+  --timing: 0.3s;
+  --width-of-input: min(100%, 360px);
+  --height-of-input: 40px;
+  --border-height: 2px;
+  --input-bg: var(--bg-surface);
+  --border-color: var(--accent);
+  --border-radius: 30px;
+  --after-border-radius: 1px;
+  position: relative;
+  width: var(--width-of-input);
+  height: var(--height-of-input);
+  display: flex;
+  align-items: center;
+  padding-inline: 0.8em;
+  border-radius: var(--border-radius);
+  transition: border-radius 0.5s ease;
+  background: var(--input-bg, var(--bg-surface));
+}
+
+.search-panel--uiverse.search-panel--public {
+  --width-of-input: 100%;
+}
+
+.search-panel--uiverse.search-panel--transparent {
+  --input-bg: transparent;
+  border: 1px solid var(--border-default);
+}
+
+/* styling of Input */
+.search-panel--uiverse .search-panel__uiverse-input {
+  font-size: 0.9rem;
+  background-color: transparent;
+  width: 100%;
+  height: 100%;
+  padding-inline: 0.5em;
+  padding-block: 0.7em;
+  border: none;
+}
+
+/* styling of animated border */
+.search-panel--uiverse::before {
+  content: "";
+  position: absolute;
+  background: var(--border-color);
+  transform: scaleX(0);
+  transform-origin: center;
+  width: 100%;
+  height: var(--border-height);
+  left: 0;
+  bottom: 0;
+  border-radius: 1px;
+  transition: transform var(--timing) ease;
+}
+
+/* Hover on Input */
+.search-panel--uiverse:focus-within {
+  border-radius: var(--after-border-radius);
+}
+
+.search-panel--uiverse .search-panel__uiverse-input:focus {
+  outline: none;
+}
+
+/* here is code of animated border */
+.search-panel--uiverse:focus-within::before {
+  transform: scale(1);
+}
+
+/* styling of close button */
+/* == you can click the close button to remove text == */
+.search-panel--uiverse .search-panel__reset {
+  border: none;
+  background: none;
+  opacity: 0;
+  visibility: hidden;
+}
+
+/* close button shown when typing */
+.search-panel--uiverse .search-panel__uiverse-input:not(:placeholder-shown) ~ .search-panel__reset {
+  opacity: 1;
+  visibility: visible;
+}
+
+/* sizing svg icons */
+.search-panel--uiverse svg {
+  width: 17px;
+  margin-top: 3px;
+}
+
 /* ----- Tag cloud ----- */
 .tag-cloud-container {
   margin-top: var(--space-4);
   width: 100%;
   min-height: 34px;
   position: relative;
-  /* Premium horizontal fade mask */
+  mask-image: none;
+  -webkit-mask-image: none;
+}
+
+.tag-cloud-container.has-more-right {
   mask-image: linear-gradient(to right, black 0%, black 93%, transparent 100%);
   -webkit-mask-image: linear-gradient(to right, black 0%, black 93%, transparent 100%);
 }
@@ -322,6 +425,9 @@
   .tag-cloud-container {
     margin-top: var(--space-3);
     min-height: 32px;
+  }
+
+  .tag-cloud-container.has-more-right {
     /* Mobile-friendly fade mask */
     mask-image: linear-gradient(to right, black 0%, black 90%, transparent 100%);
     -webkit-mask-image: linear-gradient(to right, black 0%, black 90%, transparent 100%);

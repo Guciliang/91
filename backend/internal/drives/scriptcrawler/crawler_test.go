@@ -2,6 +2,7 @@ package scriptcrawler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -24,6 +25,7 @@ import (
 const (
 	scriptCrawlerDuplicateBytes = "duplicate-video-bytes"
 	scriptCrawlerUniqueBytes    = "unique-video-bytes"
+	scriptCrawlerWebPBase64     = "UklGRrIBAABXRUJQVlA4TKUBAAAvSsAYAA8w//M///MfeJAkbXvaSG7m8Q3GfYSBJekwQztm/IcZlgwnmWImn2BK7aFmBtnVir6q//8VOkFE/xm4baTIu8c48ArEo6+B3zFKYln3pqClSCKX0begFTAXFOLXHSyF8cCNcZEG4OywuA4KVVfJCiArU7GAgJI8+lJP/OKMT/fBAjevg1cYB7YVkFuWga2lyPi5I0HFy5YTpWIHg0RZpkniRVW9odHAKOwosWuOGdxIyn2OvaCDvhg/we6TwadPBPbqBV58MsLmMJ8yZnOWk8SRz4N+QoyPL+MnamzMvcE1rHNEr91F9GKZPVUcS9w7PhhH36suB9qPeYb/oLk6cuTiJ0wOK3m5h1cKjW6EVZCYMK7dxcKCBdgP9HkKr9gkAO2P8GKZGWVdIAatQa+1IDpt6qyorVwdy01xdW8Jkfk6xjEXmVQQ+HQdFr6OKhIN34dXWq0+0qr6EJSCeeVLH9+gvGTLyqM65PQ44ihzlTXxQKjKbAvshXgir7Lil9w4L2bvMycmjQcqXaMCO6BlY28i+FOLzbfI1vEqxAhotocAAA=="
 )
 
 func writeScriptCrawlerFFprobeStub(t *testing.T, dir string, ok bool) string {
@@ -44,7 +46,27 @@ func writeScriptCrawlerFFprobeStub(t *testing.T, dir string, ok bool) string {
 func writeScriptCrawlerFFmpegStub(t *testing.T, dir string) string {
 	t.Helper()
 	path := filepath.Join(dir, "ffmpeg-hls.sh")
-	body := "#!/bin/sh\nif [ -n \"$GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE\" ]; then printf '%s\\n' \"$@\" > \"$GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE\"; fi\nout=\"\"\nfor arg do out=\"$arg\"; done\nprintf 'hls-video-bytes' > \"$out\"\n"
+	body := `#!/bin/sh
+if [ "$#" -eq 3 ] && [ "$1" = "-hide_banner" ] && [ "$2" = "-h" ] && [ "$3" = "demuxer=hls" ]; then
+  if [ "${GO_SCRIPTCRAWLER_FFMPEG_HELP_FAIL:-}" = "1" ]; then
+    echo "hls help unavailable" >&2
+    exit 1
+  fi
+  if [ -n "${GO_SCRIPTCRAWLER_FFMPEG_HLS_HELP:-}" ]; then
+    printf '%s\n' "$GO_SCRIPTCRAWLER_FFMPEG_HLS_HELP"
+  else
+    printf '%s\n' \
+      '  -allowed_extensions <string> .D.........' \
+      '  -allowed_segment_extensions <string> .D.........' \
+      '  -extension_picky <boolean> .D.........'
+  fi
+  exit 0
+fi
+if [ -n "$GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE" ]; then printf '%s\n' "$@" > "$GO_SCRIPTCRAWLER_FFMPEG_ARGS_FILE"; fi
+out=""
+for arg do out="$arg"; done
+printf 'hls-video-bytes' > "$out"
+`
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatalf("write ffmpeg stub: %v", err)
 	}
@@ -66,6 +88,17 @@ func writeScriptCrawlerJPEG(t *testing.T, path string, c color.RGBA) {
 	defer f.Close()
 	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 95}); err != nil {
 		t.Fatalf("encode jpeg: %v", err)
+	}
+}
+
+func writeScriptCrawlerWebP(t *testing.T, path string) {
+	t.Helper()
+	data, err := base64.StdEncoding.DecodeString(scriptCrawlerWebPBase64)
+	if err != nil {
+		t.Fatalf("decode WebP fixture: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write WebP fixture: %v", err)
 	}
 }
 
@@ -118,6 +151,9 @@ func TestCrawlerRunOnceImportsLocalFileAndSkipsExisting(t *testing.T) {
 	}
 	if v.Title != "Imported From Helper" || v.FileID != "abc-123.mp4" || v.Size == 0 {
 		t.Fatalf("video = title:%q file:%q size:%d", v.Title, v.FileID, v.Size)
+	}
+	if !v.PublishedAt.Equal(v.CreatedAt) {
+		t.Fatalf("crawler timestamps = published %s created %s, want identical backend import time", v.PublishedAt, v.CreatedAt)
 	}
 	if !hasString(v.Tags, "Demo Crawler") {
 		t.Fatalf("video tags = %#v, want crawler name tag", v.Tags)
@@ -543,6 +579,12 @@ func TestCrawlerRunOnceSkipsThenRestoresRetainedLocalVideo(t *testing.T) {
 		t.Fatalf("local data = %q", data)
 	}
 
+	// Simulate a tombstone written by an older backend that accepted a source
+	// publication date. Restore must re-establish the backend-owned timestamp.
+	v.PublishedAt = v.CreatedAt.Add(-365 * 24 * time.Hour)
+	if err := cat.UpsertVideo(ctx, v); err != nil {
+		t.Fatalf("seed legacy crawler timestamp: %v", err)
+	}
 	if err := cat.DeleteVideoWithTombstone(ctx, v.ID); err != nil {
 		t.Fatalf("delete with tombstone: %v", err)
 	}
@@ -582,6 +624,9 @@ func TestCrawlerRunOnceSkipsThenRestoresRetainedLocalVideo(t *testing.T) {
 	}
 	if restored.Title != v.Title || restored.PreviewStatus != "pending" {
 		t.Fatalf("restored metadata = title:%q preview:%q, want %q/pending", restored.Title, restored.PreviewStatus, v.Title)
+	}
+	if !restored.PublishedAt.Equal(restored.CreatedAt) {
+		t.Fatalf("restored timestamps = published %s created %s, want identical import time", restored.PublishedAt, restored.CreatedAt)
 	}
 	if deleted, err := cat.IsVideoDeleted(ctx, v.ID); err != nil || deleted {
 		t.Fatalf("restored video tombstone remains: deleted=%v err=%v", deleted, err)
@@ -828,7 +873,7 @@ func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed smaller video: %v", err)
 	}
-	writeScriptCrawlerJPEG(t, mediaasset.ThumbnailPathInDir(commonThumbDir, smallerID), color.RGBA{R: 80, G: 160, B: 80, A: 255})
+	writeScriptCrawlerWebP(t, mediaasset.ThumbnailPathInDir(commonThumbDir, smallerID))
 
 	outputDir := drv.OutputDir()
 	mediaPath := filepath.Join(outputDir, "larger-video.mp4")
@@ -836,7 +881,7 @@ func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
 		t.Fatalf("write media: %v", err)
 	}
 	thumbPath := filepath.Join(outputDir, "larger-thumb.jpg")
-	writeScriptCrawlerJPEG(t, thumbPath, color.RGBA{R: 81, G: 161, B: 81, A: 255})
+	writeScriptCrawlerWebP(t, thumbPath)
 
 	c := NewCrawler(CrawlerConfig{
 		Driver:         drv,
@@ -872,6 +917,15 @@ func TestCrawlerProcessItemKeepsLargerNearDuplicate(t *testing.T) {
 	}
 	if larger.Author != "" {
 		t.Fatalf("larger author = %q, want empty when crawler omits author", larger.Author)
+	}
+	normalizedThumbPath := mediaasset.ThumbnailPathInDir(commonThumbDir, larger.ID)
+	normalizedThumb, err := os.Open(normalizedThumbPath)
+	if err != nil {
+		t.Fatalf("open normalized thumbnail: %v", err)
+	}
+	defer normalizedThumb.Close()
+	if _, err := jpeg.Decode(normalizedThumb); err != nil {
+		t.Fatalf("crawler thumbnail was not normalized to JPEG: %v", err)
 	}
 }
 
@@ -1257,14 +1311,16 @@ func TestScriptCrawlerHelperProcess(t *testing.T) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	event := Event{
-		Type: "item",
-		Item: Item{
-			SourceID: "abc-123",
-			Title:    "Imported From Helper",
-			Author:   "helper",
-			Media:    MediaRef{LocalFile: localFile},
-		},
+	// Include the retired field to verify rolling compatibility with scripts
+	// deployed before crawler timestamps became backend-owned. It must decode
+	// successfully but cannot affect the stored timestamp.
+	event := map[string]any{
+		"type":             "item",
+		"source_id":        "abc-123",
+		"title":            "Imported From Helper",
+		"author":           "helper",
+		"media_local_file": localFile,
+		"published_at":     "2021-11-05",
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(event)
 	os.Exit(0)

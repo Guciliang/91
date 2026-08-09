@@ -8,11 +8,13 @@ require (
 	github.com/OpenListTeam/wopan-sdk-go v0.2.0
 	github.com/SheltonZhu/115driver v1.3.2
 	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
+	github.com/andybalholm/brotli v1.2.2
 	github.com/go-chi/chi/v5 v5.1.0
 	github.com/go-resty/resty/v2 v2.14.0
 	github.com/rclone/rclone v1.68.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	golang.org/x/crypto v0.40.0
+	golang.org/x/image v0.29.0
 	golang.org/x/net v0.42.0
 	golang.org/x/sys v0.34.0
 	golang.org/x/text v0.28.0
@@ -59,7 +61,6 @@ require (
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/term v0.33.0 // indirect
 	golang.org/x/time v0.8.0 // indirect
-	golang.org/x/tools v0.35.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 	modernc.org/gc/v3 v3.0.0-20240107210532-573471604cb6 // indirect
 	modernc.org/libc v1.55.3 // indirect

@@ -2,6 +2,10 @@ package crawlerupload
 
 import (
 	"context"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +18,8 @@ import (
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 )
+
+const crawlerUploadWebPBase64 = "UklGRrIBAABXRUJQVlA4TKUBAAAvSsAYAA8w//M///MfeJAkbXvaSG7m8Q3GfYSBJekwQztm/IcZlgwnmWImn2BK7aFmBtnVir6q//8VOkFE/xm4baTIu8c48ArEo6+B3zFKYln3pqClSCKX0begFTAXFOLXHSyF8cCNcZEG4OywuA4KVVfJCiArU7GAgJI8+lJP/OKMT/fBAjevg1cYB7YVkFuWga2lyPi5I0HFy5YTpWIHg0RZpkniRVW9odHAKOwosWuOGdxIyn2OvaCDvhg/we6TwadPBPbqBV58MsLmMJ8yZnOWk8SRz4N+QoyPL+MnamzMvcE1rHNEr91F9GKZPVUcS9w7PhhH36suB9qPeYb/oLk6cuTiJ0wOK3m5h1cKjW6EVZCYMK7dxcKCBdgP9HkKr9gkAO2P8GKZGWVdIAatQa+1IDpt6qyorVwdy01xdW8Jkfk6xjEXmVQQ+HQdFr6OKhIN34dXWq0+0qr6EJSCeeVLH9+gvGTLyqM65PQ44ihzlTXxQKjKbAvshXgir7Lil9w4L2bvMycmjQcqXaMCO6BlY28i+FOLzbfI1vEqxAhotocAAA=="
 
 type fakeRegistry struct {
 	byID map[string]drives.Drive
@@ -49,6 +55,8 @@ type fakeUploadDrive struct {
 	gotBodies   map[string][]byte
 	gotParents  map[string]string
 	ensureCalls []string
+	listCalls   int
+	listEntries []drives.Entry
 }
 
 func newFakeUploadDrive(id, kind, rootID string) *fakeUploadDrive {
@@ -68,7 +76,10 @@ func (d *fakeUploadDrive) RootID() string {
 }
 func (d *fakeUploadDrive) Init(context.Context) error { return nil }
 func (d *fakeUploadDrive) List(context.Context, string) ([]drives.Entry, error) {
-	return nil, nil
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.listCalls++
+	return append([]drives.Entry(nil), d.listEntries...), nil
 }
 func (d *fakeUploadDrive) Stat(context.Context, string) (*drives.Entry, error) {
 	return nil, drives.ErrNotSupported
@@ -101,6 +112,17 @@ func (d *fakeUploadDrive) UploadAndReportHash(_ context.Context, parentID, name 
 var _ drives.Drive = (*fakeUploadDrive)(nil)
 var _ uploadTarget = (*fakeUploadDrive)(nil)
 
+type fakeReconcileDrive struct {
+	*fakeUploadDrive
+	existing  *UploadResult
+	findCalls int
+}
+
+func (d *fakeReconcileDrive) FindExisting(_ context.Context, _, _ string, _ int64) (*UploadResult, error) {
+	d.findCalls++
+	return d.existing, nil
+}
+
 func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	ctx := context.Background()
 	cat := setupCatalog(t)
@@ -122,6 +144,13 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	}
 
 	videoID := writeCrawlerVideo(t, cat, src, "source-001", ".mp4", []byte("video payload"), true)
+	webP, err := base64.StdEncoding.DecodeString(crawlerUploadWebPBase64)
+	if err != nil {
+		t.Fatalf("decode WebP fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src.ThumbsDir(), "source-001.jpg"), webP, 0o644); err != nil {
+		t.Fatalf("replace crawler thumbnail with WebP: %v", err)
+	}
 	commonThumbDir := filepath.Join(t.TempDir(), "thumbs")
 	m := New(Config{Catalog: cat, Registry: reg, CommonThumbDir: commonThumbDir})
 
@@ -162,8 +191,13 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(src.ThumbsDir(), "source-001.jpg")); !os.IsNotExist(err) {
 		t.Fatalf("local thumb still exists or stat failed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(commonThumbDir, videoID+".jpg")); err != nil {
+	commonThumb, err := os.Open(filepath.Join(commonThumbDir, videoID+".jpg"))
+	if err != nil {
 		t.Fatalf("common thumbnail missing: %v", err)
+	}
+	defer commonThumb.Close()
+	if _, err := jpeg.Decode(commonThumb); err != nil {
+		t.Fatalf("common thumbnail was not normalized to JPEG: %v", err)
 	}
 }
 
@@ -201,6 +235,62 @@ func TestRunOnceRequiresPerCrawlerUploadTarget(t *testing.T) {
 	}
 	if got.DriveID != src.ID() {
 		t.Fatalf("drive_id = %q, want local crawler drive", got.DriveID)
+	}
+}
+
+func TestRunOnceReconcilesRemoteWriteAfterCatalogCrashWithoutReupload(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	src := setupScriptCrawler(t, "crawler-reconcile")
+	target := &fakeReconcileDrive{
+		fakeUploadDrive: newFakeUploadDrive("target-drive", "quark", "target-root"),
+		existing:        &UploadResult{FileID: "existing-remote-fid", Hash: strings.Repeat("c", 40), Size: 13},
+	}
+	reg := newFakeRegistry()
+	reg.Add(src)
+	reg.Add(target)
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID: src.ID(), Kind: scriptcrawler.Kind, Name: "Reconcile", RootID: "/",
+		Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
+		TeaserEnabled: true,
+	}); err != nil {
+		t.Fatalf("upsert crawler drive: %v", err)
+	}
+	videoID := writeCrawlerVideo(t, cat, src, "source-crash", ".mp4", []byte("video payload"), true)
+
+	m := New(Config{Catalog: cat, Registry: reg})
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+	if target.findCalls != 1 || target.uploadCalls != 0 {
+		t.Fatalf("find calls=%d upload calls=%d, want reconciliation only", target.findCalls, target.uploadCalls)
+	}
+	got, err := cat.GetVideo(ctx, videoID)
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if got.DriveID != target.ID() || got.FileID != "existing-remote-fid" || got.ContentHash != strings.Repeat("c", 40) {
+		t.Fatalf("migrated video = drive %q file %q hash %q", got.DriveID, got.FileID, got.ContentHash)
+	}
+	if _, err := os.Stat(filepath.Join(src.VideosDir(), "source-crash.mp4")); !os.IsNotExist(err) {
+		t.Fatalf("local source was not cleaned after reconciliation: %v", err)
+	}
+}
+
+func TestDestinationReconciliationCachesOneDirectorySnapshot(t *testing.T) {
+	drive := newFakeUploadDrive("target", "quark", "root")
+	drive.listEntries = []drives.Entry{{ID: "remote", Name: "movie.mp4", Size: 10}}
+	cache := &existingUploadCache{}
+	first, err := findExistingDriveUpload(context.Background(), drive, cache, "parent", "movie.mp4", 10)
+	if err != nil || first == nil || first.FileID != "remote" {
+		t.Fatalf("first lookup = %#v, err=%v", first, err)
+	}
+	second, err := findExistingDriveUpload(context.Background(), drive, cache, "parent", "missing.mp4", 10)
+	if err != nil || second != nil {
+		t.Fatalf("second lookup = %#v, err=%v", second, err)
+	}
+	if drive.listCalls != 1 {
+		t.Fatalf("List calls = %d, want one cached directory snapshot", drive.listCalls)
 	}
 }
 
@@ -288,8 +378,22 @@ func writeCrawlerVideo(t *testing.T, cat *catalog.Catalog, d *scriptcrawler.Driv
 	if err != nil {
 		t.Fatalf("thumb path: %v", err)
 	}
-	if err := os.WriteFile(thumbPath, []byte("thumb"), 0o644); err != nil {
-		t.Fatalf("write thumb: %v", err)
+	thumb, err := os.Create(thumbPath)
+	if err != nil {
+		t.Fatalf("create thumb: %v", err)
+	}
+	frame := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	for y := 0; y < frame.Bounds().Dy(); y++ {
+		for x := 0; x < frame.Bounds().Dx(); x++ {
+			frame.SetRGBA(x, y, color.RGBA{R: 80, G: 120, B: 160, A: 255})
+		}
+	}
+	if err := jpeg.Encode(thumb, frame, &jpeg.Options{Quality: 90}); err != nil {
+		_ = thumb.Close()
+		t.Fatalf("encode thumb: %v", err)
+	}
+	if err := thumb.Close(); err != nil {
+		t.Fatalf("close thumb: %v", err)
 	}
 
 	now := time.Now()

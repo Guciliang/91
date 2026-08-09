@@ -42,6 +42,7 @@ internal/
   fingerprint/              跨盘去重指纹
   nightly/                  每日维护流水线
   crawlerupload/            把爬虫产物迁移到目标网盘
+  remoteupload/             公网视频直链的安全下载与持久化单 worker
   …                         转码、标签、字幕、相似度、路径与文件名规则等小包
 data/                       运行时数据：主库、封面、上传、爬虫产物（不在版本库）
 ```
@@ -76,12 +77,11 @@ internal/
     shorts_feed.go          短视频模式取流
     video_shares.go         一次性免登录分享链接
     storage_usage*.go       存储占用接口（含 unix / windows 分支）
-    admin_*.go              管理后台：登录、网盘、爬虫、视频、重复复核、标签、用户、设置
+    admin_*.go              管理后台：登录、网盘、爬虫、视频、标签、用户、设置
   auth/                     管理员 session、密码哈希、登录失败封禁
   catalog/                  SQLite 元数据层
     catalog.go              视频、网盘、扫描状态
     tag_*.go                标签 CRUD、匹配、分类、迁移、维护
-    duplicate_review.go     疑似重复复核队列
     users.go video_shares.go
   config/                   YAML 配置与默认值
   drives/
@@ -110,6 +110,7 @@ internal/
   streamhttp/               共享的重定向策略，跳转时不泄漏网盘凭据
   nightly/                  每日一条维护流水线：扫盘 → 爬虫 → 上传迁移 → 去重维护
   crawlerupload/            把爬虫落地的视频迁移到目标网盘并改写 catalog 行
+  remoteupload/             视频直链任务、SSRF 防护、磁盘保护和下载 worker
   tagging/                  标签匹配规则、番号识别
   fixedtags/                内置标签包及其匹配规则
   mediasim/                 标题相似度 + 封面 SSIM + teaser 帧签名，供近重复判定使用
@@ -149,7 +150,7 @@ data/crawler-scripts/       后台导入的爬虫 .py 脚本
 flowchart TB
     subgraph TRIG["触发源"]
         BOOT["进程启动"]
-        CRON["nightly 每日 cron_hour"]
+        CRON["nightly 每日配置时间"]
         ADMIN["管理后台操作"]
         USER["前台用户请求"]
     end
@@ -219,23 +220,39 @@ flowchart TB
 
 1. 读 `config.yaml`（缺失则从模板复制）、建 `data/` 目录、打开 SQLite。
 2. 挂载本地内置盘（`localupload`），启动指纹补扫协程。
-3. 装配 `api.Server` / `api.AdminServer`，注册 chi 路由，挂前端静态资源。
-4. **先监听端口**，再 `go attachExistingDrives(ctx)` 异步挂载云盘。云盘挂载要校验上游登录态，放在监听之前会拖慢启动。
-5. 启动 nightly 流水线协程，等待退出信号，收到后 5 秒优雅关闭。
+3. 恢复视频直链任务：删除中断的 `.part`，把执行中任务从字节 0 重新排队，并启动唯一下载 worker。
+4. 装配 `api.Server` / `api.AdminServer`，注册 chi 路由，挂前端静态资源。
+5. **先监听端口**，再 `go attachExistingDrives(ctx)` 异步挂载云盘。云盘挂载要校验上游登录态，放在监听之前会拖慢启动。
+6. 启动 nightly 流水线协程，等待退出信号；HTTP 服务关闭后会等待直链 worker 中止请求、清理临时文件并重新排队未完成任务。
 
 启动期还会跑一次性迁移：孤儿视频清理、config 管理员写入 users 表、隐藏视频转黑名单墓碑、标签迁移。
 
 每挂载一个盘，就为它单独起 **封面 / 预览 / 指纹三个 worker**，并注册一个可独立取消的 context —— 后台「停止该盘任务」就是取消这个 context。
 
-### 2. 入库的三条路径
+### 2. 入库的四条路径
 
 | 路径 | 触发 | 关键行为 |
 |---|---|---|
 | 扫盘 | 夜间流水线、后台「重新扫描」 | 递归列目录，按扩展名过滤，`videoname` 解析标题/作者，`UpsertVideo` 落库 |
 | 爬虫 | 夜间流水线、后台「重新扫描」（爬虫盘等同触发爬取） | 启动 Python 子进程，读 stdout 的 JSON Lines 事件流，逐条下载入库 |
 | 上传 | 前台 `POST /api/upload` | 落到 `data/uploads/`，直接入库并立即排生成队列 |
+| 视频直链 | 上传页 `POST /api/upload/remote` | 持久化后台下载，校验视频流后落到 `data/uploads/`，复用上传生成队列 |
 
 扫盘结束后还有一步**删除检测**：本轮见到的 `file_id` 集合之外、且父目录在本轮走过的视频，判定为已从网盘删除。若本轮有目录报错（`stats.Errors > 0`）则整轮跳过检测 —— 宁可漏删，不可把「暂时列不出来」误判成「用户删了」。爬虫盘和站内上传不参与这个检测，它们有自己的生命周期。
+
+#### 视频直链后台任务
+
+上传页的「视频直链」只对管理员开放。创建接口立即返回 `202`，页面通过 `GET /api/upload/remote?limit=20` 展示最近任务；排队或执行中的任务可调用 `POST /api/upload/remote/{jobId}/cancel` 取消。任务保存在 `remote_upload_jobs`，严格由一个 FIFO worker 串行下载，页面刷新或关闭不影响。服务重启会删除中断任务的临时文件并从头下载；普通网络错误不自动重试，重新提交链接即可。完成、失败和取消记录保留 7 天，进入任一终态时原始 URL 会立即从数据库清空，API 和日志始终只使用不含查询参数的主机与路径标签。
+
+直链下载的边界刻意较窄：
+
+- 只接受公网 `http` / `https` 文件 URL，不接受 userinfo、HLS/m3u8、内网/NAS、网页解析或网盘分享页。
+- 不提供 Cookie、Referer 或自定义请求头，因此依赖这些鉴权信息的链接不支持；URL 自身带的签名查询参数可以使用，但不会出现在任务响应、错误或日志里。
+- 独立 HTTP transport 不读取环境代理。提交、DNS 解析、实际拨号和每次重定向都会拒绝回环、私网、链路本地、组播、未指定、CGNAT和云元数据地址；最多跟随 5 次重定向。
+- 连接、TLS 和响应头阶段各有 30 秒超时。下载没有业务大小或总时长上限，但正文连续无数据达到 `remote_upload.idle_timeout_seconds`（默认 120 秒）会失败。
+- 已知 `Content-Length` 时会先检查空间，写入每个数据块前也会继续检查，始终保留 `remote_upload.disk_reserve_bytes`（默认 1 GiB）。临时 `.part` 与最终视频在同一 `data/uploads/` 文件系统中。
+- 下载结束后必须由 `ffprobe` 确认存在视频流，并只接受 AVI、MKV、MOV、MP4 或 WebM。标题优先级为显式标题、`Content-Disposition` 文件名、最终 URL 文件名、原始 URL 文件名，沿用本地上传的文件名安全与同名冲突规则。
+- 最终文件、视频记录、人工标签和任务完成状态按可恢复流程提交；失败会清理文件和数据库记录。成功后仍调用 `OnVideoUploaded`，继续生成封面、预览和指纹。
 
 ### 3. 播放链路
 
@@ -290,7 +307,7 @@ sequenceDiagram
 
 ### 5. 夜间流水线
 
-每天 `cron_hour` 跑一次，后台「扫描所有网盘」按钮触发同一条流水线。五个阶段**串行**；Phase 1 和 Phase 2 结束时都会等待封面、预览和指纹三个生成队列排空：
+每天按 `config.yaml` 的 `nightly.start_time`（`HH:mm`）跑一次；管理后台的可视化和源码模式都直接修改这份 YAML，修改该字段会立即热更新，不需要重启。旧版 `nightly.cron_hour` 会在启动时一次性迁移。定时流水线的五个阶段**串行**；Phase 1 和 Phase 2 结束时都会等待封面、预览和指纹三个生成队列排空：
 
 ```mermaid
 flowchart LR
@@ -302,15 +319,16 @@ flowchart LR
     P4 --> P5["Phase 5<br/>全库去重维护"]
 ```
 
-流水线返回后（包括阶段仅记录错误、整体仍正常返回的情况），会把本次启动日期写入 `settings` 表的 `nightly.last_run_date`；同一天不再自动触发，管理员仍可手动重跑。如果进程在流水线返回前崩溃，日期尚未写入，重启后仍处于 `cron_hour` 时可能再次执行。流水线没有固定时长上限 —— 网盘冷却可能让某个阶段跑很久。标签匹配**不在**流水线里全库重算，它是事件驱动的：新视频入库和管理员改标签规则时即时刷新。
+定时流水线返回后（包括阶段仅记录错误、整体仍正常返回的情况），会把本次启动日期写入 `settings` 表的 `nightly.last_run_date`；同一天不再自动触发。如果进程在流水线返回前崩溃，日期尚未写入，重启后仍处于配置的触发分钟时可能再次执行。流水线没有固定时长上限 —— 网盘冷却可能让某个阶段跑很久。标签匹配**不在**流水线里全库重算，它是事件驱动的：新视频入库和管理员改标签规则时即时刷新。
+
+后台「扫描所有网盘」使用独立的手动执行模式：只运行 Phase 1（扫描网盘管理中配置的非爬虫云盘，并等待新视频的封面、预览和指纹任务排空）以及 Phase 5（全库视频去重）。它不会启动脚本爬虫、爬虫上传或保留视频恢复，也不会写入 `nightly.last_run_date`；手动扫盘与定时流水线仍共享互斥和停止机制。
 
 ### 6. 去重体系
 
-去重分布在视频生命周期四个时机，外加人工复核兜底——完整的信号定义、阈值、判定流程图见 **[docs/DEDUP.md](docs/DEDUP.md)**。一段话版本：
+去重分布在视频生命周期四个时机——完整的信号定义、阈值、判定流程图见 **[docs/DEDUP.md](docs/DEDUP.md)**。一段话版本：
 
 - **文件级**：`(drive_id, file_id)` 表示同一个源文件；扫描按 `content_hash`（哈希缺失或未命中时以 `file_name + size_bytes` 弱兜底）跳过重复，前台软过滤还会使用 `size_bytes + sampled_sha256`。夜间 Phase 5 的精确硬去重只按 `size_bytes + sampled_sha256` 分组。
-- **内容级**：teaser 选段只由时长决定，时长几乎相等的视频比较对齐帧 SSIM（中位数 ≥0.92 判重，时长精确相等时另有交叉匹配兜底），能抓标题、封面完全对不上的跨源转码副本；爬虫导入时同样启用，重复视频在上传网盘前就被挡下。
-- **人工兜底**：夜间内容通道会把对齐中位数落在 `[0.80, 0.92)` 的疑似对写入 `duplicate_review_pairs`，由后台「重复复核」页并排裁决。
+- **内容级**：teaser 选段只由时长决定，时长几乎相等的视频比较对齐帧 SSIM（中位数 ≥0.80 判重，时长精确相等时另有交叉匹配兜底），能抓标题、封面完全对不上的跨源转码副本；爬虫导入时同样启用，重复视频在上传网盘前就被挡下。
 - **删除语义**：一律打 `reason=duplicate` 墓碑 + 指向保留项，清理本地 teaser、普通封面、Shorts 背景封面和帧签名，**不删网盘源文件**；墓碑阻止重新入库，可在黑名单恢复。
 
 ### 7. 鉴权与分享
@@ -326,5 +344,5 @@ flowchart LR
 ### 8. 日志与排查
 
 - 一键脚本部署（systemd）：`journalctl -u video-site-backend` / `-u video-site-frontend`；`start.sh` 模式日志在 `$LOG_DIR`（默认 `/tmp/video-site-91/`）。
-- 后端日志按模块带前缀，直接 grep：`[scanner]`、`[scriptcrawler]`、`[nightly]`、`[dedupe-maintenance]`、`[duplicate-review]`、`[local-upload-maintenance]` 等。爬虫 Python 子进程的输出并入后端日志。
-- 常见排查入口：网盘异常看后台网盘页的健康状态与 `lastError`；预览/封面卡住多半是上游限流，等冷却期过或看 `[nightly]` 是否在等队列排空；去重删了什么搜 `duplicate deleted`，拿不准的对搜 `near-miss`。
+- 后端日志按模块带前缀，直接 grep：`[scanner]`、`[scriptcrawler]`、`[nightly]`、`[dedupe-maintenance]`、`[local-upload-maintenance]` 等。爬虫 Python 子进程的输出并入后端日志。
+- 常见排查入口：网盘异常看后台网盘页的健康状态与 `lastError`；预览/封面卡住多半是上游限流，等冷却期过或看 `[nightly]` 是否在等队列排空；去重删了什么搜 `duplicate deleted`，内容匹配过程搜 `content duplicate matched`。

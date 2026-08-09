@@ -18,6 +18,31 @@ import (
 	"github.com/video-site/backend/internal/streamhttp"
 )
 
+func TestReplaceFilePreservesHardLinkedBackupSnapshot(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "thumbnail.jpg")
+	snapshot := filepath.Join(root, "snapshot-thumbnail.jpg")
+	replacement := filepath.Join(root, "replacement.jpg")
+	if err := os.WriteFile(target, []byte("old-thumbnail"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, snapshot); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if err := os.WriteFile(replacement, []byte("new-thumbnail"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceFile(replacement, target); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(target); err != nil || string(body) != "new-thumbnail" {
+		t.Fatalf("replacement body = %q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(snapshot); err != nil || string(body) != "old-thumbnail" {
+		t.Fatalf("hard-linked snapshot body = %q err=%v", body, err)
+	}
+}
+
 func TestNewDefaultsToThreeSecondTeaserSegments(t *testing.T) {
 	gen := New(Config{})
 	if gen.cfg.DurationSeconds != 3 {
@@ -269,8 +294,8 @@ func TestFFmpegHTTPInputOptionsUsesDedicatedUserAgent(t *testing.T) {
 	if strings.Contains(joined, "User-Agent:") {
 		t.Fatalf("args = %#v, user agent should not be duplicated in raw headers", args)
 	}
-	if !strings.Contains(joined, "Cookie: UID=redacted") {
-		t.Fatalf("args = %#v, want cookie preserved in raw headers", args)
+	if strings.Contains(joined, "UID=redacted") || strings.Contains(joined, "Cookie:") {
+		t.Fatalf("args = %#v, secret cookie must never be passed to ffmpeg", args)
 	}
 }
 
@@ -286,6 +311,11 @@ func TestShouldProxy115FFmpegLinks(t *testing.T) {
 	}
 	if shouldProxyFFmpegLink(&drives.StreamLink{URL: "https://download.example/file.mp4"}) {
 		t.Fatal("generic link should not use local ffmpeg proxy")
+	}
+	if !shouldProxyFFmpegLink(&drives.StreamLink{
+		URL: "https://download.example/protected.mp4", Headers: http.Header{"Cookie": {"secret=1"}},
+	}) {
+		t.Fatal("credential-bearing link should use local ffmpeg proxy")
 	}
 }
 

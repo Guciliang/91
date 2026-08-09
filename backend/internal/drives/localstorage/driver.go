@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -239,14 +238,6 @@ func (d *Driver) localSTRMLink(strmPath, target string) (*drives.StreamLink, err
 		URL:     realPath,
 		Expires: time.Now().Add(24 * time.Hour),
 	}, nil
-}
-
-func (d *Driver) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
-	return "", drives.ErrNotSupported
-}
-
-func (d *Driver) EnsureDir(context.Context, string) (string, error) {
-	return "", drives.ErrNotSupported
 }
 
 func (d *Driver) Remove(ctx context.Context, fileID string) error {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import { AppShell } from "@/components/AppShell";
 import { PromoStrip } from "@/components/PromoStrip";
 import { SearchPanel } from "@/components/SearchPanel";
@@ -149,7 +149,11 @@ function ListingContent({
     <AppShell>
       <div className="container page-section listing-discovery-section">
         <PromoStrip />
-        <SearchPanel />
+        <SearchPanel
+          variant="uiverse"
+          placeholder=""
+          className="search-panel--public search-panel--transparent"
+        />
         <TagCloud />
       </div>
 

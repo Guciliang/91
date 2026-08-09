@@ -1,13 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import {
   ArrowLeft,
+  Ban,
   ChevronRight,
   FolderTree,
   HardDrive,
+  Loader2,
+  Plus,
   RefreshCw,
+  Search,
 } from "lucide-react";
 import * as api from "./api";
+import { AdminPageActions } from "./AdminPageActions";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
 import { ConfirmModal } from "./ConfirmModal";
@@ -18,27 +23,33 @@ import {
   driveKindAbbr,
   driveKindIconPath,
   emptyForm,
-  idleNightlyStatus,
-  nightlyButtonText,
-  nightlyBusyText,
+  idleMaintenanceStatus,
+  scanAllButtonText,
+  maintenanceBusyText,
   usesRootDirectoryID,
   defaultRootId,
   credentialFields,
   rootDirectoryLabel,
 } from "./drive/constants";
 import {
-  StorageSummary,
   StatusTag,
   DriveCardMetrics,
   DriveGenerationPanel,
 } from "./drive/DriveComponents";
+import { StorageSummary } from "./drive/StorageSummary";
+import { DriveDetailLoading, DriveListSkeleton } from "./DrivesPageLoading";
 import { DriveForm } from "./drive/DriveForm";
 import { DeleteDriveModal } from "./drive/DeleteDriveModal";
 import { SkipDirsPanel } from "./drive/SkipDirsPanel";
 import { AdminEmptyVisual } from "./AdminEmptyVisual";
+import { useAdminFloatingActionSpace } from "./useAdminFloatingActionSpace";
+import {
+  useAdminRouteActive,
+  useAdminRouteRevalidation,
+} from "./AdminRouteCache";
 
 const DRIVE_BUSY_MESSAGE = "当前存储有正在进行的任务，请稍后重试";
-const NIGHTLY_BUSY_MESSAGE = "当前有全量扫描任务正在进行，请稍后重试";
+const MAINTENANCE_BUSY_MESSAGE = "当前有全量扫描任务正在进行，请稍后重试";
 
 function isDriveBusy(d: api.AdminDrive) {
   return [
@@ -54,10 +65,12 @@ function isDriveBusy(d: api.AdminDrive) {
 }
 
 export function DrivesPage() {
+  const floatingActionPageRef = useAdminFloatingActionSpace<HTMLElement>();
+  const routeActive = useAdminRouteActive();
   const [list, setList] = useState<api.AdminDrive[]>([]);
   const [storage, setStorage] = useState<api.AdminDriveStorage | null>(null);
-  const [nightlyStatus, setNightlyStatus] =
-    useState<api.NightlyJobStatus>(idleNightlyStatus);
+  const [maintenanceStatus, setMaintenanceStatus] =
+    useState<api.MaintenanceJobStatus>(idleMaintenanceStatus);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [modalOpen, setModalOpen] = useState(false);
@@ -76,7 +89,7 @@ export function DrivesPage() {
   const [togglingTranscodeId, setTogglingTranscodeId] = useState("");
   const [scanningAll, setScanningAll] = useState(false);
   const [stoppingAll, setStoppingAll] = useState(false);
-  const [trackingNightly, setTrackingNightly] = useState(false);
+  const [trackingScanAll, setTrackingScanAll] = useState(false);
   const [scanningDriveIds, setScanningDriveIds] = useState<Record<string, boolean>>({});
   const scanningDriveIdsRef = useRef(new Set<string>());
   const [stoppingDriveId, setStoppingDriveId] = useState("");
@@ -84,7 +97,8 @@ export function DrivesPage() {
   const selectedDriveId = searchParams.get("drive") || null;
   const { show } = useToast();
   const pollConnectionLost = useRef(false);
-  const nightlyBusy = scanningAll || nightlyStatus.running || nightlyStatus.queued;
+  const driveListRequestVersion = useRef(0);
+  const maintenanceBusy = scanningAll || maintenanceStatus.running || maintenanceStatus.queued;
   const formDirty = form.id
     ? !sameForm(form, initialForm)
     : hasCreateFormChanges(form);
@@ -106,39 +120,47 @@ export function DrivesPage() {
   }
 
   async function refresh() {
+    const requestVersion = ++driveListRequestVersion.current;
     setLoading(true);
     setLoadError("");
     try {
       const [data, storageData, jobStatus] = await Promise.all([
         api.listDrives(),
         api.getDriveStorage(),
-        api.getNightlyJobStatus().catch(() => null),
+        api.getScanAllJobStatus().catch(() => null),
       ]);
-      setList(data ?? []);
+      if (requestVersion === driveListRequestVersion.current) {
+        setList(data ?? []);
+      }
       setStorage(storageData);
-      if (jobStatus) setNightlyStatus(jobStatus);
+      if (jobStatus) setMaintenanceStatus(jobStatus);
     } catch (e) {
-      const message = e instanceof Error ? e.message : "加载失败";
-      setLoadError(message);
-      show(message, "error");
+      if (requestVersion === driveListRequestVersion.current) {
+        const message = e instanceof Error ? e.message : "加载失败";
+        setLoadError(message);
+        show(message, "error");
+      }
     } finally {
       setLoading(false);
     }
   }
 
   async function refreshDriveList() {
+    const requestVersion = ++driveListRequestVersion.current;
     try {
       const [data, jobStatus] = await Promise.all([
         api.listDrives(),
-        api.getNightlyJobStatus().catch(() => null),
+        api.getScanAllJobStatus().catch(() => null),
       ]);
+      if (requestVersion !== driveListRequestVersion.current) return;
       setList(data ?? []);
-      if (jobStatus) setNightlyStatus(jobStatus);
+      if (jobStatus) setMaintenanceStatus(jobStatus);
       if (pollConnectionLost.current) {
         pollConnectionLost.current = false;
         show("连接已恢复，网盘数据已更新", "success");
       }
     } catch {
+      if (requestVersion !== driveListRequestVersion.current) return;
       if (!pollConnectionLost.current) {
         pollConnectionLost.current = true;
         show("连接中断，网盘数据可能不是最新", "error");
@@ -150,30 +172,35 @@ export function DrivesPage() {
     refresh();
   }, []);
 
+  useAdminRouteRevalidation(() => {
+    void refreshDriveList();
+  });
+
   useEffect(() => {
+    if (!routeActive) return;
     const timer = window.setInterval(() => {
       if (!document.hidden && !modalOpen) {
         refreshDriveList();
       }
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [modalOpen]);
+  }, [modalOpen, routeActive]);
 
   useEffect(() => {
-    if (!trackingNightly) return;
+    if (!routeActive || !trackingScanAll) return;
     const timer = window.setInterval(async () => {
       try {
-        const status = await api.getNightlyJobStatus();
-        setNightlyStatus(status);
+        const status = await api.getScanAllJobStatus();
+        setMaintenanceStatus(status);
         if (status.running || (!status.queued && !status.running)) {
-          setTrackingNightly(false);
+          setTrackingScanAll(false);
         }
       } catch {
         // The normal drive polling already reports connection loss.
       }
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [trackingNightly]);
+  }, [routeActive, trackingScanAll]);
 
   function openCreate() {
     const nextForm = { ...emptyForm };
@@ -313,8 +340,8 @@ export function DrivesPage() {
   }
 
   async function handleRescan(d: api.AdminDrive) {
-    if (nightlyBusy) {
-      show(nightlyBusyText(nightlyStatus) || NIGHTLY_BUSY_MESSAGE, "info");
+    if (maintenanceBusy) {
+      show(maintenanceBusyText(maintenanceStatus) || MAINTENANCE_BUSY_MESSAGE, "info");
       return;
     }
     if (isDriveBusy(d) || scanningDriveIdsRef.current.has(d.id)) {
@@ -327,7 +354,7 @@ export function DrivesPage() {
       const resp = await api.rescan(d.id);
       if (!resp.accepted) {
         if (resp.status) {
-          setNightlyStatus(resp.status);
+          setMaintenanceStatus(resp.status);
         }
         show(resp.message || DRIVE_BUSY_MESSAGE, "info");
         refreshDriveList();
@@ -347,20 +374,20 @@ export function DrivesPage() {
     }
   }
 
-  async function handleRunNightly() {
-    if (nightlyBusy) {
-      show(nightlyBusyText(nightlyStatus) || NIGHTLY_BUSY_MESSAGE, "info");
+  async function handleScanAll() {
+    if (maintenanceBusy) {
+      show(maintenanceBusyText(maintenanceStatus) || MAINTENANCE_BUSY_MESSAGE, "info");
       return;
     }
     setScanningAll(true);
     try {
-      const resp = await api.runNightlyJob();
-      setNightlyStatus(resp.status);
+      const resp = await api.runScanAllJob();
+      setMaintenanceStatus(resp.status);
       if (resp.accepted) {
-        setTrackingNightly(!resp.status.running);
-        show("已触发扫描所有网盘，耗时较长，可在任务状态和 backend 日志观察进度", "success");
+        setTrackingScanAll(!resp.status.running);
+        show("已触发全部网盘扫描，完成新视频处理后将执行视频去重", "success");
       } else {
-        show(resp.message || NIGHTLY_BUSY_MESSAGE, "info");
+        show(resp.message || MAINTENANCE_BUSY_MESSAGE, "info");
       }
     } catch (e) {
       show(e instanceof Error ? e.message : "触发失败", "error");
@@ -374,8 +401,8 @@ export function DrivesPage() {
     setStoppingAll(true);
     try {
       const resp = await api.stopAllTasks();
-      setNightlyStatus(resp.status);
-      setTrackingNightly(false);
+      setMaintenanceStatus(resp.status);
+      setTrackingScanAll(false);
       show(
         resp.stoppedDrives > 0
           ? `已停止 ${resp.stoppedDrives} 个网盘的当前任务`
@@ -522,10 +549,18 @@ export function DrivesPage() {
   }, [selectedDriveId, list]);
 
   if (selectedDriveId && !selectedDrive) {
-    const title = loading || loadError ? "网盘详情" : "网盘不存在";
+    if (loading) {
+      return (
+        <DriveDetailLoading
+          onBack={() => closeDriveDetail({ replace: true })}
+        />
+      );
+    }
+
+    const title = loadError ? "网盘详情" : "网盘不存在";
 
     return (
-      <section className="admin-drives-page">
+      <section className="admin-page admin-drives-page">
         <header className="admin-drive-detail__header-bar">
           <button
             type="button"
@@ -540,12 +575,7 @@ export function DrivesPage() {
           </div>
         </header>
 
-        {loading ? (
-          <div className="admin-loading-state admin-page-loading" role="status" aria-live="polite">
-            <RefreshCw size={20} className="admin-spin" />
-            <span>加载中...</span>
-          </div>
-        ) : loadError ? (
+        {loadError ? (
           <div className="admin-error-state">
             <strong>网盘数据加载失败</strong>
             <span>{loadError}</span>
@@ -568,7 +598,7 @@ export function DrivesPage() {
     const driveStorage = storage?.drives[d.id];
 
     return (
-      <section className="admin-drives-page">
+      <section className="admin-page admin-drives-page">
         <header className="admin-drive-detail__header-bar">
           <button
             type="button"
@@ -615,10 +645,10 @@ export function DrivesPage() {
                     type="button"
                     className="admin-btn"
                     onClick={() => handleRescan(d)}
-                    aria-disabled={nightlyBusy || isDriveBusy(d) || !!scanningDriveIds[d.id]}
+                    aria-disabled={maintenanceBusy || isDriveBusy(d) || !!scanningDriveIds[d.id]}
                     title={
-                      nightlyBusy
-                        ? nightlyBusyText(nightlyStatus) || NIGHTLY_BUSY_MESSAGE
+                      maintenanceBusy
+                        ? maintenanceBusyText(maintenanceStatus) || MAINTENANCE_BUSY_MESSAGE
                         : isDriveBusy(d) || scanningDriveIds[d.id]
                         ? DRIVE_BUSY_MESSAGE
                         : undefined
@@ -642,7 +672,14 @@ export function DrivesPage() {
                   onClick={() => openEdit(d)}
                   disabled={!!editingCredentialsId}
                 >
-                  {editingCredentialsId === d.id ? "加载中..." : "编辑凭证"}
+                  {editingCredentialsId === d.id ? (
+                    <>
+                      <Loader2 size={14} className="admin-spin" />
+                      加载中
+                    </>
+                  ) : (
+                    "编辑凭证"
+                  )}
                 </button>
                 <button type="button" className="admin-btn admin-detail-actions__danger" onClick={() => setDeleteTarget(d)}>
                   删除网盘
@@ -651,14 +688,17 @@ export function DrivesPage() {
             </div>
 
             <SkipDirsPanel
+              key={d.id}
               drive={d}
               onSaved={(saved) => {
+                // Invalidate list requests that began before this write. Their
+                // old snapshot must not overwrite the just-confirmed value.
+                driveListRequestVersion.current += 1;
                 setList((prev) =>
                   prev.map((item) =>
                     item.id === saved.id ? { ...item, skipDirIds: saved.skipDirIds } : item
                   )
                 );
-                refreshDriveList();
               }}
             />
           </div>
@@ -758,42 +798,43 @@ export function DrivesPage() {
 
   // --- List view ---
   return (
-    <section className="admin-drives-page admin-drives-page--list">
-      <header className="admin-page__header">
+    <section
+      ref={floatingActionPageRef}
+      className="admin-page admin-page--with-floating-actions admin-drives-page admin-drives-page--list"
+    >
+      <AdminPageActions>
         <div className="admin-page__actions admin-drive-list-actions">
           <div className="admin-task-controls" aria-label="所有网盘任务控制">
             <button
               type="button"
               className="admin-btn"
-              onClick={handleRunNightly}
+              onClick={handleScanAll}
               disabled={scanningAll}
-              title={nightlyBusyText(nightlyStatus) || "立即扫描所有网盘。耗时较长，期间不要重复触发。"}
+              title={maintenanceBusyText(maintenanceStatus) || "扫描已配置的存储、处理新视频并执行视频去重"}
             >
-              {nightlyButtonText(nightlyStatus, scanningAll)}
+              <Search size="1em" aria-hidden="true" />
+              {scanAllButtonText(maintenanceStatus, scanningAll)}
             </button>
             <button
               type="button"
               className="admin-btn"
               onClick={handleStopAllTasks}
               disabled={stoppingAll}
-              title="停止所有网盘当前的扫描、封面、预览视频和视频指纹生成任务。"
+              title="停止所有存储当前的扫描、封面、预览视频和视频指纹生成任务"
             >
+              <Ban size="1em" aria-hidden="true" />
               {stoppingAll ? "停止中..." : "停止所有任务"}
             </button>
           </div>
-          <button type="button" className="admin-btn" onClick={openCreate}>
-            添加网盘
-          </button>
         </div>
-      </header>
+      </AdminPageActions>
 
-      {storage && <StorageSummary storage={storage} />}
+      {(storage || loading) && (
+        <StorageSummary storage={storage} loading={!storage} />
+      )}
 
       {loading ? (
-        <div className="admin-loading-state admin-page-loading" role="status" aria-live="polite">
-          <RefreshCw size={20} className="admin-spin" />
-          <span>加载中...</span>
-        </div>
+        <DriveListSkeleton />
       ) : loadError ? (
         <div className="admin-error-state">
           <strong>网盘数据加载失败</strong>
@@ -855,6 +896,16 @@ export function DrivesPage() {
           className="admin-drive-empty-state"
         />
       )}
+
+      <button
+        data-admin-floating-actions
+        type="button"
+        className="admin-btn admin-create-fab"
+        onClick={openCreate}
+      >
+        <Plus size="1em" aria-hidden="true" />
+        添加网盘
+      </button>
 
       <Modal
         open={modalOpen}

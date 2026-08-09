@@ -388,41 +388,135 @@ func TestUserLoginOnlyFallsBackToConfigWhenUsersTableIsEmpty(t *testing.T) {
 	}
 }
 
-func TestClientIPUsesForwardedHeadersFromTrustedProxy(t *testing.T) {
-	req := loginRequest("127.0.0.1")
-	req.Header.Set("X-Forwarded-For", "203.0.113.12")
+func TestCheckCurrentPasswordUsesDatabaseAdminSession(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	hash, err := HashPassword("database-secret")
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	if _, err := cat.CreateUser(ctx, "database-admin", hash, "admin"); err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
 
-	if got := clientIP(req); got != "203.0.113.12" {
-		t.Fatalf("client IP = %q, want trusted forwarded origin", got)
+	authr := &Authenticator{
+		Username: "legacy-admin",
+		Password: "different-config-secret",
+		Catalog:  cat,
+	}
+	loginResponse := httptest.NewRecorder()
+	role, err := authr.UserLogin(
+		loginResponse,
+		loginRequest("203.0.113.33"),
+		"database-admin",
+		"database-secret",
+	)
+	if err != nil || role != "admin" {
+		t.Fatalf("login role=%q err=%v", role, err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/backups/example/restore", nil)
+	request.AddCookie(responseCookie(t, loginResponse, sessionCookie))
+
+	ok, err := authr.CheckCurrentPassword(request, "database-secret")
+	if err != nil || !ok {
+		t.Fatalf("database password check ok=%v err=%v", ok, err)
+	}
+	ok, err = authr.CheckCurrentPassword(request, "different-config-secret")
+	if err != nil {
+		t.Fatalf("wrong password check: %v", err)
+	}
+	if ok {
+		t.Fatal("database admin was incorrectly verified with the config password")
 	}
 }
 
-func TestClientIPNormalizesMappedIPv4FromTrustedProxy(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/login", strings.NewReader(`{}`))
-	req.RemoteAddr = "[::ffff:127.0.0.1]:12345"
-	req.Header.Set("X-Forwarded-For", "::ffff:203.0.113.12")
+func TestCheckCurrentPasswordSupportsLegacyAdminSession(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	authr := &Authenticator{
+		Username: "legacy-admin",
+		Password: "legacy-secret",
+		Catalog:  cat,
+	}
+	loginResponse := httptest.NewRecorder()
+	ok, err := authr.Login(
+		loginResponse,
+		loginRequest("203.0.113.34"),
+		"legacy-admin",
+		"legacy-secret",
+	)
+	if err != nil || !ok {
+		t.Fatalf("login ok=%v err=%v", ok, err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/admin/api/backups/example/restore", nil)
+	request.AddCookie(responseCookie(t, loginResponse, sessionCookie))
 
-	if got := clientIP(req); got != "203.0.113.12" {
-		t.Fatalf("client IP = %q, want normalized forwarded IPv4", got)
+	ok, err = authr.CheckCurrentPassword(request, "legacy-secret")
+	if err != nil || !ok {
+		t.Fatalf("legacy password check ok=%v err=%v", ok, err)
 	}
 }
 
-func TestClientIPUsesRightmostForwardedHeaderFromTrustedProxy(t *testing.T) {
-	req := loginRequest("127.0.0.1")
-	req.Header.Set("X-Forwarded-For", "198.51.100.99, 203.0.113.12")
-
-	if got := clientIP(req); got != "203.0.113.12" {
-		t.Fatalf("client IP = %q, want rightmost forwarded IP", got)
+func TestLoginUsesForwardedClientIPFromTrustedProxy(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
 	}
-}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+	authr := &Authenticator{
+		Username: "admin",
+		Password: "secret",
+		Catalog:  cat,
+	}
 
-func TestClientIPIgnoresForwardedHeadersFromUntrustedRemote(t *testing.T) {
-	req := loginRequest("198.51.100.20")
-	req.Header.Set("X-Forwarded-For", "203.0.113.12")
-	req.Header.Set("X-Real-IP", "203.0.113.13")
+	const forwardedIP = "203.0.113.12"
+	for i := 0; i < loginFailThreshold; i++ {
+		request := loginRequest("127.0.0.1")
+		request.Header.Set("X-Forwarded-For", forwardedIP)
+		ok, err := authr.Login(httptest.NewRecorder(), request, "admin", "wrong")
+		if ok {
+			t.Fatalf("failed login %d returned ok", i+1)
+		}
+		if i < loginFailThreshold-1 && err != nil {
+			t.Fatalf("failed login %d returned error: %v", i+1, err)
+		}
+		if i == loginFailThreshold-1 && !errors.Is(err, ErrLoginIPBanned) {
+			t.Fatalf("final failed login error = %v, want ErrLoginIPBanned", err)
+		}
+	}
 
-	if got := clientIP(req); got != "198.51.100.20" {
-		t.Fatalf("client IP = %q, want remote address", got)
+	banned, err := cat.IsLoginIPBanned(context.Background(), forwardedIP)
+	if err != nil {
+		t.Fatalf("query forwarded IP ban: %v", err)
+	}
+	if !banned {
+		t.Fatal("forwarded client IP was not persisted as banned")
+	}
+	loopbackBanned, err := cat.IsLoginIPBanned(context.Background(), "127.0.0.1")
+	if err != nil {
+		t.Fatalf("query loopback ban: %v", err)
+	}
+	if loopbackBanned {
+		t.Fatal("local proxy address was incorrectly persisted as banned")
 	}
 }
 

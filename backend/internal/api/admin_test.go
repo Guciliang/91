@@ -540,26 +540,26 @@ func TestInstalledVersionPrefersDockerImageVersionOverVersionFile(t *testing.T) 
 	}
 }
 
-func TestHandleRunNightlyJobReturnsAcceptedStatus(t *testing.T) {
+func TestHandleRunScanAllJobReturnsAcceptedStatus(t *testing.T) {
 	called := false
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/jobs/nightly/run", nil)
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/jobs/scan-all/run", nil)
 	rr := httptest.NewRecorder()
 
 	(&AdminServer{
-		OnRunNightlyJob: func() bool {
+		OnRunScanAllJob: func() bool {
 			called = true
 			return true
 		},
 		GetNightlyJobStatus: func() NightlyJobStatus {
 			return NightlyJobStatus{State: "queued", Queued: true}
 		},
-	}).handleRunNightlyJob(rr, req)
+	}).handleRunScanAllJob(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
 	}
 	if !called {
-		t.Fatal("OnRunNightlyJob was not called")
+		t.Fatal("OnRunScanAllJob was not called")
 	}
 	var got struct {
 		OK       bool             `json:"ok"`
@@ -574,18 +574,18 @@ func TestHandleRunNightlyJobReturnsAcceptedStatus(t *testing.T) {
 	}
 }
 
-func TestHandleRunNightlyJobReturnsBusyMessageWhenRejected(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/jobs/nightly/run", nil)
+func TestHandleRunScanAllJobReturnsBusyMessageWhenRejected(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/jobs/scan-all/run", nil)
 	rr := httptest.NewRecorder()
 
 	(&AdminServer{
-		OnRunNightlyJob: func() bool {
+		OnRunScanAllJob: func() bool {
 			return false
 		},
 		GetNightlyJobStatus: func() NightlyJobStatus {
 			return NightlyJobStatus{State: "running", Running: true}
 		},
-	}).handleRunNightlyJob(rr, req)
+	}).handleRunScanAllJob(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202; body = %s", rr.Code, rr.Body.String())
@@ -676,11 +676,11 @@ func TestHandleRescanReturnsAcceptedFlagAndBusyMessage(t *testing.T) {
 	}
 }
 
-func TestHandleNightlyJobStatusDefaultsToIdle(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/admin/api/jobs/nightly/status", nil)
+func TestHandleScanAllJobStatusDefaultsToIdle(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/jobs/scan-all/status", nil)
 	rr := httptest.NewRecorder()
 
-	(&AdminServer{}).handleNightlyJobStatus(rr, req)
+	(&AdminServer{}).handleScanAllJobStatus(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
@@ -1641,6 +1641,7 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 		t.Fatalf("write crawler script: %v", err)
 	}
 	for _, d := range []*catalog.Drive{
+		{ID: "quark-target", Kind: "quark", Name: "夸克", RootID: "0", Credentials: map[string]string{"cookie": "x"}},
 		{ID: "p115-target", Kind: "p115", Name: "115", RootID: "0", Credentials: map[string]string{"cookie": "x"}},
 		{ID: "wopan-target", Kind: "wopan", Name: "沃盘", RootID: "0", Credentials: map[string]string{"access_token": "a", "refresh_token": "r"}},
 		{ID: "guangyapan-target", Kind: "guangyapan", Name: "光鸭", RootID: "", Credentials: map[string]string{"access_token": "a", "refresh_token": "r"}},
@@ -1725,6 +1726,24 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_drive_id"] != "guangyapan-target" {
 		t.Fatalf("upload_drive_id = %q, want guangyapan-target", got.Credentials["upload_drive_id"])
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
+		"id": "crawler-upload",
+		"scriptPath": "`+scriptPath+`",
+		"uploadDriveId": "quark-target"
+	}`))
+	rr = httptest.NewRecorder()
+	srv.handleUpsertCrawler(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("quark target status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err = cat.GetDrive(ctx, "crawler-upload")
+	if err != nil {
+		t.Fatalf("get crawler after quark target: %v", err)
+	}
+	if got.Credentials["upload_drive_id"] != "quark-target" {
+		t.Fatalf("upload_drive_id = %q, want quark-target", got.Credentials["upload_drive_id"])
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
@@ -3266,6 +3285,77 @@ func TestHandleAdminListVideosFiltersByDriveID(t *testing.T) {
 	}
 	if got.Items[0].DriveID != "OneDrive" || got.Items[0].ID != "od-video" {
 		t.Fatalf("item = %#v, want OneDrive od-video", got.Items[0])
+	}
+}
+
+func TestHandleAdminListVideosTreatsUploadsAsOneSource(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	for _, video := range []*catalog.Video{
+		{
+			ID:          "uploaded-from-file",
+			DriveID:     "local-upload",
+			FileID:      "from-file.mp4",
+			Title:       "uploaded from file",
+			PublishedAt: now,
+			CreatedAt:   now,
+		},
+		{
+			ID:          "uploaded-from-link",
+			DriveID:     "local-upload",
+			FileID:      "from-link.mp4",
+			Title:       "uploaded from link",
+			PublishedAt: now.Add(-time.Second),
+			CreatedAt:   now.Add(-time.Second),
+		},
+		{
+			ID:          "cloud-video",
+			DriveID:     "cloud",
+			FileID:      "cloud-file",
+			Title:       "cloud video",
+			PublishedAt: now.Add(-2 * time.Second),
+			CreatedAt:   now.Add(-2 * time.Second),
+		},
+	} {
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed %s: %v", video.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/admin/api/videos?driveId=local-upload",
+		nil,
+	)
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleAdminListVideos(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Items []catalog.Video `json:"items"`
+		Total int             `json:"total"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Total != 2 || len(got.Items) != 2 {
+		t.Fatalf("response total/items = %d/%d, want both uploads: %#v", got.Total, len(got.Items), got.Items)
+	}
+	for _, item := range got.Items {
+		if item.DriveID != "local-upload" {
+			t.Fatalf("unexpected non-upload item: %#v", item)
+		}
 	}
 }
 

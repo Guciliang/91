@@ -6,6 +6,10 @@ const tagsPageSource = readFileSync(
   new URL("../src/admin/TagsPage.tsx", import.meta.url),
   "utf8"
 );
+const adminPaginationSource = readFileSync(
+  new URL("../src/admin/AdminPagination.tsx", import.meta.url),
+  "utf8"
+);
 const adminCss = readFileSync(new URL("../src/styles/admin.css", import.meta.url), "utf8");
 
 test("admin tags page limits visible tags by viewport", () => {
@@ -23,43 +27,71 @@ test("admin tags page renders only the current page", () => {
   assert.match(tagsPageSource, /全选本页/);
 });
 
-test("admin tag pagination only shows page count and hides for a single page", () => {
+test("admin tag pagination matches the compact video pagination and hides for a single page", () => {
   assert.match(tagsPageSource, /const showPagination = filteredTags\.length > pageSize;/);
   assert.match(tagsPageSource, /\{showPagination && \(/);
-  assert.match(tagsPageSource, /第 \{currentPage\} \/ \{totalPages\} 页/);
+  assert.match(
+    tagsPageSource,
+    /<AdminPagination\s+page=\{currentPage\}[\s\S]*?totalPages=\{totalPages\}[\s\S]*?total=\{filteredTags\.length\}[\s\S]*?itemLabel="标签"[\s\S]*?onPage=\{setPage\}\s*\/>/
+  );
+  assert.match(adminPaginationSource, /第 \{page\} \/ \{totalPages\} 页 · 共 \{total\} 个\{itemLabel\}/);
+  assert.equal(Array.from(adminPaginationSource.matchAll(/上一页|下一页/g)).length, 2);
+  assert.doesNotMatch(adminPaginationSource, /首页|末页/);
   assert.doesNotMatch(tagsPageSource, /显示 \{pageStart\}-\{pageEnd\}/);
   assert.doesNotMatch(tagsPageSource, /每页 \{pageSize\} 个/);
 });
 
-test("admin tag pagination keeps its position when the page has fewer cards", () => {
-  assert.match(tagsPageSource, /const placeholderTags = showPagination \? Math\.max\(0, pageSize - pagedTags\.length\) : 0;/);
-  assert.match(tagsPageSource, /Array\.from\(\{ length: placeholderTags \}/);
-  assert.match(tagsPageSource, /className="admin-tag-card admin-tag-card--placeholder"/);
+test("admin tag pagination does not create invisible rows on a short final page", () => {
+  assert.doesNotMatch(tagsPageSource, /placeholderTags|admin-tag-card--placeholder/);
+  assert.doesNotMatch(adminCss, /\.admin-tag-card--placeholder/);
+});
+
+test("admin tags loading keeps the fixed controls and leaves the card area blank", () => {
+  assert.doesNotMatch(tagsPageSource, /AdminLoading|lds-ellipsis|admin-card-skeleton-surface/);
   assert.match(
-    adminCss,
-    /\.admin-tag-card--placeholder\s*\{[^}]*visibility\s*:\s*hidden;[^}]*pointer-events\s*:\s*none/s
+    tagsPageSource,
+    /<div className="admin-tags-toolbar">[\s\S]*?\{tagsEmpty \? \(/
+  );
+  assert.match(
+    tagsPageSource,
+    /<div className="admin-tags-board" aria-busy=\{loading \|\| undefined\}>\s*<div className="admin-tags-cards">\s*\{loading \? null : loadError \? \(/
   );
 });
 
-test("admin tag search miss uses the shared no-results visual", () => {
+test("admin tag empty states distinguish an empty catalog from no results", () => {
   assert.match(tagsPageSource, /const hasActiveSearch = searchQuery\.trim\(\)\.length > 0;/);
-  assert.match(tagsPageSource, /const searchEmpty = hasActiveSearch && !loading && !loadError && filteredTags\.length === 0;/);
+  assert.match(tagsPageSource, /const tagsEmpty = !loading && !loadError && stats\.total === 0;/);
+  assert.match(tagsPageSource, /const resultsEmpty = !tagsEmpty && !loading && !loadError && filteredTags\.length === 0;/);
+  assert.match(tagsPageSource, /const searchEmpty = hasActiveSearch && resultsEmpty;/);
   assert.match(tagsPageSource, /searchEmpty \? " is-search-empty" : ""/);
   assert.match(
     tagsPageSource,
-    /searchEmpty \? \(\s*<AdminEmptyVisual[\s\S]*?variant="no-results"[\s\S]*?text="未查询到"[\s\S]*?admin-tags-empty-search[\s\S]*?\) : \(\s*<div className="admin-tags-board">/
+    /tagsEmpty \? \(\s*<AdminEmptyVisual[\s\S]*?variant="empty"[\s\S]*?text="当前没有标签"[\s\S]*?admin-tags-empty-state[\s\S]*?\) : resultsEmpty \? \(\s*<AdminEmptyVisual[\s\S]*?variant="no-results"[\s\S]*?text="未查询到"[\s\S]*?admin-tags-empty-state[\s\S]*?\) : \(\s*<div className="admin-tags-board" aria-busy=\{loading \|\| undefined\}>/
+  );
+  assert.doesNotMatch(tagsPageSource, /没有找到匹配的标签。|className="admin-card admin-empty"/);
+  assert.match(
+    tagsPageSource,
+    /className=\{`admin-page admin-page--with-floating-actions admin-tags-page\$\{searchEmpty \? " is-search-empty" : ""\}`\}/
   );
   assert.match(
     adminCss,
-    /\.admin-tags-page\.is-search-empty\s*\{[^}]*display\s*:\s*flex;[^}]*flex-direction\s*:\s*column;[^}]*min-height\s*:\s*calc\(100vh - \(var\(--space-7\) \* 2\)\)/s
+    /\.admin-tags-layout\s*\{[^}]*display\s*:\s*grid;[^}]*flex\s*:\s*1 1 auto;[^}]*align-items\s*:\s*stretch;[^}]*min-height\s*:\s*0/s
   );
   assert.match(
     adminCss,
-    /\.admin-tags-page\.is-search-empty \.admin-tags-layout,\s*\.admin-tags-page\.is-search-empty \.admin-tags-main\s*\{[^}]*display\s*:\s*flex;[^}]*width\s*:\s*100%;[^}]*min-height\s*:\s*0;/s
+    /\.admin-tags-main\s*\{[^}]*display\s*:\s*flex;[^}]*flex-direction\s*:\s*column;[^}]*min-height\s*:\s*0/s
   );
   assert.match(
     adminCss,
-    /\.admin-tags-empty-search\s*\{[^}]*box-sizing\s*:\s*border-box;[^}]*flex\s*:\s*1 1 auto;[^}]*min-height\s*:\s*0;[^}]*padding\s*:\s*0 16px 96px/s
+    /\.admin-tags-empty-state\s*\{[^}]*box-sizing\s*:\s*border-box;[^}]*flex\s*:\s*1 1 auto;[^}]*min-height\s*:\s*0;[^}]*padding\s*:\s*0 16px 96px/s
   );
+  assert.doesNotMatch(adminCss, /\.admin-tags-page\.is-search-empty\s*\{[^}]*100(?:d)?vh/s);
   assert.doesNotMatch(adminCss, /\.admin-tags-page\.is-search-empty \.admin-tags-board[\s\S]*?display\s*:\s*flex/);
+});
+
+test("admin tags hide bulk delete when the catalog is empty", () => {
+  assert.match(
+    tagsPageSource,
+    /\{stats\.total > 0 && \(\s*<button[\s\S]*?admin-tags-toolbar-actions__toggle[\s\S]*?>\s*批量删除\s*<\/button>\s*\)\}/
+  );
 });

@@ -19,7 +19,6 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +26,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/mediaasset"
+	"github.com/video-site/backend/internal/persistence"
 	"golang.org/x/net/proxy"
 )
 
@@ -87,6 +87,8 @@ type Crawler struct {
 	cfg                          CrawlerConfig
 	runTimeoutExplicit           bool
 	candidateIdleTimeoutExplicit bool
+	hlsCapsOnce                  sync.Once
+	hlsCaps                      ffmpegHLSCapabilities
 
 	// protocol is the protocol resolved for the current run. It is refreshed
 	// from the script under runMu, so cfg stays immutable after construction.
@@ -233,7 +235,6 @@ type Event struct {
 	Quality            string            `json:"quality,omitempty"`
 	DurationSeconds    int               `json:"duration_seconds,omitempty"`
 	Description        string            `json:"description,omitempty"`
-	PublishedAt        string            `json:"published_at,omitempty"`
 	Headers            map[string]string `json:"headers,omitempty"`
 	MediaHeaders       map[string]string `json:"media_headers,omitempty"`
 	ThumbnailHeaders   map[string]string `json:"thumbnail_headers,omitempty"`
@@ -256,7 +257,6 @@ type Item struct {
 	Quality            string            `json:"quality,omitempty"`
 	DurationSeconds    int               `json:"duration_seconds,omitempty"`
 	Description        string            `json:"description,omitempty"`
-	PublishedAt        string            `json:"published_at,omitempty"`
 	Headers            map[string]string `json:"headers,omitempty"`
 	MediaHeaders       map[string]string `json:"media_headers,omitempty"`
 	ThumbnailHeaders   map[string]string `json:"thumbnail_headers,omitempty"`
@@ -307,9 +307,6 @@ func (e Event) normalizedItem() Item {
 	}
 	if strings.TrimSpace(item.Description) == "" {
 		item.Description = e.Description
-	}
-	if strings.TrimSpace(item.PublishedAt) == "" {
-		item.PublishedAt = e.PublishedAt
 	}
 	if len(item.Headers) == 0 && len(e.Headers) > 0 {
 		item.Headers = e.Headers
@@ -729,10 +726,6 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		}
 	}
 	crawlerTagLabel = c.crawlerTagName()
-	publishedAt := now
-	if parsed := parsePublishedAt(item.PublishedAt); !parsed.IsZero() {
-		publishedAt = parsed
-	}
 	quality := strings.TrimSpace(item.Quality)
 	if quality == "" {
 		quality = "HD"
@@ -754,7 +747,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		Quality:         quality,
 		Description:     strings.TrimSpace(item.Description),
 		PreviewStatus:   previewStatus,
-		PublishedAt:     publishedAt,
+		PublishedAt:     now,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -791,8 +784,8 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 					log.Printf("[scriptcrawler] drive=%s common thumbs mkdir: %v", c.cfg.Driver.ID(), err)
 				} else {
 					dst := mediaasset.ThumbnailPathInDir(c.cfg.CommonThumbDir, videoID)
-					if err := copyFileAtomic(thumbPath, dst); err != nil {
-						log.Printf("[scriptcrawler] drive=%s source_id=%s copy thumbnail: %v", c.cfg.Driver.ID(), sourceID, err)
+					if err := mediaasset.NormalizeThumbnailJPEG(thumbPath, dst); err != nil {
+						log.Printf("[scriptcrawler] drive=%s source_id=%s normalize thumbnail: %v", c.cfg.Driver.ID(), sourceID, err)
 					} else {
 						commonThumbPath = dst
 						thumbReady = true
@@ -804,7 +797,8 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	if thumbReady {
 		v.ThumbnailURL = "/p/thumb/" + v.ID
 	}
-	if duplicate, err := c.findNearDuplicateVideo(ctx, v, commonThumbPath, videoPath); err != nil {
+	duplicate, err := c.findNearDuplicateVideo(ctx, v, commonThumbPath, videoPath)
+	if err != nil {
 		_ = os.Remove(videoPath)
 		if thumbPath != "" {
 			_ = os.Remove(thumbPath)
@@ -813,7 +807,12 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 			_ = os.Remove(commonThumbPath)
 		}
 		return false, fmt.Errorf("near duplicate lookup: %w", err)
-	} else if duplicate != nil && duplicate.video != nil {
+	}
+	// Media and thumbnail downloads above are written through .part files.
+	// Coordinate only the final file/catalog cleanup and publication.
+	persistence.RLock()
+	defer persistence.RUnlock()
+	if duplicate != nil && duplicate.video != nil {
 		if v.Size > duplicate.video.Size {
 			if err := c.cfg.Catalog.DeleteVideoWithTombstoneOptions(ctx, duplicate.video.ID, catalog.DeleteVideoTombstoneOptions{
 				Reason:           catalog.DeletedVideoReasonDuplicate,
@@ -959,12 +958,12 @@ func (c *Crawler) RestoreRequestedVideos(ctx context.Context) (int, error) {
 		video.TranscodeError = ""
 		video.TranscodedFileID = ""
 		video.TranscodedSize = 0
-		if video.PublishedAt.IsZero() {
-			video.PublishedAt = file.modTime
-		}
 		if video.CreatedAt.IsZero() {
 			video.CreatedAt = file.modTime
 		}
+		// Crawler timestamps are backend-owned. Restoring an older crawler
+		// tombstone must not reintroduce a source-supplied publication date.
+		video.PublishedAt = video.CreatedAt
 		if c.restoreCrawlerThumbnail(video, fileID) {
 			video.ThumbnailURL = "/p/thumb/" + video.ID
 		}
@@ -1007,7 +1006,7 @@ func (c *Crawler) restoreCrawlerThumbnail(video *catalog.Video, fileID string) b
 		if err := os.MkdirAll(c.cfg.CommonThumbDir, 0o755); err != nil {
 			return false
 		}
-		if err := copyFileAtomic(source, mediaasset.ThumbnailPathInDir(c.cfg.CommonThumbDir, video.ID)); err != nil {
+		if err := mediaasset.NormalizeThumbnailJPEG(source, mediaasset.ThumbnailPathInDir(c.cfg.CommonThumbDir, video.ID)); err != nil {
 			log.Printf("[scriptcrawler] drive=%s restore thumbnail video=%s: %v", c.cfg.Driver.ID(), video.ID, err)
 			return false
 		}
@@ -1178,11 +1177,8 @@ func (c *Crawler) downloadHLSAtomic(ctx context.Context, ref MediaRef, dst, refe
 	if h := ffmpegHeaderBlock(headers); h != "" {
 		args = append(args, "-headers", h)
 	}
+	args = append(args, c.ffmpegHLSInputOptions(ctx)...)
 	args = append(args,
-		"-protocol_whitelist", "http,https,tcp,tls,crypto",
-		"-allowed_extensions", "ALL",
-		"-allowed_segment_extensions", "ALL",
-		"-extension_picky", "0",
 		"-i", src,
 		"-c", "copy",
 		"-bsf:a", "aac_adtstoasc",
@@ -1381,7 +1377,6 @@ func normalizeItemForImport(item Item) (Item, string, error) {
 	item.Author = strings.TrimSpace(item.Author)
 	item.Quality = strings.TrimSpace(item.Quality)
 	item.Description = strings.TrimSpace(item.Description)
-	item.PublishedAt = strings.TrimSpace(item.PublishedAt)
 	item.MediaURL = strings.TrimSpace(item.MediaURL)
 	item.MediaLocalFile = strings.TrimSpace(item.MediaLocalFile)
 	item.ThumbnailURL = strings.TrimSpace(item.ThumbnailURL)
@@ -1558,25 +1553,6 @@ func mediaExt(raw string, video bool) string {
 		return ext
 	}
 	return ""
-}
-
-func parsePublishedAt(raw string) time.Time {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return time.Time{}
-	}
-	if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
-		if ms > 100000000000 {
-			return time.UnixMilli(ms)
-		}
-		return time.Unix(ms, 0)
-	}
-	for _, layout := range []string{time.RFC3339, "2006-01-02", "2006-01-02 15:04:05"} {
-		if t, err := time.Parse(layout, raw); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
 }
 
 func cleanStringList(in []string) []string {

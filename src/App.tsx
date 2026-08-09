@@ -1,7 +1,9 @@
 import { Suspense, lazy, useEffect, type ReactNode } from "react";
-import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router";
 import { SkyStarfield } from "@/components/SkyStarfield";
 import { AdminLayout } from "@/admin/AdminLayout";
+import { CrawlersPageLoading } from "@/admin/CrawlersPageLoading";
+import { DrivesPageLoading } from "@/admin/DrivesPageLoading";
 import { RequireAuth } from "@/admin/RequireAuth";
 import { RequireAdmin } from "@/admin/RequireAdmin";
 import { rememberVideoReturnPath, routeToPath } from "@/lib/videoReturnPath";
@@ -30,20 +32,29 @@ const VideosPage = lazy(() =>
 const TagsPage = lazy(() =>
   import("@/admin/TagsPage").then((module) => ({ default: module.TagsPage }))
 );
-const DuplicateReviewsPage = lazy(() =>
-  import("@/admin/DuplicateReviewsPage").then((module) => ({
-    default: module.DuplicateReviewsPage,
+const SettingsPage = lazy(() =>
+  import("@/admin/SettingsPage").then((module) => ({
+    default: module.SettingsPage,
   }))
 );
-const ThemePage = lazy(() =>
-  import("@/admin/ThemePage").then((module) => ({ default: module.ThemePage }))
+const BackupPage = lazy(() =>
+  import("@/admin/BackupPage").then((module) => ({ default: module.BackupPage }))
 );
 const UsersPage = lazy(() =>
   import("@/admin/UsersPage").then((module) => ({ default: module.UsersPage }))
 );
+const LogsPage = lazy(() =>
+  import("@/admin/LogsPage").then((module) => ({ default: module.LogsPage }))
+);
 
-function PageSuspense({ children }: { children: ReactNode }) {
-  return <Suspense fallback={null}>{children}</Suspense>;
+function PageSuspense({
+  children,
+  fallback = null,
+}: {
+  children: ReactNode;
+  fallback?: ReactNode;
+}) {
+  return <Suspense fallback={fallback}>{children}</Suspense>;
 }
 
 function VideoReturnPathRecorder() {
@@ -151,7 +162,7 @@ export default function App() {
           <Route
             path="drives"
             element={
-              <PageSuspense>
+              <PageSuspense fallback={<DrivesPageLoading />}>
                 <DrivesPage />
               </PageSuspense>
             }
@@ -159,7 +170,7 @@ export default function App() {
           <Route
             path="crawlers"
             element={
-              <PageSuspense>
+              <PageSuspense fallback={<CrawlersPageLoading />}>
                 <CrawlersPage />
               </PageSuspense>
             }
@@ -173,14 +184,6 @@ export default function App() {
             }
           />
           <Route
-            path="duplicate-reviews"
-            element={
-              <PageSuspense>
-                <DuplicateReviewsPage />
-              </PageSuspense>
-            }
-          />
-          <Route
             path="tags"
             element={
               <PageSuspense>
@@ -189,10 +192,19 @@ export default function App() {
             }
           />
           <Route
-            path="theme"
+            path="settings"
             element={
               <PageSuspense>
-                <ThemePage />
+                <SettingsPage />
+              </PageSuspense>
+            }
+          />
+          <Route path="theme" element={<Navigate to="/admin/drives" replace />} />
+          <Route
+            path="backup"
+            element={
+              <PageSuspense>
+                <BackupPage />
               </PageSuspense>
             }
           />
@@ -201,6 +213,14 @@ export default function App() {
             element={
               <PageSuspense>
                 <UsersPage />
+              </PageSuspense>
+            }
+          />
+          <Route
+            path="logs"
+            element={
+              <PageSuspense>
+                <LogsPage />
               </PageSuspense>
             }
           />

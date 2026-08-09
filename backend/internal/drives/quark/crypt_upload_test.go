@@ -3,7 +3,7 @@ package quark
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -697,7 +697,7 @@ func TestUploadUsesQuarkPreHashMultipartCommitAndFinish(t *testing.T) {
 	var calls []string
 	var uploaded bytes.Buffer
 	var upstream *httptest.Server
-	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/file/upload/pre":
 			calls = append(calls, "pre")
@@ -747,7 +747,8 @@ func TestUploadUsesQuarkPreHashMultipartCommitAndFinish(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxyTransport := http.DefaultTransport.(*http.Transport).Clone()
+	proxyTransport := upstream.Client().Transport.(*http.Transport).Clone()
+	proxyTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // test server certificate
 	proxyTransport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, splitErr := net.SplitHostPort(address)
 		if splitErr == nil && strings.HasPrefix(host, "bucket.") {
@@ -758,6 +759,8 @@ func TestUploadUsesQuarkPreHashMultipartCommitAndFinish(t *testing.T) {
 	d := New(Config{ID: "quark-upload", Cookie: "cookie", UploadTempDir: t.TempDir()})
 	d.apiBase = upstream.URL
 	d.streamHTTPClient = &http.Client{Transport: proxyTransport}
+	d.client.SetTransport(proxyTransport)
+	d.uploadClient = newQuarkUploadHTTPClient(d.streamHTTPClient)
 
 	fileID, err := d.Upload(context.Background(), "parent-1", "video.mp4", strings.NewReader("hello world"), int64(len("hello world")))
 	if err != nil {
@@ -861,9 +864,4 @@ func (d *genericCryptTestDrive) Upload(_ context.Context, _ string, name string,
 	d.uploadedData = data
 	d.uploadedSize = size
 	return "encrypted-file", nil
-}
-
-func writeQuarkTestJSON(w http.ResponseWriter, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(value)
 }

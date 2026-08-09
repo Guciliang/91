@@ -2,30 +2,45 @@
   "name": "video-site",
   "private": true,
   "license": "MIT",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fsevents@2.3.3": true
+  },
   "scripts": {
     "dev": "vite",
     "dev:raw": "node node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "audit": "npm audit --audit-level=info",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "npm run audit && npm run lint && npm test",
+    "verify": "npm run check && npm run build"
   },
   "dependencies": {
+    "@codemirror/lang-yaml": "^6.1.3",
+    "@codemirror/merge": "^6.12.2",
+    "@codemirror/state": "^6.7.1",
+    "@uiw/react-codemirror": "^4.25.11",
     "artplayer": "^5.4.0",
     "hls.js": "^1.6.16",
     "lucide-react": "0.453.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",
-    "react-router-dom": "^6.30.3"
+    "react-router": "^7.18.2",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/react": "18.3.12",
     "@types/react-dom": "18.3.1",
-    "@vitejs/plugin-react": "^6.0.2",
-    "tsx": "^4.22.3",
+    "@vitejs/plugin-react": "^6.0.5",
+    "tsx": "^4.23.11",
     "typescript": "5.6.3",
-    "vite": "^8.0.14"
+    "vite": "^8.2.1"
   }
 }

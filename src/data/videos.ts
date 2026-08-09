@@ -220,13 +220,80 @@ export function uploadVideo(input: UploadVideoInput): Promise<VideoItem> {
   return apiForm<VideoItem>("/api/upload", body);
 }
 
+export type RemoteUploadState =
+  | "queued"
+  | "downloading"
+  | "validating"
+  | "saving"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export type RemoteUploadJob = {
+  id: string;
+  state: RemoteUploadState;
+  sourceLabel: string;
+  title?: string;
+  tags: string[];
+  bytesDownloaded: number;
+  totalBytes: number;
+  canCancel: boolean;
+  cancelRequested?: boolean;
+  error?: string;
+  completedVideoId?: string;
+  videoHref?: string;
+  createdAt: string;
+  startedAt?: string;
+  updatedAt: string;
+  finishedAt?: string;
+};
+
+export type CreateRemoteUploadInput = {
+  url: string;
+  title: string;
+  tags: string[];
+};
+
+export function createRemoteUpload(
+  input: CreateRemoteUploadInput
+): Promise<RemoteUploadJob> {
+  return apiJSON<RemoteUploadJob>("/api/upload/remote", {
+    method: "POST",
+    body: JSON.stringify({
+      url: input.url.trim(),
+      title: input.title.trim(),
+      tags: input.tags,
+    }),
+  });
+}
+
+export function fetchRemoteUploads(limit = 20): Promise<RemoteUploadJob[]> {
+  return apiGet<RemoteUploadJob[]>(
+    `/api/upload/remote?limit=${encodeURIComponent(String(limit))}`
+  );
+}
+
+export function cancelRemoteUpload(id: string): Promise<RemoteUploadJob> {
+  return apiJSON<RemoteUploadJob>(
+    `/api/upload/remote/${encodeURIComponent(id)}/cancel`,
+    { method: "POST" }
+  );
+}
+
 export type TagItem = { id: string; label: string; count?: number };
 
 let cachedTags: TagItem[] | null = null;
 let pendingTags: Promise<TagItem[]> | null = null;
+let tagCacheVersion = 0;
 
 export function readCachedTags(): TagItem[] | null {
   return cachedTags;
+}
+
+export function invalidateTagsCache() {
+  tagCacheVersion += 1;
+  cachedTags = null;
+  pendingTags = null;
 }
 
 export function fetchTags(): Promise<TagItem[]> {
@@ -234,16 +301,29 @@ export function fetchTags(): Promise<TagItem[]> {
     return Promise.resolve(cachedTags);
   }
   if (pendingTags) return pendingTags;
-  pendingTags = apiGet<TagItem[]>("/api/tags")
+  const requestVersion = tagCacheVersion;
+  let request!: Promise<TagItem[]>;
+  request = apiGet<TagItem[]>("/api/tags")
     .then((tags) => {
-      cachedTags = tags;
+      if (requestVersion === tagCacheVersion) cachedTags = tags;
       return tags;
     })
     .catch(() => cachedTags ?? [])
     .finally(() => {
-      pendingTags = null;
-    });
-  return pendingTags;
+      if (pendingTags === request) pendingTags = null;
+  });
+  pendingTags = request;
+  return request;
+}
+
+// 上传选项由后台标签目录实时生成，不复用首页标签云的会话缓存，确保管理端
+// 新增或删除标签后再次进入上传页即可看到最新结果。
+export async function fetchUploadTags(): Promise<TagItem[]> {
+  const tags = await apiGet<TagItem[]>("/api/upload/tags");
+  if (!Array.isArray(tags)) {
+    throw new Error("Invalid /api/upload/tags response");
+  }
+  return tags;
 }
 
 /** 短视频模式单条记录。比 VideoItem 多 videoSrc / poster。 */
@@ -391,7 +471,7 @@ async function apiJSON<T>(path: string, init: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await responseError(res);
   return res.json();
 }
 
@@ -401,6 +481,18 @@ async function apiForm<T>(path: string, body: FormData): Promise<T> {
     credentials: "include",
     body,
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw await responseError(res);
   return res.json();
+}
+
+async function responseError(res: Response): Promise<Error> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body?.error === "string" && body.error.trim()) {
+      return new Error(body.error.trim());
+    }
+  } catch {
+    // Non-JSON errors retain the stable HTTP fallback below.
+  }
+  return new Error(`HTTP ${res.status}`);
 }
