@@ -53,6 +53,29 @@ func (a *App) attachDrive(ctx context.Context, d *catalog.Drive) error {
 	return a.attachDriveUnlocked(ctx, d)
 }
 
+// reloadSavedDrive applies persisted configuration to the runtime. Saving is
+// deliberately not a crawler-upload trigger: uploads are started only by the
+// explicit upload action, successful crawl completion, or the nightly pipeline.
+func (a *App) reloadSavedDrive(ctx context.Context, driveID string) error {
+	d, err := a.cat.GetDrive(ctx, driveID)
+	if err != nil {
+		return err
+	}
+	if err := a.attachDrive(ctx, d); err != nil {
+		return err
+	}
+
+	// 本地存储开启 .strm 越root后，之前因 strm 指向目录外而失败的封面/
+	// 预览/指纹应自动重试，省得用户再手动点三个"重试失败"按钮。
+	if (d.Kind == localstorage.Kind || d.Kind == webdav.Kind) &&
+		parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false) {
+		go a.regenFailedThumbnails(ctx, driveID)
+		go a.regenFailedPreviews(ctx, driveID)
+		go a.regenFailedFingerprints(ctx, driveID)
+	}
+	return nil
+}
+
 func (a *App) ensureDriveAttached(ctx context.Context, driveID string) error {
 	if _, ok := a.registry.Get(driveID); ok {
 		return nil
@@ -103,6 +126,21 @@ func (a *App) recordDriveRuntimeStatus(driveID, status, lastError string) {
 	}
 }
 
+// persistDriveCredentials applies only the credential keys produced by a
+// runtime token/cookie refresh. Driver callbacks can outlive the Drive value
+// used during attachment, so writing that whole value back would risk rolling
+// back independently saved settings such as skip directories or root IDs.
+func (a *App) persistDriveCredentials(driveID string, updates map[string]string) {
+	if a == nil || a.cat == nil || len(updates) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := a.cat.PatchDriveCredentials(ctx, driveID, updates); err != nil {
+		log.Printf("[drive %s] persist refreshed credentials: %v", driveID, err)
+	}
+}
+
 func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 	if d == nil {
 		return errors.New("nil drive")
@@ -123,24 +161,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 				if a.proxy != nil {
 					a.proxy.InvalidateDrive(d.ID)
 				}
-				persistCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				defer cancel()
-				current, err := a.cat.GetDrive(persistCtx, d.ID)
-				if err != nil {
-					log.Printf("[drive %s] load before persisting rotated Quark cookie: %v", d.ID, err)
-					return
-				}
-				if current.Credentials == nil {
-					current.Credentials = make(map[string]string)
-				}
-				if current.Credentials["cookie"] == cookie {
-					return
-				}
-				current.Credentials["cookie"] = cookie
-				if err := a.cat.UpsertDrive(persistCtx, current); err != nil {
-					log.Printf("[drive %s] persist rotated Quark cookie: %v", d.ID, err)
-					return
-				}
+				a.persistDriveCredentials(d.ID, map[string]string{"cookie": cookie})
 			},
 		})
 	case "p115":
@@ -162,11 +183,7 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			UploadTempDir: a.uploadWorkDir(p123.Kind),
 			ProxyURL:      d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access string) {
-				if d.Credentials == nil {
-					d.Credentials = make(map[string]string)
-				}
-				d.Credentials["access_token"] = access
-				_ = a.cat.UpsertDrive(ctx, d)
+				a.persistDriveCredentials(d.ID, map[string]string{"access_token": access})
 			},
 		})
 	case "pikpak":
@@ -184,11 +201,12 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			UploadTempDir:    a.uploadWorkDir("pikpak"),
 			ProxyURL:         d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh, captcha, deviceID string) {
-				d.Credentials["access_token"] = access
-				d.Credentials["refresh_token"] = refresh
-				d.Credentials["captcha_token"] = captcha
-				d.Credentials["device_id"] = deviceID
-				_ = a.cat.UpsertDrive(ctx, d)
+				a.persistDriveCredentials(d.ID, map[string]string{
+					"access_token":  access,
+					"refresh_token": refresh,
+					"captcha_token": captcha,
+					"device_id":     deviceID,
+				})
 			},
 		})
 	case "wopan":
@@ -201,9 +219,10 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			UploadTempDir: a.uploadWorkDir("wopan"),
 			ProxyURL:      d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh string) {
-				d.Credentials["access_token"] = access
-				d.Credentials["refresh_token"] = refresh
-				_ = a.cat.UpsertDrive(ctx, d)
+				a.persistDriveCredentials(d.ID, map[string]string{
+					"access_token":  access,
+					"refresh_token": refresh,
+				})
 			},
 		})
 	case guangyapan.Kind:
@@ -226,14 +245,9 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			AccountBaseURL: d.Credentials["account_base_url"],
 			APIBaseURL:     d.Credentials["api_base_url"],
 			ProxyURL:       d.Credentials["proxy_url"],
+			UploadTempDir:  a.uploadWorkDir(guangyapan.Kind),
 			OnCredentialsUpdate: func(updated map[string]string) {
-				if d.Credentials == nil {
-					d.Credentials = make(map[string]string)
-				}
-				for k, v := range updated {
-					d.Credentials[k] = v
-				}
-				_ = a.cat.UpsertDrive(ctx, d)
+				a.persistDriveCredentials(d.ID, updated)
 			},
 		})
 	case "onedrive":
@@ -248,12 +262,10 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			RenewAPIURL:  d.Credentials["api_url_address"],
 			ProxyURL:     d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh string) {
-				if d.Credentials == nil {
-					d.Credentials = make(map[string]string)
-				}
-				d.Credentials["access_token"] = access
-				d.Credentials["refresh_token"] = refresh
-				_ = a.cat.UpsertDrive(ctx, d)
+				a.persistDriveCredentials(d.ID, map[string]string{
+					"access_token":  access,
+					"refresh_token": refresh,
+				})
 			},
 		})
 	case googledrive.Kind:
@@ -268,12 +280,10 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 			APIBaseURL:   d.Credentials["api_base_url"],
 			ProxyURL:     d.Credentials["proxy_url"],
 			OnTokenUpdate: func(access, refresh string) {
-				if d.Credentials == nil {
-					d.Credentials = make(map[string]string)
-				}
-				d.Credentials["access_token"] = access
-				d.Credentials["refresh_token"] = refresh
-				_ = a.cat.UpsertDrive(ctx, d)
+				a.persistDriveCredentials(d.ID, map[string]string{
+					"access_token":  access,
+					"refresh_token": refresh,
+				})
 			},
 		})
 	case webdav.Kind:
@@ -323,13 +333,17 @@ func (a *App) attachDriveUnlocked(ctx context.Context, d *catalog.Drive) error {
 		}
 		d.Status = "error"
 		d.LastError = err.Error()
-		_ = a.cat.UpsertDrive(ctx, d)
+		if persistErr := a.cat.SetDriveRuntimeStatus(ctx, d.ID, d.Status, d.LastError); persistErr != nil {
+			log.Printf("[drive %s] persist attach failure: %v", d.ID, persistErr)
+		}
 		return err
 	}
 
 	d.Status = "ok"
 	d.LastError = ""
-	_ = a.cat.UpsertDrive(ctx, d)
+	if err := a.cat.SetDriveRuntimeStatus(ctx, d.ID, d.Status, d.LastError); err != nil {
+		log.Printf("[drive %s] persist attach success: %v", d.ID, err)
+	}
 	if a.proxy != nil {
 		a.proxy.InvalidateDrive(d.ID)
 	}
@@ -1125,11 +1139,41 @@ func (a *App) detachDrive(id string) {
 // 走标准 List + IsDir 过滤 —— 它们的根目录通常不会有几万个文件。
 //
 // drive 未挂载（如凭证错误未通过 Init）时返回 error；前端展示 5xx 给用户。
+type driveNotAttachedError struct {
+	driveID   string
+	lastError string
+}
+
+func (e *driveNotAttachedError) Error() string {
+	message := fmt.Sprintf("drive %s not attached", e.driveID)
+	if e.lastError != "" {
+		message += ": " + e.lastError
+	}
+	return message
+}
+
+func (a *App) currentDriveNotAttachedError(ctx context.Context, driveID string) error {
+	err := &driveNotAttachedError{driveID: driveID}
+	if a != nil && a.cat != nil {
+		if d, getErr := a.cat.GetDrive(ctx, driveID); getErr == nil && d != nil {
+			err.lastError = strings.TrimSpace(d.LastError)
+		}
+	}
+	return err
+}
+
 func (a *App) listDriveDirChildren(ctx context.Context, driveID, parentID string) (children []api.DriveDirEntry, resultErr error) {
 	defer func() {
 		// Closing the directory picker (or navigating away) cancels its request;
 		// that says nothing about the provider's connection state.
 		if errors.Is(resultErr, context.Canceled) {
+			return
+		}
+		var notAttached *driveNotAttachedError
+		if errors.As(resultErr, &notAttached) && notAttached.lastError != "" {
+			// The attach path already persisted the provider's root cause. A
+			// directory picker cannot add new information while no driver exists,
+			// so do not replace that cause with a generic secondary error.
 			return
 		}
 		if resultErr != nil {
@@ -1141,7 +1185,7 @@ func (a *App) listDriveDirChildren(ctx context.Context, driveID, parentID string
 
 	drv, ok := a.registry.Get(driveID)
 	if !ok {
-		return nil, fmt.Errorf("drive %s not attached", driveID)
+		return nil, a.currentDriveNotAttachedError(ctx, driveID)
 	}
 	if parentID == "" {
 		parentID = drv.RootID()

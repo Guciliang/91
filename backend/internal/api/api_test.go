@@ -124,11 +124,14 @@ func TestPlaybackMediaTypeDescribesSelectedResource(t *testing.T) {
 func TestVideoURLsEscapePathSegments(t *testing.T) {
 	updated := time.UnixMilli(1778863000123)
 	v := &catalog.Video{
-		ID:        "wopan-drive-fid/with space",
-		DriveID:   "drive-1",
-		FileID:    "fid/with space",
-		Title:     "Video",
-		UpdatedAt: updated,
+		ID:                 "wopan-drive-fid/with space",
+		DriveID:            "drive-1",
+		FileID:             "fid/with space",
+		Title:              "Video",
+		ThumbnailURL:       "/p/thumb/wopan-drive-fid/with space",
+		ThumbnailUpdatedAt: updated,
+		PreviewUpdatedAt:   updated,
+		UpdatedAt:          updated,
 	}
 
 	dto := mapVideo(v)
@@ -148,9 +151,9 @@ func TestVideoURLsEscapePathSegments(t *testing.T) {
 
 func TestThumbnailURLRewritesStoredLocalURLForUnsafeVideoID(t *testing.T) {
 	got := thumbnailURL(&catalog.Video{
-		ID:           "wopan-drive-fid/with space",
-		ThumbnailURL: "/p/thumb/wopan-drive-fid/with space",
-		UpdatedAt:    time.UnixMilli(1778863000123),
+		ID:                 "wopan-drive-fid/with space",
+		ThumbnailURL:       "/p/thumb/wopan-drive-fid/with space",
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
 	})
 
 	if got != "/p/thumb/wopan-drive-fid%2Fwith%20space?v=1778863000123" {
@@ -584,10 +587,10 @@ func TestVideoSourceUsesLocalUploadRoute(t *testing.T) {
 	}
 }
 
-func TestPreviewURLIncludesUpdatedAtVersion(t *testing.T) {
+func TestPreviewURLIncludesPreviewRevision(t *testing.T) {
 	got := previewURL(&catalog.Video{
-		ID:        "video-1",
-		UpdatedAt: time.UnixMilli(1778863000123),
+		ID:               "video-1",
+		PreviewUpdatedAt: time.UnixMilli(1778863000123),
 	})
 
 	if got != "/p/preview/video-1?v=1778863000123" {
@@ -595,7 +598,7 @@ func TestPreviewURLIncludesUpdatedAtVersion(t *testing.T) {
 	}
 }
 
-func TestPreviewURLFallsBackWithoutUpdatedAt(t *testing.T) {
+func TestPreviewURLFallsBackWithoutPreviewRevision(t *testing.T) {
 	got := previewURL(&catalog.Video{ID: "video-1"})
 
 	if got != "/p/preview/video-1" {
@@ -684,9 +687,10 @@ func TestHandleVideoDetailDecodesEscapedVideoID(t *testing.T) {
 
 func TestThumbnailURLVersionsLocalGeneratedThumbnails(t *testing.T) {
 	got := thumbnailURL(&catalog.Video{
-		ID:           "video-1",
-		ThumbnailURL: "/p/thumb/video-1",
-		UpdatedAt:    time.UnixMilli(1778863000123),
+		ID:                 "video-1",
+		ThumbnailURL:       "/p/thumb/video-1",
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
+		UpdatedAt:          time.UnixMilli(1779999999999),
 	})
 	if got != "/p/thumb/video-1?v=1778863000123" {
 		t.Fatalf("thumbnail URL = %q, want versioned local URL", got)
@@ -694,12 +698,20 @@ func TestThumbnailURLVersionsLocalGeneratedThumbnails(t *testing.T) {
 
 	remote := "https://thumb.example/video-1.jpg"
 	got = thumbnailURL(&catalog.Video{
-		ID:           "video-1",
-		ThumbnailURL: remote,
-		UpdatedAt:    time.UnixMilli(1778863000123),
+		ID:                 "video-1",
+		ThumbnailURL:       remote,
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
 	})
 	if got != remote {
 		t.Fatalf("remote thumbnail URL = %q, want unchanged %q", got, remote)
+	}
+
+	got = thumbnailURL(&catalog.Video{
+		ID:                 "video-pending",
+		ThumbnailUpdatedAt: time.UnixMilli(1778863000123),
+	})
+	if got != "/p/thumb/video-pending" {
+		t.Fatalf("pending thumbnail URL = %q, want unversioned retryable URL", got)
 	}
 }
 
@@ -845,6 +857,22 @@ func requestHomeRecommendationBatch(t *testing.T, handler http.Handler, token st
 	return got
 }
 
+func requestHomeLatestBatch(t *testing.T, handler http.Handler, token string, count int) []VideoDTO {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/home/latest?count="+strconv.Itoa(count), nil)
+	req.AddCookie(&http.Cookie{Name: "vs_admin", Value: token})
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("latest count %d status = %d, body = %s", count, rr.Code, rr.Body.String())
+	}
+	var got []VideoDTO
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode latest count %d response: %v", count, err)
+	}
+	return got
+}
+
 func assertUniqueHomeBatch(t *testing.T, got []VideoDTO) {
 	t.Helper()
 	seen := make(map[string]struct{}, len(got))
@@ -853,6 +881,34 @@ func assertUniqueHomeBatch(t *testing.T, got []VideoDTO) {
 			t.Fatalf("home batch returned duplicate video %q; items=%#v", item.ID, got)
 		}
 		seen[item.ID] = struct{}{}
+	}
+}
+
+func TestNextHomeSnapshotBatchStopsAfterUnavailableFreshRound(t *testing.T) {
+	server, _, _ := newHomeRecommendationTestRoute(t, 0, 0)
+	loadCalls := 0
+
+	items, roundVideoIDs, roundCursor, err := server.nextHomeSnapshotBatch(
+		context.Background(),
+		[]string{"removed-from-current-round"},
+		0,
+		8,
+		func() ([]string, error) {
+			loadCalls++
+			return []string{"removed-from-fresh-round"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("load unavailable snapshots: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %d, want 0", len(items))
+	}
+	if loadCalls != 1 {
+		t.Fatalf("fresh round loads = %d, want 1", loadCalls)
+	}
+	if len(roundVideoIDs) != 1 || roundVideoIDs[0] != "removed-from-fresh-round" || roundCursor != 1 {
+		t.Fatalf("fresh round state = %#v at %d, want exhausted unavailable round", roundVideoIDs, roundCursor)
 	}
 }
 
@@ -892,6 +948,130 @@ func TestHomeRouteCompletesWholeLibraryBeforeRepeating(t *testing.T) {
 		t.Fatalf("next round returned %d items, want 8", len(nextRound))
 	}
 	assertUniqueHomeBatch(t, nextRound)
+}
+
+func TestHomeLatestRouteRotatesOneBoundedSnapshotWithMixedGridSizes(t *testing.T) {
+	server, router, token := newHomeRecommendationTestRoute(t, 110, 110)
+	seen := make(map[string]struct{}, 28)
+	for _, count := range []int{8, 12, 8} {
+		batch := requestHomeLatestBatch(t, router, token, count)
+		if len(batch) != count {
+			t.Fatalf("latest count %d returned %d items", count, len(batch))
+		}
+		assertUniqueHomeBatch(t, batch)
+		for _, item := range batch {
+			if _, duplicate := seen[item.ID]; duplicate {
+				t.Fatalf("latest video %q repeated before the snapshot completed", item.ID)
+			}
+			seen[item.ID] = struct{}{}
+		}
+	}
+	if len(seen) != 28 {
+		t.Fatalf("latest mixed batches contained %d unique videos, want 28", len(seen))
+	}
+
+	if len(server.homeRecommendationSessions) != 1 {
+		t.Fatalf("server session records = %d, want 1", len(server.homeRecommendationSessions))
+	}
+	for _, session := range server.homeRecommendationSessions {
+		if len(session.latestVideoIDs) != homeLatestSnapshotSize {
+			t.Fatalf("latest snapshot size = %d, want %d", len(session.latestVideoIDs), homeLatestSnapshotSize)
+		}
+		if session.latestCursor != 28 {
+			t.Fatalf("latest cursor = %d, want 28", session.latestCursor)
+		}
+	}
+}
+
+func TestHomeLatestRouteRefreshesSharedSnapshotAfterTTLWithoutRepeatingConsumedCards(t *testing.T) {
+	server, router, token := newHomeRecommendationTestRoute(t, 20, 20)
+	clock := time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC)
+	server.homeRecommendationNow = func() time.Time { return clock }
+	first := requestHomeLatestBatch(t, router, token, 8)
+	firstIDs := make(map[string]struct{}, len(first))
+	for _, item := range first {
+		firstIDs[item.ID] = struct{}{}
+	}
+
+	now := time.Now().Add(24 * time.Hour)
+	if err := server.Catalog.UpsertVideo(context.Background(), &catalog.Video{
+		ID:           "new-latest-video",
+		DriveID:      "drive",
+		FileID:       "new-latest-video",
+		Title:        "New latest video",
+		ThumbnailURL: "https://thumb.example/new-latest-video.jpg",
+		PublishedAt:  now,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("seed new latest video: %v", err)
+	}
+
+	withinTTL := requestHomeLatestBatch(t, router, token, 8)
+	if len(withinTTL) != 8 {
+		t.Fatalf("cached latest batch returned %d items, want 8", len(withinTTL))
+	}
+	for _, item := range withinTTL {
+		if item.ID == "new-latest-video" {
+			t.Fatal("new video appeared before the shared latest snapshot TTL expired")
+		}
+	}
+
+	clock = clock.Add(homeLatestSnapshotTTL)
+	afterTTL := requestHomeLatestBatch(t, router, token, 4)
+	if len(afterTTL) != 4 {
+		t.Fatalf("refreshed latest batch returned %d items, want 4", len(afterTTL))
+	}
+	if afterTTL[0].ID != "new-latest-video" {
+		t.Fatalf("first card after snapshot refresh = %q, want new latest video", afterTTL[0].ID)
+	}
+	for _, item := range append(withinTTL, afterTTL...) {
+		if _, duplicate := firstIDs[item.ID]; duplicate {
+			t.Fatalf("catalog refresh repeated consumed latest video %q", item.ID)
+		}
+	}
+}
+
+func TestHomeLatestRouteSerializesConcurrentRefreshesWithinOneSession(t *testing.T) {
+	_, router, token := newHomeRecommendationTestRoute(t, 24, 24)
+	type batchResult struct {
+		items  []VideoDTO
+		status int
+		body   string
+		err    error
+	}
+	start := make(chan struct{})
+	results := make(chan batchResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			req := httptest.NewRequest(http.MethodGet, "/api/home/latest?count=12", nil)
+			req.AddCookie(&http.Cookie{Name: "vs_admin", Value: token})
+			rr := httptest.NewRecorder()
+			router.ServeHTTP(rr, req)
+			var items []VideoDTO
+			err := json.NewDecoder(rr.Body).Decode(&items)
+			results <- batchResult{items: items, status: rr.Code, body: rr.Body.String(), err: err}
+		}()
+	}
+	close(start)
+
+	seen := make(map[string]struct{}, 24)
+	for range 2 {
+		result := <-results
+		if result.status != http.StatusOK || result.err != nil {
+			t.Fatalf("concurrent latest response status=%d decode=%v body=%s", result.status, result.err, result.body)
+		}
+		if len(result.items) != 12 {
+			t.Fatalf("concurrent latest batch returned %d items, want 12", len(result.items))
+		}
+		for _, item := range result.items {
+			if _, duplicate := seen[item.ID]; duplicate {
+				t.Fatalf("concurrent latest refreshes returned the same video %q", item.ID)
+			}
+			seen[item.ID] = struct{}{}
+		}
+	}
 }
 
 func TestHomeRouteSerializesConcurrentRefreshesWithinOneSession(t *testing.T) {
@@ -1420,17 +1600,19 @@ func TestHandlePreviewIgnoresRemotePreviewFileIDAndServesLocalFile(t *testing.T)
 		t.Fatalf("write local preview: %v", err)
 	}
 	now := time.Now()
+	previewRevision := time.UnixMilli(1778863000123)
 	if err := cat.UpsertVideo(ctx, &catalog.Video{
-		ID:            "video-1",
-		DriveID:       "drive-1",
-		FileID:        "file-1",
-		Title:         "Video",
-		PreviewStatus: "ready",
-		PreviewFileID: "remote-preview-file",
-		PreviewLocal:  localPreview,
-		PublishedAt:   now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:               "video-1",
+		DriveID:          "drive-1",
+		FileID:           "file-1",
+		Title:            "Video",
+		PreviewStatus:    "ready",
+		PreviewFileID:    "remote-preview-file",
+		PreviewLocal:     localPreview,
+		PreviewUpdatedAt: previewRevision,
+		PublishedAt:      now,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
@@ -1452,6 +1634,35 @@ func TestHandlePreviewIgnoresRemotePreviewFileIDAndServesLocalFile(t *testing.T)
 	}
 	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	versionedReq := requestWithRouteParam(
+		http.MethodGet,
+		"/p/preview/video-1?v=1778863000123",
+		"videoID",
+		"video-1",
+		strings.NewReader(``),
+	)
+	versionedRR := httptest.NewRecorder()
+	server.handlePreview(versionedRR, versionedReq)
+	if versionedRR.Code != http.StatusOK {
+		t.Fatalf("versioned status = %d, body = %s", versionedRR.Code, versionedRR.Body.String())
+	}
+	if got := versionedRR.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("versioned Cache-Control = %q, want immutable private cache", got)
+	}
+
+	staleReq := requestWithRouteParam(
+		http.MethodGet,
+		"/p/preview/video-1?v=stale",
+		"videoID",
+		"video-1",
+		strings.NewReader(``),
+	)
+	staleRR := httptest.NewRecorder()
+	server.handlePreview(staleRR, staleReq)
+	if got := staleRR.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("stale Cache-Control = %q, want no-store", got)
 	}
 }
 
@@ -1539,6 +1750,25 @@ func TestHandleThumbServesHashedPathForLongVideoID(t *testing.T) {
 	}
 	if rr.Body.String() != "thumb-bytes" {
 		t.Fatalf("body = %q, want thumb bytes", rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "private, max-age=86400" {
+		t.Fatalf("unversioned Cache-Control = %q", got)
+	}
+
+	versionedReq := requestWithRouteParam(
+		http.MethodGet,
+		"/p/thumb/"+longID+"?v=1778863000123",
+		"videoID",
+		longID,
+		strings.NewReader(``),
+	)
+	versionedRR := httptest.NewRecorder()
+	server.handleThumb(versionedRR, versionedReq)
+	if versionedRR.Code != http.StatusOK {
+		t.Fatalf("versioned status = %d, body = %s", versionedRR.Code, versionedRR.Body.String())
+	}
+	if got := versionedRR.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("versioned Cache-Control = %q", got)
 	}
 }
 

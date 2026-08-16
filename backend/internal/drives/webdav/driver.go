@@ -92,9 +92,7 @@ func New(c Config) *Driver {
 		d.proxyErr = err
 		return d
 	}
-	if transport, ok := transfer.Transport.(*http.Transport); ok {
-		drives.ConfigureStreamTransport(transport)
-	}
+	drives.ConfigureStreamTransport(transfer.Transport)
 	d.metadata = metadata
 	d.transfer = transfer
 	return d

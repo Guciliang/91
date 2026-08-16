@@ -71,6 +71,9 @@ type Server struct {
 	homeRecommendationMu       sync.Mutex
 	homeRecommendationSessions map[string]*homeRecommendationSession
 	homeRecommendationNow      func() time.Time
+	homeLatestSnapshotMu       sync.Mutex
+	homeLatestSnapshot         []string
+	homeLatestSnapshotUntil    time.Time
 
 	// shareNow is injectable so one-time share expiry behavior can be tested
 	// without sleeping. Production leaves it nil and uses time.Now.
@@ -197,6 +200,7 @@ func (s *Server) RegisterRoutes(r chi.Router, a *auth.Authenticator) {
 	r.Group(func(r chi.Router) {
 		r.Use(a.Required)
 		r.Get("/api/home", s.handleHome)
+		r.Get("/api/home/latest", s.handleHomeLatest)
 		r.Get("/api/list", s.handleList)
 		r.Get("/api/video/{id}", s.handleVideoDetail)
 		r.Get("/api/video/{id}/subtitles", s.handleVideoSubtitles)
@@ -250,12 +254,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	recommendationSession := &homeRecommendationSession{}
-	persistentSession := false
-	if identity, ok := auth.SessionIdentityFromContext(r.Context()); ok {
-		recommendationSession = s.homeRecommendationSession(identity)
-		persistentSession = true
-	}
+	recommendationSession, persistentSession := s.homeSessionFromContext(r.Context())
 	recommendationSession.requestMu.Lock()
 	defer recommendationSession.requestMu.Unlock()
 
@@ -275,6 +274,42 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func (s *Server) handleHomeLatest(w http.ResponseWriter, r *http.Request) {
+	count, err := homeRecommendationCount(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	session, persistentSession := s.homeSessionFromContext(r.Context())
+	session.latestRequestMu.Lock()
+	defer session.latestRequestMu.Unlock()
+
+	items, latestVideoIDs, latestCursor, err := s.nextHomeLatestBatch(
+		r.Context(),
+		session,
+		count,
+	)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	session.latestVideoIDs = latestVideoIDs
+	session.latestCursor = latestCursor
+	if persistentSession {
+		s.touchHomeRecommendationSession(session)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, mapVideos(items))
+}
+
+func (s *Server) homeSessionFromContext(ctx context.Context) (*homeRecommendationSession, bool) {
+	if identity, ok := auth.SessionIdentityFromContext(ctx); ok {
+		return s.homeRecommendationSession(identity), true
+	}
+	return &homeRecommendationSession{}, false
 }
 
 func homeRecommendationCount(r *http.Request) (int, error) {
@@ -424,6 +459,7 @@ func (s *Server) relatedTagPool(ctx context.Context, tags []string, seen map[str
 			PageSize:              30,
 			ThumbnailReadyOnly:    readyOnly,
 			PreferReadyThumbnails: !readyOnly,
+			SkipTotal:             true,
 		})
 		if err != nil {
 			continue
@@ -452,6 +488,7 @@ func (s *Server) relatedListPool(ctx context.Context, seen map[string]struct{}, 
 		PageSize:              pageSize,
 		ThumbnailReadyOnly:    readyOnly,
 		PreferReadyThumbnails: !readyOnly,
+		SkipTotal:             true,
 	})
 	if err != nil {
 		return nil
@@ -1252,24 +1289,25 @@ func normalizeSubtitleExt(ext string) string {
 
 func previewURL(v *catalog.Video) string {
 	base := "/p/preview/" + pathSegment(v.ID)
-	if v.UpdatedAt.IsZero() {
+	if v.PreviewUpdatedAt.IsZero() {
 		return base
 	}
-	return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
+	return base + "?v=" + strconv.FormatInt(v.PreviewUpdatedAt.UnixMilli(), 10)
 }
 
 func thumbnailURL(v *catalog.Video) string {
 	base := "/p/thumb/" + pathSegment(v.ID)
+	hasThumbnail := v.ThumbnailURL != ""
 	if v.ThumbnailURL != "" {
 		base = v.ThumbnailURL
 		if thumbnailURLMatchesVideoID(base, v.ID) {
 			base = "/p/thumb/" + pathSegment(v.ID)
 		}
 	}
-	if !strings.HasPrefix(base, "/p/thumb/") || v.UpdatedAt.IsZero() {
+	if !hasThumbnail || !strings.HasPrefix(base, "/p/thumb/") || v.ThumbnailUpdatedAt.IsZero() {
 		return base
 	}
-	return base + "?v=" + strconv.FormatInt(v.UpdatedAt.UnixMilli(), 10)
+	return base + "?v=" + strconv.FormatInt(v.ThumbnailUpdatedAt.UnixMilli(), 10)
 }
 
 // transcodedSource 在视频有就绪的浏览器兼容性转码产物时返回产物的播放地址。

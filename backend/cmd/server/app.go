@@ -70,7 +70,7 @@ type App struct {
 	fingerprintQueueMu  sync.Mutex
 	fingerprintQueueing map[string]bool
 
-	// crawlerUploadRunning 去重"保存上传目标后检查本地未上传文件"的后台任务。
+	// crawlerUploadRunning 去重管理员手动发起的单爬虫上传任务。
 	crawlerUploadMu      sync.Mutex
 	crawlerUploadRunning map[string]bool
 
@@ -90,6 +90,9 @@ type App struct {
 	// the catalog and purges each one after a successful provider delete.
 	blacklistSourceDeleteMu    sync.Mutex
 	blacklistSourceDeleteState api.BlacklistSourceDeleteStatus
+	// blacklistVideoLocks serializes restore and source deletion for the same
+	// tombstone without making unrelated videos wait on a slow provider call.
+	blacklistVideoLocks videoOperationLocks
 
 	// tagJobMu protects the admin-visible tag job status. tagMaintenanceMu
 	// serializes bulk writes to video_tags across startup, manual, and nightly
@@ -97,6 +100,41 @@ type App struct {
 	tagJobMu         sync.Mutex
 	tagMaintenanceMu sync.Mutex
 	tagJobState      api.TagJobStatus
+}
+
+type videoOperationLocks struct {
+	mu    sync.Mutex
+	items map[string]*videoOperationLock
+}
+
+type videoOperationLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (locks *videoOperationLocks) lock(videoID string) func() {
+	locks.mu.Lock()
+	if locks.items == nil {
+		locks.items = make(map[string]*videoOperationLock)
+	}
+	item := locks.items[videoID]
+	if item == nil {
+		item = &videoOperationLock{}
+		locks.items[videoID] = item
+	}
+	item.refs++
+	locks.mu.Unlock()
+
+	item.mu.Lock()
+	return func() {
+		item.mu.Unlock()
+		locks.mu.Lock()
+		item.refs--
+		if item.refs == 0 {
+			delete(locks.items, videoID)
+		}
+		locks.mu.Unlock()
+	}
 }
 
 type driveScanProgress struct {
@@ -115,4 +153,5 @@ type driveUploadProgress struct {
 
 type crawlerUploadRunner interface {
 	RunOnce(ctx context.Context) error
+	StartDrive(ctx context.Context, driveID string) (<-chan error, bool)
 }

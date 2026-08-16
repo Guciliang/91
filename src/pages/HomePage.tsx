@@ -1,158 +1,149 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { useSearchParams } from "react-router";
+import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
 import { AppShell } from "@/components/AppShell";
+import { ListingLoadError } from "@/components/ListingLoadError";
+import { Pagination } from "@/components/Pagination";
 import { PromoStrip } from "@/components/PromoStrip";
 import { SearchPanel } from "@/components/SearchPanel";
-import { TagCloud } from "@/components/TagCloud";
 import { SectionHeader } from "@/components/SectionHeader";
-import { SortToolbar, type ViewMode } from "@/components/SortToolbar";
+import { SortToolbar } from "@/components/SortToolbar";
+import { TagCloud } from "@/components/TagCloud";
 import { VideoGrid } from "@/components/VideoGrid";
-import { Pagination } from "@/components/Pagination";
-import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
-import { fetchHomeVideos, fetchListing } from "@/data/videos";
+import { fetchHomeVideos, fetchLatestHomeVideos } from "@/data/videos";
+import {
+  readListingPage,
+  readListingSort,
+  readListingView,
+  withListingNavigation,
+  withListingPage,
+  withListingView,
+} from "@/lib/listingSearchParams";
 import { MOBILE_VIDEO_PAGE_SIZE, useIsMobile } from "@/lib/responsive";
-import type { SortKey, VideoItem } from "@/types";
+import { useListingQuery } from "@/lib/useListingQuery";
+import type { VideoItem } from "@/types";
 
 const DESKTOP_COUNT = 12;
 const MOBILE_COUNT = 8;
 const HOME_SEARCH_DESKTOP_PAGE_SIZE = 20;
-const LATEST_POOL_SIZE = 96;
-const HOME_LATEST_CURSOR_KEY = "home.latest.cursor";
 
-// 模块级缓存：SPA 生命周期内保持，刷新页面时重置
+// 首页推荐接口每次请求都会推进会话轮换游标。模块级快照因此在 SPA 会话内
+// 保持稳定，只有用户主动刷新、浏览器整页刷新或响应式布局需要补足卡片时才更新。
 let cachedRanking: VideoItem[] | null = null;
-let cachedLatestPool: VideoItem[] | null = null;
-let cachedLatestBatch: VideoItem[] | null = null;
-
-function loadLatestCursor(poolLength: number): number {
-  if (poolLength <= 0) return 0;
-  try {
-    const raw = window.localStorage.getItem(HOME_LATEST_CURSOR_KEY);
-    const parsed = raw ? Number.parseInt(raw, 10) : 0;
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed % poolLength : 0;
-  } catch {
-    return 0;
-  }
-}
-
-function saveLatestCursor(cursor: number) {
-  try {
-    window.localStorage.setItem(HOME_LATEST_CURSOR_KEY, String(cursor));
-  } catch {
-    // localStorage 不可用时只影响跨刷新循环进度，不影响展示。
-  }
-}
-
-function nextLatestBatch(items: VideoItem[], count: number): VideoItem[] {
-  if (items.length === 0 || count <= 0) return [];
-  if (items.length <= count) {
-    saveLatestCursor(0);
-    return items;
-  }
-
-  const start = loadLatestCursor(items.length);
-  const batch: VideoItem[] = [];
-  // 缓存最多 12 条以便页面在桌面/手机断点之间切换，但续取游标只前进
-  // 实际展示数量；手机显示 8 条时不会再悄悄跳过后面的 4 条。
-  const batchSize = Math.min(DESKTOP_COUNT, items.length);
-  for (let i = 0; i < batchSize; i += 1) {
-    batch.push(items[(start + i) % items.length]);
-  }
-  saveLatestCursor((start + count) % items.length);
-  return batch;
-}
-
-function cacheNextLatestBatch(items: VideoItem[], count: number): VideoItem[] {
-  const batch = nextLatestBatch(items, count);
-  cachedLatestBatch = batch;
-  return batch;
-}
+let cachedLatest: VideoItem[] | null = null;
 
 export default function HomePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const activeSearchQuery = searchParams.get("q")?.trim() ?? "";
   const activeTag = searchParams.get("tag")?.trim() ?? "";
-  const [rankingVideos, setRankingVideos] = useState<VideoItem[]>(cachedRanking ?? []);
-  const [latestVideos, setLatestVideos] = useState<VideoItem[]>(cachedLatestBatch ?? []);
-  const [rankingLoading, setRankingLoading] = useState(cachedRanking === null);
-  const [rankingError, setRankingError] = useState(false);
-  const [latestLoading, setLatestLoading] = useState(cachedLatestBatch === null);
-  const [latestError, setLatestError] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [searchPage, setSearchPage] = useState(1);
-  const [searchItems, setSearchItems] = useState<VideoItem[]>([]);
-  const [searchTotal, setSearchTotal] = useState(0);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [searchError, setSearchError] = useState(false);
-  const [searchSort, setSearchSort] = useState<SortKey>("hot");
-  const [searchView, setSearchView] = useState<ViewMode>("grid");
-  const homeRequestVersion = useRef(1);
+  const hasActiveSearch = activeSearchQuery.length > 0;
+  const hasActiveTag = activeTag.length > 0;
+  const hasActiveFilter = hasActiveSearch || hasActiveTag;
+  const searchPage = readListingPage(searchParams);
+  const searchSort = readListingSort(searchParams);
+  const searchView = readListingView(searchParams);
   const isMobile = useIsMobile();
   const displayCount = isMobile ? MOBILE_COUNT : DESKTOP_COUNT;
   const searchPageSize = isMobile
     ? MOBILE_VIDEO_PAGE_SIZE
     : HOME_SEARCH_DESKTOP_PAGE_SIZE;
+  const searchResult = useListingQuery(
+    {
+      q: activeSearchQuery,
+      tag: activeTag,
+      sort: searchSort,
+      page: searchPage,
+      pageSize: searchPageSize,
+    },
+    { enabled: hasActiveFilter }
+  );
+  const searchSnapshot = searchResult.snapshot;
+  const searchItems = searchSnapshot?.items ?? [];
+  const searchHasContent = searchItems.length > 0;
+  const searchShowSkeleton =
+    searchResult.initialLoading ||
+    (searchResult.transitioning && !searchHasContent);
+  const searchShowContentError =
+    searchResult.phase === "error" && searchHasContent;
+  const searchShowEmptyError =
+    searchResult.phase === "error" && !searchHasContent;
+  const eagerCount = isMobile ? 2 : 4;
+
+  const [rankingVideos, setRankingVideos] = useState<VideoItem[]>(cachedRanking ?? []);
+  const [latestVideos, setLatestVideos] = useState<VideoItem[]>(cachedLatest ?? []);
+  const [rankingLoading, setRankingLoading] = useState(cachedRanking === null);
+  const [rankingError, setRankingError] = useState(false);
+  const [rankingRevalidating, setRankingRevalidating] = useState(false);
+  const [latestLoading, setLatestLoading] = useState(cachedLatest === null);
+  const [latestError, setLatestError] = useState(false);
+  const [latestRevalidating, setLatestRevalidating] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const homeRequestVersion = useRef(0);
+  const rankingRequestVersion = useRef(0);
+  const latestRequestVersion = useRef(0);
   const displayCountRef = useRef(displayCount);
+  const previousDisplayCountRef = useRef(displayCount);
+  const previousSearchPageSizeRef = useRef(searchPageSize);
+  const searchScrollOnCommitRef = useRef(false);
   displayCountRef.current = displayCount;
 
-  const resetSearchResults = useCallback(() => {
-    setSearchPage(1);
-    setSearchSort("hot");
+  const loadRanking = useCallback(async (background: boolean) => {
+    const requestVersion = ++rankingRequestVersion.current;
+    const hasCachedContent = cachedRanking !== null;
+    setRankingLoading(!hasCachedContent);
+    setRankingRevalidating(background && hasCachedContent);
+    setRankingError(false);
+    try {
+      const rankingItems = await fetchHomeVideos(DESKTOP_COUNT);
+      if (requestVersion !== rankingRequestVersion.current) return;
+      cachedRanking = rankingItems;
+      setRankingVideos(rankingItems);
+      setRankingError(false);
+    } catch {
+      if (requestVersion !== rankingRequestVersion.current) return;
+      setRankingError(true);
+    } finally {
+      if (requestVersion === rankingRequestVersion.current) {
+        setRankingLoading(false);
+        setRankingRevalidating(false);
+      }
+    }
   }, []);
+
+  const loadLatest = useCallback(async (background: boolean) => {
+    const requestVersion = ++latestRequestVersion.current;
+    const hasCachedContent = cachedLatest !== null;
+    setLatestLoading(!hasCachedContent);
+    setLatestRevalidating(background && hasCachedContent);
+    setLatestError(false);
+    try {
+      const latestItems = await fetchLatestHomeVideos(displayCountRef.current);
+      if (requestVersion !== latestRequestVersion.current) return;
+      cachedLatest = latestItems;
+      setLatestVideos(latestItems);
+      setLatestError(false);
+    } catch {
+      if (requestVersion !== latestRequestVersion.current) return;
+      setLatestError(true);
+    } finally {
+      if (requestVersion === latestRequestVersion.current) {
+        setLatestLoading(false);
+        setLatestRevalidating(false);
+      }
+    }
+  }, []);
+
+  const refreshRanking = useCallback(() => loadRanking(true), [loadRanking]);
+  const refreshLatest = useCallback(() => loadLatest(true), [loadLatest]);
 
   const refreshHome = useCallback(async () => {
     const requestVersion = ++homeRequestVersion.current;
     setRefreshing(true);
-    setRankingLoading(true);
-    setRankingError(false);
-    setLatestLoading(true);
-    setLatestError(false);
-
-    const [rankingResult, latestResult] = await Promise.allSettled([
-      fetchHomeVideos(displayCountRef.current),
-      fetchListing(1, LATEST_POOL_SIZE, { sort: "latest", includeTotal: false }),
-    ]);
+    await Promise.allSettled([loadRanking(false), loadLatest(false)]);
     if (requestVersion !== homeRequestVersion.current) return;
-
-    if (rankingResult.status === "fulfilled") {
-      cachedRanking = rankingResult.value;
-      setRankingVideos(rankingResult.value);
-    } else {
-      setRankingError(true);
-    }
-    if (latestResult.status === "fulfilled") {
-      cachedLatestPool = latestResult.value.items;
-      const latestBatch = cacheNextLatestBatch(
-        latestResult.value.items,
-        displayCountRef.current
-      );
-      setLatestVideos(latestBatch);
-    } else {
-      setLatestError(true);
-    }
-    setRankingLoading(false);
-    setLatestLoading(false);
     setRefreshing(false);
-  }, []);
-
-  const handleSearch = useCallback((keyword: string) => {
-    const q = keyword.trim();
-    resetSearchResults();
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        if (q) {
-          next.set("q", q);
-          next.delete("tag");
-        } else {
-          next.delete("q");
-        }
-        return next;
-      },
-      { replace: true }
-    );
-  }, [resetSearchResults, setSearchParams]);
+  }, [loadLatest, loadRanking]);
 
   useEffect(() => {
     document.title = activeSearchQuery
@@ -163,178 +154,175 @@ export default function HomePage() {
   }, [activeSearchQuery, activeTag]);
 
   useEffect(() => {
-    let active = true;
-    const requestVersion = homeRequestVersion.current;
-
     if (cachedRanking === null) {
-      setRankingLoading(true);
-      setRankingError(false);
-      fetchHomeVideos(displayCountRef.current)
-        .then((rankingItems) => {
-          if (!active || requestVersion !== homeRequestVersion.current) return;
-          cachedRanking = rankingItems;
-          setRankingVideos(rankingItems);
-          setRankingError(false);
-        })
-        .catch(() => {
-          if (!active || requestVersion !== homeRequestVersion.current) return;
-          setRankingError(true);
-        })
-        .finally(() => {
-          if (active && requestVersion === homeRequestVersion.current) {
-            setRankingLoading(false);
-          }
-        });
+      void loadRanking(false);
     }
 
-    if (cachedLatestPool === null) {
-      setLatestLoading(true);
-      setLatestError(false);
-      fetchListing(1, LATEST_POOL_SIZE, { sort: "latest", includeTotal: false })
-        .then((latestResult) => {
-          if (!active || requestVersion !== homeRequestVersion.current) return;
-          cachedLatestPool = latestResult.items;
-          setLatestVideos(
-            cacheNextLatestBatch(
-              latestResult.items,
-              displayCountRef.current
-            )
-          );
-          setLatestError(false);
-        })
-        .catch(() => {
-          if (!active || requestVersion !== homeRequestVersion.current) return;
-          setLatestError(true);
-        })
-        .finally(() => {
-          if (active && requestVersion === homeRequestVersion.current) {
-            setLatestLoading(false);
-          }
-        });
+    if (cachedLatest === null) {
+      void loadLatest(false);
+    } else if (cachedLatest.length < displayCountRef.current) {
+      void loadLatest(true);
     } else {
-      setLatestVideos(
-        cachedLatestBatch ??
-          cacheNextLatestBatch(cachedLatestPool, displayCountRef.current)
-      );
+      setLatestVideos(cachedLatest);
       setLatestLoading(false);
     }
 
-    return () => { active = false; };
-  }, []);
+    return () => {
+      homeRequestVersion.current += 1;
+      rankingRequestVersion.current += 1;
+      latestRequestVersion.current += 1;
+    };
+  }, [loadLatest, loadRanking]);
 
   useEffect(() => {
-    if (!activeSearchQuery && !activeTag) {
-      setSearchItems([]);
-      setSearchTotal(0);
-      setSearchLoading(false);
-      setSearchError(false);
+    if (hasActiveFilter) return;
+    const previousCount = previousDisplayCountRef.current;
+    if (displayCount <= previousCount) {
+      previousDisplayCountRef.current = displayCount;
       return;
     }
+    if (latestVideos.length >= displayCount) {
+      previousDisplayCountRef.current = displayCount;
+      return;
+    }
+    if (refreshing || latestLoading || latestRevalidating) return;
 
-    let active = true;
-    setSearchLoading(true);
-    setSearchError(false);
-    fetchListing(searchPage, searchPageSize, {
-      q: activeSearchQuery,
-      tag: activeTag,
-      sort: searchSort,
-    })
-      .then((result) => {
-        if (!active) return;
-        setSearchItems(result.items ?? []);
-        setSearchTotal(result.total ?? 0);
-      })
-      .catch(() => {
-        if (!active) return;
-        setSearchItems([]);
-        setSearchTotal(0);
-        setSearchError(true);
-      })
-      .finally(() => {
-        if (active) setSearchLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [activeSearchQuery, activeTag, searchPage, searchPageSize, searchSort]);
+    previousDisplayCountRef.current = displayCount;
+    void refreshLatest();
+  }, [
+    displayCount,
+    hasActiveFilter,
+    latestLoading,
+    latestRevalidating,
+    latestVideos.length,
+    refreshLatest,
+    refreshing,
+  ]);
 
   useEffect(() => {
-    setSearchPage(1);
-  }, [searchPageSize]);
+    if (previousSearchPageSizeRef.current === searchPageSize) return;
+    previousSearchPageSizeRef.current = searchPageSize;
+    if (!hasActiveFilter || searchPage === 1) return;
+    setSearchParams((current) => withListingPage(current, 1), { replace: true });
+  }, [hasActiveFilter, searchPage, searchPageSize, setSearchParams]);
 
   useEffect(() => {
-    setSearchPage(1);
-    setSearchSort("hot");
-  }, [activeSearchQuery, activeTag]);
+    if (
+      !searchScrollOnCommitRef.current ||
+      searchSnapshot?.key !== searchResult.key
+    ) {
+      return;
+    }
+    searchScrollOnCommitRef.current = false;
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }, [searchResult.key, searchSnapshot?.key]);
 
   const ranking = rankingVideos.slice(0, displayCount);
   const latest = latestVideos.slice(0, displayCount);
   const homeLoading = rankingLoading || latestLoading;
-  const hasActiveSearch = activeSearchQuery.length > 0;
-  const hasActiveTag = activeTag.length > 0;
-  const hasActiveFilter = hasActiveSearch || hasActiveTag;
-  const searchTotalPages = Math.max(1, Math.ceil(searchTotal / searchPageSize));
   const hasAnyVideos = ranking.length > 0 || latest.length > 0;
   const hasHomeError = rankingError || latestError;
   const showEmptyHome = !homeLoading && !hasHomeError && !hasAnyVideos;
+  const displayedSearchSort =
+    searchResult.phase === "error" && searchSnapshot
+      ? searchSnapshot.query.sort
+      : searchSort;
+  const displayedSearchPage = searchSnapshot?.query.page ?? searchPage;
 
   return (
     <AppShell mobileAutoHideNav>
       <div className="container page-section home-discovery-section">
         <PromoStrip />
         <SearchPanel
-          value={activeSearchQuery}
-          onSearch={handleSearch}
+          navigationPath="/"
           variant="uiverse"
           placeholder=""
           className="search-panel--public search-panel--transparent"
         />
-        {!hasActiveSearch && (
-          hasAnyVideos || hasActiveTag ? (
-            <TagCloud linkBasePath="/" onTagSelect={resetSearchResults} />
-          ) : (
-            <div className="tag-cloud-container is-reserved" aria-hidden="true" />
-          )
+        {hasAnyVideos || hasActiveFilter ? (
+          <TagCloud linkBasePath="/" />
+        ) : (
+          <div className="tag-cloud-container is-reserved" aria-hidden="true" />
         )}
       </div>
 
       {hasActiveFilter ? (
         <div className="container page-section home-primary-section">
           <SortToolbar
-            sort={searchSort}
+            sort={displayedSearchSort}
             view={searchView}
+            sortDisabled={searchResult.initialLoading || searchResult.transitioning}
             onSortChange={(nextSort) => {
-              setSearchSort(nextSort);
-              setSearchPage(1);
-              window.scrollTo({ top: 0, behavior: "smooth" });
+              searchScrollOnCommitRef.current = true;
+              setSearchParams(
+                withListingNavigation(searchParams, {
+                  sort: nextSort,
+                  page: 1,
+                }),
+                { replace: true }
+              );
             }}
-            onViewChange={setSearchView}
+            onViewChange={(nextView) => {
+              setSearchParams(withListingView(searchParams, nextView), {
+                replace: true,
+              });
+            }}
           />
-          {searchLoading ? (
-            <VideoGrid videos={searchItems} loading compact={searchView === "compact"} skeletonCount={12} />
-          ) : searchError ? (
-            <AdminEmptyVisual
-              variant="no-results"
-              text="视频列表加载失败，请刷新重试"
-              className="admin-empty-state admin-empty-state--plain home-empty-state"
+
+          {searchShowSkeleton ? (
+            <VideoGrid
+              videos={[]}
+              loading
+              compact={searchView === "compact"}
+              skeletonCount={searchPageSize}
             />
-          ) : searchItems.length === 0 ? (
+          ) : searchShowEmptyError ? (
+            <ListingLoadError
+              hasContent={false}
+              onRetry={searchResult.retry}
+              emptyClassName="admin-empty-state admin-empty-state--plain home-empty-state"
+            />
+          ) : searchSnapshot && searchItems.length === 0 ? (
             <AdminEmptyVisual
               variant="no-results"
               text="未查询到"
               className="admin-empty-state admin-empty-state--plain home-empty-state"
             />
           ) : (
-            <VideoGrid videos={searchItems} compact={searchView === "compact"} skeletonCount={12} />
+            <>
+              {searchShowContentError && (
+                <ListingLoadError
+                  hasContent
+                  displayedPage={displayedSearchPage}
+                  onRetry={searchResult.retry}
+                />
+              )}
+              <VideoGrid
+                videos={searchItems}
+                compact={searchView === "compact"}
+                refreshMode={
+                  searchResult.transitioning
+                    ? "blocking"
+                    : searchResult.revalidating
+                    ? "background"
+                    : undefined
+                }
+                eagerCount={eagerCount}
+                highPriorityCount={1}
+              />
+            </>
           )}
-          {!searchLoading && searchTotalPages > 1 && (
+
+          {searchSnapshot && (
             <Pagination
-              page={searchPage}
-              pageSize={searchPageSize}
-              total={searchTotal}
-              onChange={(p) => {
-                setSearchPage(p);
-                window.scrollTo({ top: 0, behavior: "smooth" });
+              page={displayedSearchPage}
+              pageSize={searchSnapshot.query.pageSize}
+              total={searchSnapshot.total}
+              disabled={searchResult.transitioning}
+              pendingPage={searchResult.transitioning ? searchPage : undefined}
+              onChange={(nextPage) => {
+                searchScrollOnCommitRef.current = true;
+                setSearchParams(withListingPage(searchParams, nextPage));
               }}
             />
           )}
@@ -351,20 +339,47 @@ export default function HomePage() {
         <>
           <div className="container page-section home-primary-section">
             <SectionHeader title="随机推荐" />
+            {rankingError && ranking.length > 0 && (
+              <ListingLoadError
+                hasContent
+                onRetry={() => void refreshRanking()}
+              />
+            )}
             <VideoGrid
               videos={ranking}
               loading={rankingLoading}
+              refreshMode={
+                refreshing && !rankingLoading
+                  ? "blocking"
+                  : rankingRevalidating
+                  ? "background"
+                  : undefined
+              }
               emptyText={rankingError ? "随机推荐加载失败，请刷新重试" : undefined}
-              priorityCount={Math.min(4, displayCount)}
+              eagerCount={eagerCount}
+              highPriorityCount={1}
               skeletonCount={displayCount}
             />
           </div>
 
           <div className="container page-section">
             <SectionHeader title="最新视频" />
+            {latestError && latest.length > 0 && (
+              <ListingLoadError
+                hasContent
+                onRetry={() => void refreshLatest()}
+              />
+            )}
             <VideoGrid
               videos={latest}
               loading={latestLoading}
+              refreshMode={
+                refreshing && !latestLoading
+                  ? "blocking"
+                  : latestRevalidating
+                  ? "background"
+                  : undefined
+              }
               emptyText={latestError ? "最新视频加载失败，请刷新重试" : undefined}
               skeletonCount={displayCount}
             />

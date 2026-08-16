@@ -237,7 +237,6 @@ export type BackupOperationProgress = {
 export type BackupUploadChunk = {
   index: number;
   size: number;
-  sha256: string;
 };
 
 export type BackupUploadSession = {
@@ -310,7 +309,6 @@ export function backupDownloadURL(id: string) {
 export function beginBackupUpload(input: {
   fileName: string;
   size: number;
-  sha256?: string;
 }) {
   return request<BackupUploadSession>("/backup-uploads", {
     method: "POST",
@@ -326,7 +324,6 @@ export async function putBackupUploadChunk(
   id: string,
   index: number,
   chunk: Blob,
-  sha256: string,
   signal?: AbortSignal
 ): Promise<BackupUploadSession> {
   const res = await fetch(
@@ -336,7 +333,6 @@ export async function putBackupUploadChunk(
       credentials: "include",
       headers: {
         "Content-Type": "application/octet-stream",
-        "X-Chunk-SHA256": sha256,
       },
       body: chunk,
       signal,
@@ -357,10 +353,10 @@ export async function putBackupUploadChunk(
   return (await res.json()) as BackupUploadSession;
 }
 
-export function finalizeBackupUpload(id: string) {
+export function finalizeBackupUpload(id: string, sha256: string) {
   return request<BackupRecord>(
     `/backup-uploads/${encodeURIComponent(id)}/finalize`,
-    { method: "POST" }
+    { method: "POST", body: JSON.stringify({ sha256 }) }
   );
 }
 
@@ -383,6 +379,106 @@ export function restoreBackup(
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+export type BackupTransferState =
+  | "queued"
+  | "connecting"
+  | "uploading"
+  | "finalizing"
+  | "retrying"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export type BackupTransferJob = {
+  id: string;
+  backupId: string;
+  backupName: string;
+  targetUrl: string;
+  state: BackupTransferState | string;
+  size: number;
+  sha256: string;
+  processedBytes: number;
+  bytesPerSecond: number;
+  totalRanges?: number;
+  processedRanges?: number;
+  attempts?: number;
+  nextAttemptAt?: string;
+  error?: string;
+  targetBackupId?: string;
+  targetBackupName?: string;
+  createdAt: string;
+  startedAt?: string;
+  updatedAt: string;
+  finishedAt?: string;
+  cancellable: boolean;
+  retryable: boolean;
+};
+
+export type BackupReceiveToken = {
+  id: string;
+  token: string;
+  createdAt: string;
+  expiresAt: string;
+};
+
+export type BackupReceiveTransfer = {
+  id: string;
+  sourceServerId: string;
+  backupId: string;
+  backupName: string;
+  state: BackupTransferState | string;
+  size: number;
+  processedBytes: number;
+  bytesPerSecond: number;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt?: string;
+  targetBackupId?: string;
+  error?: string;
+  cancellable: boolean;
+};
+
+export function listBackupTransfers() {
+  return request<BackupTransferJob[]>("/backup-transfers");
+}
+
+export function listBackupReceiveTransfers() {
+  return request<BackupReceiveTransfer[]>("/backup-receives");
+}
+
+export function cancelBackupReceiveTransfer(id: string) {
+  return request<void>(`/backup-receives/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function createBackupTransfer(
+  backupId: string,
+  input: { targetUrl: string; receiveToken: string }
+) {
+  return request<BackupTransferJob>(
+    `/backups/${encodeURIComponent(backupId)}/transfers`,
+    { method: "POST", body: JSON.stringify(input) }
+  );
+}
+
+export function cancelBackupTransfer(id: string) {
+  return request<BackupTransferJob>(`/backup-transfers/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function retryBackupTransfer(id: string) {
+  return request<BackupTransferJob>(
+    `/backup-transfers/${encodeURIComponent(id)}/retry`,
+    { method: "POST" }
+  );
+}
+
+export function createBackupReceiveToken() {
+  return request<BackupReceiveToken>("/backup-receive-tokens", { method: "POST" });
 }
 
 // ---------- Drives ----------
@@ -523,6 +619,7 @@ export type AdminCrawler = {
   scriptPath: string;
   scriptSourceUrl?: string;
   proxy?: string;
+  uploadProxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
   paused: boolean;
@@ -552,6 +649,7 @@ export type UpsertCrawlerInput = {
   scriptPath: string;
   scriptSourceUrl?: string;
   proxy?: string;
+  uploadProxy?: string;
   targetNew?: string;
   uploadDriveId?: string;
 };
@@ -976,7 +1074,8 @@ export type AdminDeletedVideo = {
   sourceDeleted: boolean;
   canonicalVideoId?: string;
   canonicalTitle?: string;
-  restorePolicy: "none" | "scan" | "crawler";
+  // direct：本地上传这类无法被扫盘/爬取重新发现的来源，取消拉黑时当场重建记录。
+  restorePolicy: "none" | "scan" | "crawler" | "direct";
   deletedAt: number;
 };
 
@@ -1013,6 +1112,7 @@ export type BlacklistSourceDeleteStatus = {
   total: number;
   processed: number;
   deleted: number;
+  skipped: number;
   failed: number;
   currentFile?: string;
   lastError?: string;
@@ -1158,6 +1258,7 @@ export type ConfigSaveResult = {
   restartRequired: boolean;
   settings: {
     nightlyStartTime: string;
+    nightlyTimezone: string;
     builtinTagsEnabled: boolean;
   };
 };

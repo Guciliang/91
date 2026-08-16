@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/video-site/backend/internal/scopedproxy"
+
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -59,16 +61,31 @@ func NewHTTPClientForProxy(raw string, timeout time.Duration, checkRedirect func
 	if transport == nil {
 		transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
-	return &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: checkRedirect}, nil
+	// The configured drive proxy remains the default route. Wrapping it also
+	// lets crawler uploads temporarily override that route through their request
+	// context without changing playback, scanning, or other drive operations.
+	return &http.Client{
+		Transport:     scopedproxy.NewTransportWithBase(transport, nil),
+		Timeout:       timeout,
+		CheckRedirect: checkRedirect,
+	}, nil
 }
 
 // ConfigureStreamTransport keeps enough idle CDN connections for transformed
 // playback and overlapping browser range requests.
-func ConfigureStreamTransport(transport *http.Transport) {
-	if transport == nil {
-		return
+func ConfigureStreamTransport(roundTripper http.RoundTripper) {
+	configure := func(transport *http.Transport) {
+		if transport == nil {
+			return
+		}
+		transport.MaxIdleConns = 64
+		transport.MaxIdleConnsPerHost = 32
+		transport.IdleConnTimeout = 2 * time.Minute
 	}
-	transport.MaxIdleConns = 64
-	transport.MaxIdleConnsPerHost = 32
-	transport.IdleConnTimeout = 2 * time.Minute
+	switch transport := roundTripper.(type) {
+	case *http.Transport:
+		configure(transport)
+	case *scopedproxy.Transport:
+		transport.ConfigureTransports(configure)
+	}
 }

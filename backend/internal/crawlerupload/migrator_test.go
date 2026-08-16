@@ -17,12 +17,14 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
+	"github.com/video-site/backend/internal/scopedproxy"
 )
 
 const crawlerUploadWebPBase64 = "UklGRrIBAABXRUJQVlA4TKUBAAAvSsAYAA8w//M///MfeJAkbXvaSG7m8Q3GfYSBJekwQztm/IcZlgwnmWImn2BK7aFmBtnVir6q//8VOkFE/xm4baTIu8c48ArEo6+B3zFKYln3pqClSCKX0begFTAXFOLXHSyF8cCNcZEG4OywuA4KVVfJCiArU7GAgJI8+lJP/OKMT/fBAjevg1cYB7YVkFuWga2lyPi5I0HFy5YTpWIHg0RZpkniRVW9odHAKOwosWuOGdxIyn2OvaCDvhg/we6TwadPBPbqBV58MsLmMJ8yZnOWk8SRz4N+QoyPL+MnamzMvcE1rHNEr91F9GKZPVUcS9w7PhhH36suB9qPeYb/oLk6cuTiJ0wOK3m5h1cKjW6EVZCYMK7dxcKCBdgP9HkKr9gkAO2P8GKZGWVdIAatQa+1IDpt6qyorVwdy01xdW8Jkfk6xjEXmVQQ+HQdFr6OKhIN34dXWq0+0qr6EJSCeeVLH9+gvGTLyqM65PQ44ihzlTXxQKjKbAvshXgir7Lil9w4L2bvMycmjQcqXaMCO6BlY28i+FOLzbfI1vEqxAhotocAAA=="
 
 type fakeRegistry struct {
-	byID map[string]drives.Drive
+	byID     map[string]drives.Drive
+	allCalls int
 }
 
 func newFakeRegistry() *fakeRegistry {
@@ -39,6 +41,7 @@ func (r *fakeRegistry) Get(id string) (drives.Drive, bool) {
 }
 
 func (r *fakeRegistry) All() []drives.Drive {
+	r.allCalls++
 	out := make([]drives.Drive, 0, len(r.byID))
 	for _, d := range r.byID {
 		out = append(out, d)
@@ -55,6 +58,8 @@ type fakeUploadDrive struct {
 	gotBodies   map[string][]byte
 	gotParents  map[string]string
 	ensureCalls []string
+	ensureProxy bool
+	uploadProxy bool
 	listCalls   int
 	listEntries []drives.Entry
 }
@@ -90,21 +95,23 @@ func (d *fakeUploadDrive) StreamURL(context.Context, string) (*drives.StreamLink
 func (d *fakeUploadDrive) Upload(context.Context, string, string, io.Reader, int64) (string, error) {
 	return "", drives.ErrNotSupported
 }
-func (d *fakeUploadDrive) EnsureDir(_ context.Context, pathFromRoot string) (string, error) {
+func (d *fakeUploadDrive) EnsureDir(ctx context.Context, pathFromRoot string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.ensureCalls = append(d.ensureCalls, pathFromRoot)
+	d.ensureProxy = scopedproxy.Configured(ctx)
 	return d.rootID + "/" + pathFromRoot, nil
 }
 func (d *fakeUploadDrive) Rename(context.Context, string, string) error {
 	return nil
 }
-func (d *fakeUploadDrive) UploadAndReportHash(_ context.Context, parentID, name string, r io.Reader, _ int64) (UploadResult, error) {
+func (d *fakeUploadDrive) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, _ int64) (UploadResult, error) {
 	body, _ := io.ReadAll(r)
 	d.mu.Lock()
 	d.uploadCalls++
 	d.gotBodies[name] = body
 	d.gotParents[name] = parentID
+	d.uploadProxy = scopedproxy.Configured(ctx)
 	d.mu.Unlock()
 	return UploadResult{FileID: "remote-" + name, Hash: strings.Repeat("a", 40), Size: int64(len(body))}, nil
 }
@@ -123,6 +130,25 @@ func (d *fakeReconcileDrive) FindExisting(_ context.Context, _, _ string, _ int6
 	return d.existing, nil
 }
 
+type blockingFakeUploadDrive struct {
+	*fakeUploadDrive
+	started chan struct{}
+	release chan struct{}
+}
+
+func (d *blockingFakeUploadDrive) UploadAndReportHash(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
+	select {
+	case d.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-d.release:
+		return d.fakeUploadDrive.UploadAndReportHash(ctx, parentID, name, r, size)
+	case <-ctx.Done():
+		return UploadResult{}, ctx.Err()
+	}
+}
+
 func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	ctx := context.Background()
 	cat := setupCatalog(t)
@@ -133,11 +159,15 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	reg.Add(target)
 
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
-		ID:            src.ID(),
-		Kind:          scriptcrawler.Kind,
-		Name:          "Example Crawler",
-		RootID:        "/",
-		Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
+		ID:     src.ID(),
+		Kind:   scriptcrawler.Kind,
+		Name:   "Example Crawler",
+		RootID: "/",
+		Credentials: map[string]string{
+			"script_path":     "/tmp/example.py",
+			"upload_drive_id": target.ID(),
+			"upload_proxy":    "http://upload-proxy.example:7890",
+		},
 		TeaserEnabled: true,
 	}); err != nil {
 		t.Fatalf("upsert crawler drive: %v", err)
@@ -171,6 +201,12 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	if len(target.ensureCalls) != 1 || target.ensureCalls[0] != "Script Crawlers/crawler-one" {
 		t.Fatalf("ensure calls = %#v, want crawler upload folder", target.ensureCalls)
 	}
+	if !target.ensureProxy || !target.uploadProxy {
+		t.Fatalf("scoped upload proxy ensure/upload = %v/%v, want true/true", target.ensureProxy, target.uploadProxy)
+	}
+	if scopedproxy.Configured(ctx) {
+		t.Fatal("crawler upload proxy leaked into the caller context")
+	}
 
 	got, err := cat.GetVideo(ctx, videoID)
 	if err != nil {
@@ -198,6 +234,135 @@ func TestRunOnceUploadsScriptCrawlerLocalVideo(t *testing.T) {
 	defer commonThumb.Close()
 	if _, err := jpeg.Decode(commonThumb); err != nil {
 		t.Fatalf("common thumbnail was not normalized to JPEG: %v", err)
+	}
+}
+
+func TestStartDriveUploadsOnlySelectedCrawlerWhileRunOnceRemainsGlobal(t *testing.T) {
+	ctx := context.Background()
+	cat := setupCatalog(t)
+	first := setupScriptCrawler(t, "crawler-first")
+	second := setupScriptCrawler(t, "crawler-second")
+	target := newFakeUploadDrive("target-drive", "pikpak", "target-root")
+	reg := newFakeRegistry()
+	reg.Add(first)
+	reg.Add(second)
+	reg.Add(target)
+	for _, src := range []*scriptcrawler.Driver{first, second} {
+		if err := cat.UpsertDrive(ctx, &catalog.Drive{
+			ID: src.ID(), Kind: scriptcrawler.Kind, Name: src.ID(), RootID: "/",
+			Credentials: map[string]string{
+				"script_path":     "/tmp/example.py",
+				"proxy":           "http://crawl-only-proxy.example:7890",
+				"upload_drive_id": target.ID(),
+			},
+			TeaserEnabled: true,
+		}); err != nil {
+			t.Fatalf("upsert crawler %s: %v", src.ID(), err)
+		}
+	}
+	firstVideoID := writeCrawlerVideo(t, cat, first, "first-source", ".mp4", []byte("first payload"), true)
+	secondVideoID := writeCrawlerVideo(t, cat, second, "second-source", ".mp4", []byte("second payload"), true)
+	m := New(Config{Catalog: cat, Registry: reg})
+
+	done, accepted := m.StartDrive(ctx, first.ID())
+	if !accepted {
+		t.Fatal("selected crawler migration was not accepted")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("run selected crawler: %v", err)
+	}
+	firstVideo, err := cat.GetVideo(ctx, firstVideoID)
+	if err != nil {
+		t.Fatalf("get first video: %v", err)
+	}
+	secondVideo, err := cat.GetVideo(ctx, secondVideoID)
+	if err != nil {
+		t.Fatalf("get second video: %v", err)
+	}
+	if firstVideo.DriveID != target.ID() {
+		t.Fatalf("first video drive = %q, want target", firstVideo.DriveID)
+	}
+	if secondVideo.DriveID != second.ID() {
+		t.Fatalf("second video drive = %q, want untouched crawler", secondVideo.DriveID)
+	}
+	if target.uploadCalls != 1 {
+		t.Fatalf("selected upload calls = %d, want 1", target.uploadCalls)
+	}
+	if reg.allCalls != 0 {
+		t.Fatalf("selected migration enumerated all drives %d time(s)", reg.allCalls)
+	}
+
+	if err := m.RunOnce(ctx); err != nil {
+		t.Fatalf("run global migration: %v", err)
+	}
+	secondVideo, err = cat.GetVideo(ctx, secondVideoID)
+	if err != nil {
+		t.Fatalf("get globally migrated second video: %v", err)
+	}
+	if secondVideo.DriveID != target.ID() {
+		t.Fatalf("second video drive after RunOnce = %q, want target", secondVideo.DriveID)
+	}
+	if target.uploadCalls != 2 {
+		t.Fatalf("global upload calls = %d, want 2 total", target.uploadCalls)
+	}
+	if reg.allCalls != 1 {
+		t.Fatalf("global migration enumerated all drives %d time(s), want 1", reg.allCalls)
+	}
+	if target.ensureProxy || target.uploadProxy {
+		t.Fatalf("crawl-only proxy leaked into upload ensure/upload = %v/%v", target.ensureProxy, target.uploadProxy)
+	}
+}
+
+func TestStartDriveRejectsBeforeReportingAcceptedWhenAnotherMigrationRuns(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cat := setupCatalog(t)
+	first := setupScriptCrawler(t, "crawler-first")
+	second := setupScriptCrawler(t, "crawler-second")
+	target := &blockingFakeUploadDrive{
+		fakeUploadDrive: newFakeUploadDrive("target-drive", "pikpak", "target-root"),
+		started:         make(chan struct{}, 1),
+		release:         make(chan struct{}),
+	}
+	reg := newFakeRegistry()
+	reg.Add(first)
+	reg.Add(second)
+	reg.Add(target)
+	for _, src := range []*scriptcrawler.Driver{first, second} {
+		if err := cat.UpsertDrive(ctx, &catalog.Drive{
+			ID: src.ID(), Kind: scriptcrawler.Kind, Name: src.ID(), RootID: "/",
+			Credentials:   map[string]string{"script_path": "/tmp/example.py", "upload_drive_id": target.ID()},
+			TeaserEnabled: true,
+		}); err != nil {
+			t.Fatalf("upsert crawler %s: %v", src.ID(), err)
+		}
+		writeCrawlerVideo(t, cat, src, src.ID()+"-source", ".mp4", []byte(src.ID()), true)
+	}
+	m := New(Config{Catalog: cat, Registry: reg})
+
+	firstDone, accepted := m.StartDrive(ctx, first.ID())
+	if !accepted {
+		t.Fatal("first migration was not accepted")
+	}
+	select {
+	case <-target.started:
+	case <-ctx.Done():
+		t.Fatalf("first migration did not reach upload: %v", ctx.Err())
+	}
+	if secondDone, accepted := m.StartDrive(ctx, second.ID()); accepted || secondDone != nil {
+		t.Fatalf("second migration accepted=%v done=%v, want busy rejection", accepted, secondDone)
+	}
+	close(target.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("finish first migration: %v", err)
+	}
+
+	secondDone, accepted := m.StartDrive(ctx, second.ID())
+	if !accepted {
+		t.Fatal("second migration was not accepted after the slot was released")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("finish second migration: %v", err)
 	}
 }
 

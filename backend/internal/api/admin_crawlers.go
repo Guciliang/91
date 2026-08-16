@@ -34,6 +34,7 @@ type crawlerDTO struct {
 	ScriptPath                  string           `json:"scriptPath"`
 	ScriptSourceURL             string           `json:"scriptSourceUrl,omitempty"`
 	Proxy                       string           `json:"proxy,omitempty"`
+	UploadProxy                 string           `json:"uploadProxy,omitempty"`
 	TargetNew                   string           `json:"targetNew,omitempty"`
 	UploadDriveID               string           `json:"uploadDriveId,omitempty"`
 	Paused                      bool             `json:"paused"`
@@ -59,13 +60,14 @@ type crawlerDTO struct {
 }
 
 type upsertCrawlerReq struct {
-	ID              string `json:"id"`
-	ScriptPath      string `json:"scriptPath"`
-	ScriptSourceURL string `json:"scriptSourceUrl"`
-	Proxy           string `json:"proxy"`
-	TargetNew       string `json:"targetNew"`
-	UploadDriveID   string `json:"uploadDriveId"`
-	TeaserEnabled   *bool  `json:"teaserEnabled,omitempty"`
+	ID              string  `json:"id"`
+	ScriptPath      string  `json:"scriptPath"`
+	ScriptSourceURL string  `json:"scriptSourceUrl"`
+	Proxy           string  `json:"proxy"`
+	UploadProxy     *string `json:"uploadProxy"`
+	TargetNew       string  `json:"targetNew"`
+	UploadDriveID   string  `json:"uploadDriveId"`
+	TeaserEnabled   *bool   `json:"teaserEnabled,omitempty"`
 }
 
 type crawlerPausedReq struct {
@@ -131,6 +133,7 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.Crawle
 		ScriptPath:                  strings.TrimSpace(d.Credentials["script_path"]),
 		ScriptSourceURL:             strings.TrimSpace(d.Credentials["script_source_url"]),
 		Proxy:                       strings.TrimSpace(d.Credentials["proxy"]),
+		UploadProxy:                 strings.TrimSpace(d.Credentials["upload_proxy"]),
 		TargetNew:                   strings.TrimSpace(d.Credentials["target_new"]),
 		UploadDriveID:               strings.TrimSpace(d.Credentials["upload_drive_id"]),
 		Paused:                      crawlerPaused(d),
@@ -217,6 +220,11 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		"proxy":             strings.TrimSpace(body.Proxy),
 		"target_new":        strings.TrimSpace(body.TargetNew),
 		"upload_drive_id":   strings.TrimSpace(body.UploadDriveID),
+	}
+	// Keep the new field backward-compatible with older admin clients: omitted
+	// means preserve, while an explicit empty string clears the upload proxy.
+	if body.UploadProxy != nil {
+		incoming["upload_proxy"] = strings.TrimSpace(*body.UploadProxy)
 	}
 	for k, v := range incoming {
 		creds[k] = v
@@ -788,29 +796,30 @@ func (a *AdminServer) handleDeleteCrawler(w http.ResponseWriter, r *http.Request
 	if a.OnStopDriveTasks != nil {
 		a.OnStopDriveTasks(id)
 	}
-
-	persistence.RLock()
-	defer persistence.RUnlock()
-	deletedScript, scriptErr := a.removeImportedCrawlerScript(d)
-	if d.Credentials == nil {
-		d.Credentials = map[string]string{}
+	if a.OnDriveDeleteCleanup == nil {
+		http.Error(w, "crawler video cleanup is not available", http.StatusInternalServerError)
+		return
 	}
-	delete(d.Credentials, "script_path")
-	delete(d.Credentials, "proxy")
-	delete(d.Credentials, "target_new")
-	delete(d.Credentials, "paused")
-	delete(d.Credentials, "builtin")
-	delete(d.Credentials, "python_path")
-	delete(d.Credentials, "config_json")
-	d.Status = "disconnected"
-	d.LastError = ""
-	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
+	deletedVideos, err := a.OnDriveDeleteCleanup(r.Context(), id)
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+
+	persistence.RLock()
+	deletedScript, scriptErr := a.removeImportedCrawlerScript(d)
+	deleteErr := a.Catalog.DeleteDrive(r.Context(), id)
+	persistence.RUnlock()
+	if deleteErr != nil {
+		writeErr(w, http.StatusInternalServerError, deleteErr)
+		return
+	}
+	if a.OnDriveRemoved != nil {
+		a.OnDriveRemoved(id)
+	}
 	resp := map[string]any{
 		"ok":            true,
-		"deletedVideos": 0,
+		"deletedVideos": deletedVideos,
 		"deletedScript": deletedScript,
 	}
 	if scriptErr != nil {

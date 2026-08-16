@@ -123,9 +123,7 @@ func New(c Config) *Driver {
 		d.proxyErr = err
 		return d
 	}
-	if transport, ok := streamClient.Transport.(*http.Transport); ok {
-		drives.ConfigureStreamTransport(transport)
-	}
+	drives.ConfigureStreamTransport(streamClient.Transport)
 	d.client = resty.NewWithClient(apiClient).
 		SetTimeout(30*time.Second).
 		SetHeader("Accept", "application/json, text/plain, */*")

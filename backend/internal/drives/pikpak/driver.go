@@ -132,9 +132,7 @@ func New(c Config) *Driver {
 		d.proxyErr = err
 		return d
 	}
-	if transport, ok := streamClient.Transport.(*http.Transport); ok {
-		drives.ConfigureStreamTransport(transport)
-	}
+	drives.ConfigureStreamTransport(streamClient.Transport)
 	d.client = resty.NewWithClient(apiClient).
 		SetTimeout(30*time.Second).
 		SetHeader("Accept", "application/json, text/plain, */*")
@@ -151,20 +149,12 @@ func (d *Driver) Init(ctx context.Context) error {
 	if d.proxyErr != nil {
 		return fmt.Errorf("pikpak proxy configuration: %w", d.proxyErr)
 	}
-	clearPersistedCaptcha := func() {
-		if d.captchaToken == "" {
-			return
-		}
-		d.captchaToken = ""
-		d.persistTokens()
-	}
-
 	if d.refreshToken != "" {
 		if err := d.refresh(ctx, d.refreshToken); err != nil {
 			if !IsCaptchaError(err) || d.username == "" || d.password == "" {
 				return err
 			}
-			clearPersistedCaptcha()
+			d.clearCaptchaToken()
 			if err := d.login(ctx); err != nil {
 				return fmt.Errorf("pikpak refresh captcha recovery login: %w", err)
 			}
@@ -172,7 +162,7 @@ func (d *Driver) Init(ctx context.Context) error {
 			// Persisted captcha tokens are short-lived. With a refresh token we can
 			// safely request a fresh captcha token after auth, and avoiding the
 			// stored value prevents known-stale tokens from poisoning startup.
-			clearPersistedCaptcha()
+			d.clearCaptchaToken()
 		}
 	} else {
 		if err := d.login(ctx); err != nil {

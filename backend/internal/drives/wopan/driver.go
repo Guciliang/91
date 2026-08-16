@@ -80,9 +80,7 @@ func New(c Config) *Driver {
 		d.proxyErr = err
 		return d
 	}
-	if transport, ok := streamClient.Transport.(*http.Transport); ok {
-		drives.ConfigureStreamTransport(transport)
-	}
+	drives.ConfigureStreamTransport(streamClient.Transport)
 	d.apiHTTPClient = apiClient
 	d.streamHTTPClient = streamClient
 	return d

@@ -10,15 +10,17 @@ import (
 	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/backup"
+	"github.com/video-site/backend/internal/backuptransfer"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives/quark"
 )
 
 type AdminServer struct {
-	Catalog *catalog.Catalog
-	Auth    *auth.Authenticator
-	Backups *backup.Manager
+	Catalog         *catalog.Catalog
+	Auth            *auth.Authenticator
+	Backups         *backup.Manager
+	BackupTransfers *backuptransfer.Manager
 	// Logs is the durable runtime log store exposed only through the
 	// administrator-authenticated routes below.
 	Logs *applog.Store
@@ -64,7 +66,11 @@ type AdminServer struct {
 	OnDeleteVideo                  func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
 	OnStartBlacklistSourceDelete   func(BlacklistSourceDeleteRequest) bool
 	GetBlacklistSourceDeleteStatus func() BlacklistSourceDeleteStatus
-	OnStartTagRetag                func() bool
+	// OnRemoveBlacklist owns the complete application-level restore operation:
+	// provider inspection, catalog mutation, source-delete coordination, and any
+	// post-restore generation/cache work. Tests may omit it for non-direct paths.
+	OnRemoveBlacklist func(ctx context.Context, videoID string) error
+	OnStartTagRetag   func() bool
 	// OnTagsChanged invalidates read-side tag caches after a catalog mutation.
 	OnTagsChanged                func()
 	GetTagJobStatus              func() TagJobStatus
@@ -165,6 +171,7 @@ type BlacklistSourceDeleteStatus struct {
 	Total        int    `json:"total"`
 	Processed    int    `json:"processed"`
 	Deleted      int    `json:"deleted"`
+	Skipped      int    `json:"skipped"`
 	Failed       int    `json:"failed"`
 	CurrentFile  string `json:"currentFile,omitempty"`
 	LastError    string `json:"lastError,omitempty"`
@@ -289,11 +296,20 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/backups/{id}/download", a.handleDownloadBackup)
 			r.Delete("/backups/{id}", a.handleDeleteBackup)
 			r.Post("/backups/{id}/restore", a.handleRestoreBackup)
+			r.Post("/backups/{id}/transfers", a.handleCreateBackupTransfer)
 			r.Post("/backup-uploads", a.handleBeginBackupUpload)
 			r.Get("/backup-uploads/{id}", a.handleBackupUploadStatus)
 			r.Put("/backup-uploads/{id}/chunks/{index}", a.handleBackupUploadChunk)
 			r.Post("/backup-uploads/{id}/finalize", a.handleFinalizeBackupUpload)
 			r.Delete("/backup-uploads/{id}", a.handleCancelBackupUpload)
+			r.Get("/backup-transfers", a.handleListBackupTransfers)
+			r.Get("/backup-receives", a.handleListBackupReceiveTransfers)
+			r.Delete("/backup-receives/{id}", a.handleCancelBackupReceiveTransfer)
+			r.Delete("/backup-transfers/{id}", a.handleCancelBackupTransfer)
+			r.Post("/backup-transfers/{id}/retry", a.handleRetryBackupTransfer)
+			r.Get("/backup-receive-tokens", a.handleListBackupReceiveTokens)
+			r.Post("/backup-receive-tokens", a.handleCreateBackupReceiveToken)
+			r.Delete("/backup-receive-tokens/{id}", a.handleRevokeBackupReceiveToken)
 			r.Get("/jobs/scan-all/status", a.handleScanAllJobStatus)
 			r.Post("/jobs/scan-all/run", a.handleRunScanAllJob)
 			// 兼容旧前端缓存；旧路径现在也遵循“只扫盘 + 去重”的语义。
@@ -301,5 +317,17 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
 			r.Post("/tasks/stop", a.handleStopAllTasks)
 		})
+	})
+
+	// Peer routes use narrowly scoped receive tokens rather than browser login
+	// sessions. Keeping them outside /admin/api prevents machine credentials
+	// from acquiring unrelated administrator capabilities.
+	r.Route(backuptransfer.PeerBackupPath, func(r chi.Router) {
+		r.Get("/capabilities", a.handlePeerBackupCapabilities)
+		r.Post("/imports", a.handlePeerBeginBackupImport)
+		r.Get("/imports/{id}", a.handlePeerBackupImportStatus)
+		r.Put("/imports/{id}/ranges/{index}", a.handlePeerBackupImportRange)
+		r.Post("/imports/{id}/finalize", a.handlePeerFinalizeBackupImport)
+		r.Delete("/imports/{id}", a.handlePeerCancelBackupImport)
 	})
 }

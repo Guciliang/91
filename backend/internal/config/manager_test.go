@@ -28,6 +28,8 @@ nightly:
   cron_hour: 3
 dedupe:
   duplicate_review_enabled: false
+# obsolete template placeholder
+drives: []
 future_section:
   keep_me: true
 `)
@@ -56,13 +58,19 @@ future_section:
 	if strings.Contains(text, "cron_hour:") || !strings.Contains(text, "start_time: 04:25") {
 		t.Fatalf("nightly schema was not migrated:\n%s", text)
 	}
+	if !strings.Contains(text, "timezone: Asia/Shanghai") {
+		t.Fatalf("nightly timezone was not made explicit:\n%s", text)
+	}
 	if strings.Contains(text, "duplicate_review_enabled") || strings.Contains(text, "dedupe:") {
 		t.Fatalf("retired duplicate-review setting remains:\n%s", text)
+	}
+	if strings.Contains(text, "drives:") || strings.Contains(text, "obsolete template placeholder") {
+		t.Fatalf("retired empty drive placeholder remains:\n%s", text)
 	}
 	if !strings.Contains(text, "builtin_pack_enabled: false") {
 		t.Fatalf("built-in tag setting was not migrated:\n%s", text)
 	}
-	want := LiveSettings{NightlyStartTime: "04:25", BuiltinTagsEnabled: false}
+	want := LiveSettings{NightlyStartTime: "04:25", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: false}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want %#v", got, want)
 	}
@@ -79,13 +87,45 @@ func TestManagerYAMLValuesWinOverLegacySQLiteValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := LiveSettings{NightlyStartTime: "02:10", BuiltinTagsEnabled: true}
+	want := LiveSettings{NightlyStartTime: "02:10", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want YAML %#v", got, want)
 	}
 	data, _ := os.ReadFile(path)
 	if strings.Contains(string(data), "cron_hour:") || strings.Contains(string(data), "duplicate_review_enabled") {
 		t.Fatalf("retired fields remain:\n%s", data)
+	}
+}
+
+func TestManagerRemovesNonEmptyLegacyDriveDefinitions(t *testing.T) {
+	source := `nightly:
+  start_time: "01:00"
+  timezone: "Etc/UTC"
+tags:
+  builtin_pack_enabled: true
+drives:
+  - id: "operator-copy"
+    kind: "webdav"
+    params:
+      base_url: "https://example.com/dav"
+`
+	manager, path := newManagerForTest(t, source)
+	changed, err := manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("non-empty legacy drive data was not removed")
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(written)
+	for _, removed := range []string{"drives:", "operator-copy", "base_url", "example.com/dav"} {
+		if strings.Contains(text, removed) {
+			t.Fatalf("retired drive data %q remains:\n%s", removed, written)
+		}
 	}
 }
 
@@ -118,7 +158,7 @@ func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *tes
 	if err != nil || !changed {
 		t.Fatalf("reload changed=%v err=%v", changed, err)
 	}
-	want := LiveSettings{NightlyStartTime: "06:30", BuiltinTagsEnabled: true}
+	want := LiveSettings{NightlyStartTime: "06:30", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("settings = %#v, want %#v", got, want)
 	}
@@ -138,7 +178,7 @@ func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *tes
 
 func TestRestartRequiredComparisonIgnoresOnlyLivePaths(t *testing.T) {
 	before := []byte("nightly:\n  start_time: \"01:00\"\nfuture:\n  value: one\n")
-	liveOnly := []byte("nightly:\n  start_time: \"03:15\"\ntags:\n  builtin_pack_enabled: false\nfuture:\n  value: one\n")
+	liveOnly := []byte("nightly:\n  start_time: \"03:15\"\n  timezone: Asia/Shanghai\ntags:\n  builtin_pack_enabled: false\nfuture:\n  value: one\n")
 	if hasRestartRequiredChange(before, liveOnly) {
 		t.Fatal("live-only values were reported as restart-required")
 	}

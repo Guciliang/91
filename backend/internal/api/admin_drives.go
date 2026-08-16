@@ -197,6 +197,7 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "unsupported drive kind", http.StatusBadRequest)
 		return
 	}
+	patchPikPakCredentials := body.Kind == "pikpak" && existing != nil && existing.Kind == "pikpak"
 	if body.Kind == scriptcrawler.Kind {
 		credentials, err := mergeScriptCrawlerCredentials(existing, body.Credentials)
 		if err != nil {
@@ -206,6 +207,11 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		body.Credentials = credentials
 	} else if body.Kind == "googledrive" {
 		body.Credentials = mergeGoogleDriveCredentials(existing, body.Credentials)
+	} else if body.Kind == "pikpak" {
+		// PikPak's access/captcha/device tokens are refreshed at runtime. Treat the
+		// submitted values as a patch so an edit cannot replace those hidden keys
+		// with a stale form snapshot.
+		body.Credentials = nonEmptyCredentials(body.Credentials)
 	} else if body.Kind == "quark" || body.Kind == "localstorage" || body.Kind == "guangyapan" || body.Kind == "webdav" {
 		// 按键合并、空值沿用旧值：这些网盘的编辑表单允许只改某几个字段，
 		// 其它 token / 路径 / 开关字段应保留旧值。
@@ -228,14 +234,11 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 
 	// skipDirIds 解析顺序：
 	//   1. 请求显式带了（包括空数组）→ 用请求值（空数组 = 清空）
-	//   2. 请求没带 + 编辑现有 drive → 沿用旧值
-	//   3. 请求没带 + 新建 drive → nil（不跳过任何目录）
+	//   2. 请求没带 → 在 catalog 的冲突更新 SQL 中保留当前值，避免这里先读到
+	//      旧值后与跳过目录自动保存发生丢失更新；新建 drive 仍写入空数组。
 	var skipDirIDs []string
-	switch {
-	case body.SkipDirIDs != nil:
+	if body.SkipDirIDs != nil {
 		skipDirIDs = *body.SkipDirIDs
-	case existing != nil:
-		skipDirIDs = existing.SkipDirIDs
 	}
 
 	d := &catalog.Drive{
@@ -246,8 +249,18 @@ func (a *AdminServer) handleUpsertDrive(w http.ResponseWriter, r *http.Request) 
 		TeaserEnabled: teaserEnabled,
 		SkipDirIDs:    skipDirIDs,
 	}
-	if err := a.Catalog.UpsertDrive(r.Context(), d); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+	var saveErr error
+	if patchPikPakCredentials && body.SkipDirIDs == nil {
+		saveErr = a.Catalog.UpsertDrivePatchingCredentialsPreservingSkipDirIDs(r.Context(), d)
+	} else if patchPikPakCredentials {
+		saveErr = a.Catalog.UpsertDrivePatchingCredentials(r.Context(), d)
+	} else if body.SkipDirIDs == nil {
+		saveErr = a.Catalog.UpsertDrivePreservingSkipDirIDs(r.Context(), d)
+	} else {
+		saveErr = a.Catalog.UpsertDrive(r.Context(), d)
+	}
+	if saveErr != nil {
+		writeErr(w, http.StatusInternalServerError, saveErr)
 		return
 	}
 	if a.OnDriveSaved != nil {

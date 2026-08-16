@@ -179,6 +179,7 @@ export type CredentialField = {
   key: string;
   label: string;
   placeholder: string;
+  methodLabel?: "方式一" | "方式二";
   type?: "text" | "select";
   options?: Array<{ value: string; label: string }>;
   multiline?: boolean;
@@ -266,22 +267,58 @@ function cloudSecurityFields(cryptEnabled = false): CredentialField[] {
 }
 
 export function credentialFields(kind: Kind, credentials: Record<string, string> = {}): CredentialField[] {
-	const cryptEnabled = ["1", "t", "true"].includes((credentials.crypt_enabled ?? "").toLowerCase());
-	const cloudBaseFields = (() => {
+	const cryptEnabled = ["1", "t", "true"].includes(
+		(credentials.crypt_enabled ?? "").trim().toLowerCase()
+	);
+	const cloudBaseFields = ((): CredentialField[] | undefined => {
 		switch (kind) {
 			case "quark":
-				return [{ key: "cookie", label: "Cookie", placeholder: "__pus=...; __puus=...; ...", multiline: true, required: true }];
+				return [
+					{
+						key: "cookie",
+						label: "Cookie",
+						placeholder: "__pus=...; __puus=...; ...",
+						methodLabel: "方式二",
+						multiline: true,
+						required: true,
+					},
+				];
 			case "p115":
-				return [{ key: "cookie", label: "Cookie", placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx", multiline: true, required: true }];
+				return [
+					{
+						key: "cookie",
+						label: "Cookie",
+						placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
+						methodLabel: "方式二",
+						multiline: true,
+						required: true,
+					},
+				];
 			case "p123":
 				return [
-					{ key: "username", label: "手机号/邮箱", placeholder: "手机号或邮箱" },
-					{ key: "password", label: "密码", placeholder: "123 网盘密码" },
+					{
+						key: "username",
+						label: "手机号/邮箱",
+						placeholder: "手机号或邮箱",
+						methodLabel: "方式二",
+					},
+					{ key: "password", label: "密码", placeholder: "123网盘密码" },
 				];
 			case "pikpak":
 				return [
-					{ key: "username", label: "用户名 / 邮箱", placeholder: "user@example.com", required: true },
-					{ key: "password", label: "密码", placeholder: "PikPak 密码", required: true },
+					{
+						key: "username",
+						label: "邮箱",
+						placeholder: "user@example.com",
+						methodLabel: "方式一",
+					},
+					{ key: "password", label: "密码", placeholder: "PikPak 密码" },
+					{
+						key: "refresh_token",
+						label: "refresh_token",
+						placeholder: "邮箱密码登录不可用时填写",
+						methodLabel: "方式二",
+					},
 				];
 			case "wopan":
 				return [
@@ -290,20 +327,59 @@ export function credentialFields(kind: Kind, credentials: Record<string, string>
 				];
 			case "guangyapan":
 				return [
-					{ key: "refresh_token", label: "refresh_token", placeholder: "推荐填写，服务端会自动刷新 access_token", multiline: true },
-					{ key: "access_token", label: "access_token", placeholder: "Bearer eyJ... 或直接粘贴 token", multiline: true },
+					{
+						key: "refresh_token",
+						label: "refresh_token",
+						placeholder: "推荐填写，服务端会自动刷新 access_token",
+						multiline: true,
+					},
+					{
+						key: "access_token",
+						label: "access_token",
+						placeholder: "Bearer eyJ... 或直接粘贴 token",
+						multiline: true,
+					},
 				];
 			case "onedrive":
-				return [{ key: "refresh_token", label: "refresh_token", placeholder: "OpenList OneDrive refresh_token", multiline: true, required: true }];
+				return [
+					{
+						key: "refresh_token",
+						label: "refresh_token",
+						placeholder: "OpenList OneDrive refresh_token",
+						multiline: true,
+						required: true,
+					},
+				];
 			case "googledrive":
 				return [
-					{ key: "client_id", label: "客户端 ID", placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com", required: true },
-					{ key: "client_secret", label: "客户端密钥", placeholder: "Google OAuth client secret", required: true },
-					{ key: "refresh_token", label: "refresh_token", placeholder: "Google OAuth refresh_token", multiline: true, required: true },
+					{
+						key: "client_id",
+						label: "客户端 ID",
+						placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
+						required: true,
+					},
+					{
+						key: "client_secret",
+						label: "客户端密钥",
+						placeholder: "Google OAuth client secret",
+						required: true,
+					},
+					{
+						key: "refresh_token",
+						label: "refresh_token",
+						placeholder: "Google OAuth refresh_token",
+						multiline: true,
+						required: true,
+					},
 				];
 			case "webdav":
 				return [
-					{ key: "base_url", label: "WebDAV 地址", placeholder: "https://openlist.example.com/dav", required: true },
+					{
+						key: "base_url",
+						label: "WebDAV 地址",
+						placeholder: "https://openlist.example.com/dav",
+						required: true,
+					},
 					{ key: "username", label: "用户名", placeholder: "WebDAV 用户名", required: true },
 					{ key: "password", label: "密码", placeholder: "WebDAV 密码", required: true },
 					{
@@ -322,149 +398,32 @@ export function credentialFields(kind: Kind, credentials: Record<string, string>
 				return undefined;
 		}
 	})();
-	if (cloudBaseFields) return [...cloudBaseFields, ...cloudSecurityFields(cryptEnabled)];
+	if (cloudBaseFields) {
+		return [...cloudBaseFields, ...cloudSecurityFields(cryptEnabled)];
+	}
 
-  switch (kind) {
-    case "quark":
-      return [
-        {
-          key: "cookie",
-          label: "Cookie",
-          placeholder: "__pus=...; __puus=...; ...",
-          multiline: true,
-          required: true,
-        },
-		...cloudSecurityFields(),
-      ];
-    case "p115":
-      return [
-        {
-          key: "cookie",
-          label: "Cookie",
-          placeholder: "UID=xxx; CID=xxx; SEID=xxx; KID=xxx",
-          multiline: true,
-          required: true,
-		},
-		...cloudSecurityFields(),
-      ];
-    case "p123":
-      return [
-        {
-          key: "username",
-          label: "手机号/邮箱",
-          placeholder: "手机号或邮箱",
-		},
-		...cloudSecurityFields(),
-        {
-          key: "password",
-          label: "密码",
-          placeholder: "123网盘密码",
-		},
-		...cloudSecurityFields(),
-      ];
-    case "pikpak":
-      return [
-        {
-          key: "username",
-          label: "用户名 / 邮箱",
-          placeholder: "user@example.com",
-          required: true,
-		},
-		...cloudSecurityFields(),
-        {
-          key: "password",
-          label: "密码",
-          placeholder: "PikPak 密码",
-          required: true,
-		},
-		...cloudSecurityFields(),
-      ];
-    case "wopan":
-      return [
-        {
-          key: "access_token",
-          label: "access_token",
-          placeholder: "",
-          required: true,
-		},
-		...cloudSecurityFields(),
-        {
-          key: "refresh_token",
-          label: "refresh_token",
-          placeholder: "",
-          required: true,
-		},
-		...cloudSecurityFields(),
-      ];
-    case "guangyapan":
-      return [
-        {
-          key: "refresh_token",
-          label: "refresh_token",
-          placeholder: "推荐填写，服务端会自动刷新 access_token",
-          multiline: true,
-		},
-		...cloudSecurityFields(),
-        {
-          key: "access_token",
-          label: "access_token",
-          placeholder: "Bearer eyJ... 或直接粘贴 token",
-          multiline: true,
-        },
-      ];
-    case "onedrive":
-      return [
-        {
-          key: "refresh_token",
-          label: "refresh_token",
-          placeholder: "OpenList OneDrive refresh_token",
-          multiline: true,
-          required: true,
-        },
-      ];
-    case "googledrive":
-      return [
-        {
-          key: "client_id",
-          label: "客户端 ID",
-          placeholder: "xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
-          required: true,
-        },
-        {
-          key: "client_secret",
-          label: "客户端密钥",
-          placeholder: "Google OAuth client secret",
-          required: true,
-        },
-        {
-          key: "refresh_token",
-          label: "refresh_token",
-          placeholder: "Google OAuth refresh_token",
-          multiline: true,
-          required: true,
-        },
-      ];
-    case "localstorage":
-      return [
-        {
-          key: "path",
-          label: "本地目录路径",
-          placeholder: "/mnt/videos",
-          required: true,
-        },
-        {
-          key: "strm_allow_outside_root",
-          label: ".strm 允许指向目录外",
-          placeholder: "",
-          type: "select",
-          defaultValue: "false",
-          options: [
-            { value: "false", label: "关闭（默认，仅允许目录内路径）" },
-            { value: "true", label: "开启（允许任意本地路径）" },
-          ],
-        },
-      ];
-    default:
-      return [];
-  }
+	switch (kind) {
+		case "localstorage":
+			return [
+				{
+					key: "path",
+					label: "本地目录路径",
+					placeholder: "/mnt/videos",
+					required: true,
+				},
+				{
+					key: "strm_allow_outside_root",
+					label: ".strm 允许指向目录外",
+					placeholder: "",
+					type: "select",
+					defaultValue: "false",
+					options: [
+						{ value: "false", label: "关闭（默认，仅允许目录内路径）" },
+						{ value: "true", label: "开启（允许任意本地路径）" },
+					],
+				},
+			];
+		default:
+			return [];
+	}
 }

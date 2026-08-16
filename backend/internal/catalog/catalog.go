@@ -127,27 +127,29 @@ func (c *Catalog) BackupTo(ctx context.Context, destination string) error {
 // ---------- Video ----------
 
 type Video struct {
-	ID                string   `json:"id"`
-	DriveID           string   `json:"driveId"`
-	FileID            string   `json:"fileId"`
-	FileName          string   `json:"fileName"`
-	ContentHash       string   `json:"contentHash"`
-	SampledSHA256     string   `json:"sampledSha256"`
-	FingerprintStatus string   `json:"fingerprintStatus"`
-	FingerprintError  string   `json:"fingerprintError"`
-	ParentID          string   `json:"parentId"`
-	DirName           string   `json:"dirName"`
-	Title             string   `json:"title"`
-	Author            string   `json:"author"`
-	Tags              []string `json:"tags"`
-	DurationSeconds   int      `json:"durationSeconds"`
-	Size              int64    `json:"size"`
-	Ext               string   `json:"ext"`
-	Quality           string   `json:"quality"`
-	ThumbnailURL      string   `json:"thumbnailUrl"`
-	PreviewFileID     string   `json:"previewFileId"`
-	PreviewLocal      string   `json:"previewLocal"`
-	PreviewStatus     string   `json:"previewStatus"`
+	ID                 string    `json:"id"`
+	DriveID            string    `json:"driveId"`
+	FileID             string    `json:"fileId"`
+	FileName           string    `json:"fileName"`
+	ContentHash        string    `json:"contentHash"`
+	SampledSHA256      string    `json:"sampledSha256"`
+	FingerprintStatus  string    `json:"fingerprintStatus"`
+	FingerprintError   string    `json:"fingerprintError"`
+	ParentID           string    `json:"parentId"`
+	DirName            string    `json:"dirName"`
+	Title              string    `json:"title"`
+	Author             string    `json:"author"`
+	Tags               []string  `json:"tags"`
+	DurationSeconds    int       `json:"durationSeconds"`
+	Size               int64     `json:"size"`
+	Ext                string    `json:"ext"`
+	Quality            string    `json:"quality"`
+	ThumbnailURL       string    `json:"thumbnailUrl"`
+	ThumbnailUpdatedAt time.Time `json:"thumbnailUpdatedAt"`
+	PreviewFileID      string    `json:"previewFileId"`
+	PreviewLocal       string    `json:"previewLocal"`
+	PreviewUpdatedAt   time.Time `json:"previewUpdatedAt"`
+	PreviewStatus      string    `json:"previewStatus"`
 	// TranscodeStatus：浏览器兼容性转码状态。
 	// ''=未检测 / pending=已入队 / ready=已转码 / skipped=无需转码 / failed=失败。
 	TranscodeStatus  string    `json:"transcodeStatus"`
@@ -171,6 +173,35 @@ type Video struct {
 
 func (c *Catalog) UpsertVideo(ctx context.Context, v *Video) error {
 	existed := c.videoExists(ctx, v.ID)
+	storedTags, err := upsertVideoRow(ctx, c.db, v)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		if len(storedTags) > 0 {
+			return c.replaceVideoTags(ctx, v.ID, storedTags, "manual", true, true)
+		}
+		assignments, err := c.MatchTagAssignments(ctx, v.Title, v.FileName, v.Author, v.DirName)
+		if err != nil {
+			return err
+		}
+		if len(assignments) > 0 {
+			_, err = c.ReplaceAutoVideoTags(ctx, v.ID, assignments)
+			return err
+		}
+	}
+	return nil
+}
+
+type videoRowExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+// upsertVideoRow owns the videos-table statement without opening a transaction.
+// Ordinary scans call it through UpsertVideo; tombstone restoration calls it
+// with an existing transaction so the row, tag assignments, and tombstone can
+// move to their new state atomically.
+func upsertVideoRow(ctx context.Context, exec videoRowExecer, v *Video) ([]string, error) {
 	v.ContentHash = normalizeContentHash(v.ContentHash)
 	v.SampledSHA256 = normalizeContentHash(v.SampledSHA256)
 	fingerprintStatus := nullableStatus(v.FingerprintStatus)
@@ -185,19 +216,39 @@ func (c *Catalog) UpsertVideo(ctx context.Context, v *Video) error {
 		v.CreatedAt = time.UnixMilli(now)
 	}
 	v.UpdatedAt = time.UnixMilli(now)
+	thumbnailUpdatedAt := int64(0)
+	if v.ThumbnailURL != "" {
+		if v.ThumbnailUpdatedAt.IsZero() {
+			v.ThumbnailUpdatedAt = time.UnixMilli(now)
+		}
+		thumbnailUpdatedAt = v.ThumbnailUpdatedAt.UnixMilli()
+	} else {
+		v.ThumbnailUpdatedAt = time.Time{}
+	}
+	previewUpdatedAt := int64(0)
+	if v.PreviewLocal != "" && v.PreviewStatus == "ready" {
+		if v.PreviewUpdatedAt.IsZero() {
+			v.PreviewUpdatedAt = time.UnixMilli(now)
+		}
+		previewUpdatedAt = v.PreviewUpdatedAt.UnixMilli()
+	} else {
+		v.PreviewUpdatedAt = time.Time{}
+	}
 
-	_, err := c.db.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO videos (
   id, drive_id, file_id, file_name, content_hash, sampled_sha256, fingerprint_status, fingerprint_error, parent_id, dir_name, title, author, tags,
-  duration_seconds, size_bytes, ext, quality, thumbnail_url, thumbnail_status,
-	  preview_file_id, preview_local, preview_status,
-	  views, last_viewed_at, favorites, comments, likes, dislikes,
+	  duration_seconds, size_bytes, ext, quality, thumbnail_url, thumbnail_updated_at, thumbnail_status,
+	  preview_file_id, preview_local, preview_updated_at, preview_status,
+	  transcode_status, transcode_error, transcoded_file_id, transcoded_size,
+	  views, last_viewed_at, favorites, comments, likes, last_liked_at, dislikes,
 	  hidden, badges, description, published_at, created_at, updated_at
 	) VALUES (
 	  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-	  ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
-	  ?, ?, ?,
-	  ?, ?, ?, ?, ?, ?,
+	  ?, ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
+	  ?, ?, ?, ?,
+	  ?, ?, ?, ?,
+	  ?, ?, ?, ?, ?, ?, ?,
 	  ?, ?, ?, ?, ?, ?
 	)
 ON CONFLICT(id) DO UPDATE SET
@@ -239,6 +290,13 @@ ON CONFLICT(id) DO UPDATE SET
   ext             = excluded.ext,
   quality         = excluded.quality,
   thumbnail_url   = excluded.thumbnail_url,
+	thumbnail_updated_at = CASE
+	                    WHEN COALESCE(excluded.thumbnail_url, '') = '' THEN 0
+	                    WHEN COALESCE(excluded.thumbnail_url, '') != COALESCE(videos.thumbnail_url, '')
+	                         OR COALESCE(videos.thumbnail_updated_at, 0) = 0
+	                      THEN MAX(COALESCE(videos.thumbnail_updated_at, 0) + 1, excluded.thumbnail_updated_at)
+	                    ELSE videos.thumbnail_updated_at
+	                  END,
   -- thumbnail_url 写非空就意味着文件已就绪（要么 worker 抽帧填的本地 /p/thumb/<id>，
   -- 要么网盘 API 直接给的远程 URL，要么管理员手动指定）。同步把 status 标 'ready'，
   -- 避免出现 "url 非空 + status='pending'" 的脏状态。url 被改成空（本调用不发生，
@@ -252,29 +310,17 @@ ON CONFLICT(id) DO UPDATE SET
   updated_at      = excluded.updated_at
 `,
 		v.ID, v.DriveID, v.FileID, v.FileName, v.ContentHash, v.SampledSHA256, fingerprintStatus, v.FingerprintError, v.ParentID, v.DirName, v.Title, v.Author, string(tagsJSON),
-		v.DurationSeconds, v.Size, v.Ext, v.Quality, v.ThumbnailURL, v.ThumbnailURL,
-		v.PreviewFileID, v.PreviewLocal, nullableStatus(v.PreviewStatus),
-		v.Views, unixMilliOrZero(v.LastViewedAt), v.Favorites, v.Comments, v.Likes, v.Dislikes,
+		v.DurationSeconds, v.Size, v.Ext, v.Quality, v.ThumbnailURL, thumbnailUpdatedAt, v.ThumbnailURL,
+		v.PreviewFileID, v.PreviewLocal, previewUpdatedAt, nullableStatus(v.PreviewStatus),
+		v.TranscodeStatus, v.TranscodeError, v.TranscodedFileID, v.TranscodedSize,
+		v.Views, unixMilliOrZero(v.LastViewedAt), v.Favorites, v.Comments, v.Likes, unixMilliOrZero(v.LastLikedAt), v.Dislikes,
 		boolToInt(v.Hidden), string(badgesJSON), v.Description,
 		v.PublishedAt.UnixMilli(), v.CreatedAt.UnixMilli(), v.UpdatedAt.UnixMilli(),
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if !existed {
-		if len(storedTags) > 0 {
-			return c.replaceVideoTags(ctx, v.ID, storedTags, "manual", true, true)
-		}
-		assignments, err := c.MatchTagAssignments(ctx, v.Title, v.FileName, v.Author, v.DirName)
-		if err != nil {
-			return err
-		}
-		if len(assignments) > 0 {
-			_, err = c.ReplaceAutoVideoTags(ctx, v.ID, assignments)
-			return err
-		}
-	}
-	return nil
+	return storedTags, nil
 }
 
 func nullableStatus(s string) string {
@@ -285,9 +331,20 @@ func nullableStatus(s string) string {
 }
 
 func (c *Catalog) UpdatePreview(ctx context.Context, id, previewLocal, status string) error {
+	now := time.Now().UnixMilli()
 	_, err := c.db.ExecContext(ctx,
-		`UPDATE videos SET preview_file_id = '', preview_local = ?, preview_status = ?, updated_at = ? WHERE id = ?`,
-		previewLocal, status, time.Now().UnixMilli(), id)
+		`UPDATE videos
+		    SET preview_file_id = '',
+		        preview_local = ?,
+		        preview_updated_at = CASE
+		          WHEN ? = 'ready' AND COALESCE(?, '') != ''
+		            THEN MAX(COALESCE(preview_updated_at, 0) + 1, ?)
+		          ELSE 0
+		        END,
+		        preview_status = ?,
+		        updated_at = ?
+		  WHERE id = ?`,
+		previewLocal, status, previewLocal, now, status, now, id)
 	return err
 }
 
@@ -585,9 +642,13 @@ type VideoMetaPatch struct {
 func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPatch) error {
 	parts := []string{}
 	args := []any{}
+	now := time.Now().UnixMilli()
 	if p.ThumbnailURL != "" {
-		parts = append(parts, "thumbnail_url = ?")
-		args = append(args, p.ThumbnailURL)
+		parts = append(parts,
+			"thumbnail_url = ?",
+			"thumbnail_updated_at = MAX(COALESCE(thumbnail_updated_at, 0) + 1, ?)",
+		)
+		args = append(args, p.ThumbnailURL, now)
 	}
 	switch {
 	case p.ThumbnailStatus != "":
@@ -644,7 +705,7 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 		return nil
 	}
 	parts = append(parts, "updated_at = ?")
-	args = append(args, time.Now().UnixMilli())
+	args = append(args, now)
 	args = append(args, id)
 	q := `UPDATE videos SET ` + strings.Join(parts, ", ") + ` WHERE id = ?`
 	if _, err := c.db.ExecContext(ctx, q, args...); err != nil {
@@ -1044,9 +1105,63 @@ const (
 	DeletedVideoRestorePolicyNone    = "none"
 	DeletedVideoRestorePolicyScan    = "scan"
 	DeletedVideoRestorePolicyCrawler = "crawler"
+	// DeletedVideoRestorePolicyDirect covers sources whose file is retained by
+	// this application but that cannot be enumerated, so no scan or crawl will
+	// ever rediscover them. Local uploads are the only such source today: the
+	// drive supports Stat but returns ErrNotSupported for List. The tombstone
+	// already carries the full restore payload, so the row is rebuilt directly
+	// instead of waiting for a rediscovery pass that would never come.
+	DeletedVideoRestorePolicyDirect = "direct"
 )
 
-var ErrDeletedVideoNotRestorable = errors.New("deleted video is not restorable")
+var (
+	ErrDeletedVideoNotRestorable = errors.New("deleted video is not restorable")
+	// ErrDeletedVideoSourceCheckRequired prevents catalog-only callers from
+	// bypassing the source inspection that a direct restore requires.
+	ErrDeletedVideoSourceCheckRequired = errors.New("deleted video source check is required")
+	// ErrDeletedVideoSourceMissing means a direct restore was attempted but the
+	// retained source file is gone, so rebuilding the row would publish a video
+	// that cannot be played.
+	ErrDeletedVideoSourceMissing = errors.New("deleted video source file is missing")
+)
+
+const deletedVideoRestorePayloadVersion = 1
+
+// DeletedVideoSourceInfo is the provider-owned state observed immediately
+// before a direct restore. Catalog uses it both to reject unusable files and to
+// invalidate stale source-derived metadata when a retained file was replaced.
+type DeletedVideoSourceInfo struct {
+	Size    int64
+	ModTime time.Time
+}
+
+type DeletedVideoRestoreResult struct {
+	RestorePolicy string
+	Video         *Video
+}
+
+type deletedVideoRestorePayload struct {
+	Version        int                                `json:"version"`
+	Video          *Video                             `json:"video"`
+	TagsManual     bool                               `json:"tagsManual"`
+	TagAssignments []deletedVideoTagRestoreAssignment `json:"tagAssignments,omitempty"`
+}
+
+// deletedVideoTagRestoreAssignment keeps both sides of a tag relation. The tag
+// definition may be pruned when the video is tombstoned, while assignment
+// source/evidence determines whether future automatic retagging may replace it.
+type deletedVideoTagRestoreAssignment struct {
+	Label         string `json:"label"`
+	Source        string `json:"source"`
+	Evidence      string `json:"evidence,omitempty"`
+	CreatedAt     int64  `json:"createdAt,omitempty"`
+	TagAliases    string `json:"tagAliases,omitempty"`
+	TagMatchRules string `json:"tagMatchRules,omitempty"`
+	TagSource     string `json:"tagSource,omitempty"`
+	TagOrigin     string `json:"tagOrigin,omitempty"`
+	TagCreatedAt  int64  `json:"tagCreatedAt,omitempty"`
+	TagUpdatedAt  int64  `json:"tagUpdatedAt,omitempty"`
+}
 
 type DeleteVideoTombstoneOptions struct {
 	Reason           string
@@ -1079,21 +1194,21 @@ func (c *Catalog) DeleteVideoWithTombstoneOptions(ctx context.Context, id string
 	if options.Reason != DeletedVideoReasonDuplicate {
 		options.CanonicalVideoID = ""
 	}
-	restoreVideo, err := c.GetVideo(ctx, id)
-	if err != nil {
-		return err
-	}
-	restorePayloadData, err := json.Marshal(restoreVideo)
-	if err != nil {
-		return fmt.Errorf("catalog: encode deleted video restore payload: %w", err)
-	}
-	restorePayload := string(restorePayloadData)
-
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	restoreVideo, err := scanVideo(tx.QueryRowContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos WHERE id = ?`, id))
+	if err != nil {
+		return err
+	}
+	restorePayloadData, err := buildDeletedVideoRestorePayload(ctx, tx, restoreVideo)
+	if err != nil {
+		return fmt.Errorf("catalog: encode deleted video restore payload: %w", err)
+	}
+	restorePayload := string(restorePayloadData)
 
 	restoreVideo.ContentHash = normalizeContentHash(restoreVideo.ContentHash)
 
@@ -1422,82 +1537,309 @@ func (c *Catalog) PurgeDeletedVideo(ctx context.Context, id string) error {
 
 // RemoveDeletedVideo 允许可扫描来源在后续任务中重新入库。本函数不会触发
 // 扫描或爬取。爬虫来源会保留墓碑和 seen 记录，并标记为待目录扫描恢复，
-// 使下一轮爬取仍将其当作已见来源跳过。
+// 使下一轮爬取仍将其当作已见来源跳过。direct 来源必须通过
+// RestoreDeletedVideo 提供源文件检查，避免 catalog-only 调用绕过安全边界。
 func (c *Catalog) RemoveDeletedVideo(ctx context.Context, id string) error {
+	_, err := c.RestoreDeletedVideo(ctx, id, nil)
+	return err
+}
+
+// RestoreDeletedVideo removes or advances a tombstone according to its policy.
+// Direct restoration is the only branch that creates a catalog row, so it
+// requires provider-owned source inspection and returns the restored video for
+// application-level generation queues. Its row, tag assignments, and tombstone
+// deletion commit in one SQLite transaction.
+func (c *Catalog) RestoreDeletedVideo(
+	ctx context.Context,
+	id string,
+	inspectSource func(driveID, fileID string) (DeletedVideoSourceInfo, error),
+) (DeletedVideoRestoreResult, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return sql.ErrNoRows
+		return DeletedVideoRestoreResult{}, sql.ErrNoRows
 	}
+
+	deleted, driveKind, _, err := c.deletedVideoForRestore(ctx, c.db, id)
+	if err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	deleted.RestorePolicy = deletedVideoRestorePolicy(deleted, driveKind)
+	if deleted.RestorePolicy == DeletedVideoRestorePolicyNone {
+		return DeletedVideoRestoreResult{}, deletedVideoNotRestorableError(deleted)
+	}
+
+	if deleted.RestorePolicy == DeletedVideoRestorePolicyDirect {
+		if inspectSource == nil {
+			return DeletedVideoRestoreResult{}, ErrDeletedVideoSourceCheckRequired
+		}
+		source, err := inspectSource(deleted.DriveID, deleted.FileID)
+		if err != nil {
+			return DeletedVideoRestoreResult{}, fmt.Errorf("%w: %v", ErrDeletedVideoSourceMissing, err)
+		}
+		if source.Size <= 0 {
+			return DeletedVideoRestoreResult{}, fmt.Errorf("%w: source file is empty", ErrDeletedVideoSourceMissing)
+		}
+		return c.restoreDeletedVideoDirect(ctx, id, source)
+	}
+
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return DeletedVideoRestoreResult{}, err
 	}
 	defer tx.Rollback()
-
-	var deleted DeletedVideo
-	var sourceDeleted int
-	var driveKind string
-	err = tx.QueryRowContext(ctx, `
-SELECT dv.id,
-       COALESCE(dv.drive_id, ''),
-       COALESCE(dv.reason, ''),
-       COALESCE(dv.source_deleted, 0),
-       COALESCE(d.kind, '')
-  FROM deleted_videos dv
-  LEFT JOIN drives d ON d.id = dv.drive_id
- WHERE dv.id = ?`, id).Scan(
-		&deleted.ID,
-		&deleted.DriveID,
-		&deleted.Reason,
-		&sourceDeleted,
-		&driveKind,
-	)
+	deleted, driveKind, _, err = c.deletedVideoForRestore(ctx, tx, id)
 	if err != nil {
-		return err
+		return DeletedVideoRestoreResult{}, err
 	}
-	deleted.SourceDeleted = sourceDeleted != 0
-	deleted.RestorePolicy = deletedVideoRestorePolicy(&deleted, driveKind)
+	deleted.RestorePolicy = deletedVideoRestorePolicy(deleted, driveKind)
 	if deleted.RestorePolicy == DeletedVideoRestorePolicyNone {
-		switch {
-		case deleted.SourceDeleted:
-			return fmt.Errorf("%w: source file was deleted", ErrDeletedVideoNotRestorable)
-		case deleted.Reason == DeletedVideoReasonDuplicate:
-			return fmt.Errorf("%w: duplicate videos must use the retained canonical video", ErrDeletedVideoNotRestorable)
-		default:
-			return fmt.Errorf("%w: source does not support rediscovery", ErrDeletedVideoNotRestorable)
-		}
+		return DeletedVideoRestoreResult{}, deletedVideoNotRestorableError(deleted)
 	}
-
 	if deleted.RestorePolicy == DeletedVideoRestorePolicyCrawler {
 		prefix := driveKind + "-" + deleted.DriveID + "-"
 		if !strings.HasPrefix(deleted.ID, prefix) {
-			return fmt.Errorf("%w: crawler source id is unavailable", ErrDeletedVideoNotRestorable)
+			return DeletedVideoRestoreResult{}, fmt.Errorf("%w: crawler source id is unavailable", ErrDeletedVideoNotRestorable)
 		}
 		sourceID := strings.TrimSpace(strings.TrimPrefix(deleted.ID, prefix))
 		if sourceID == "" {
-			return fmt.Errorf("%w: crawler source id is unavailable", ErrDeletedVideoNotRestorable)
+			return DeletedVideoRestoreResult{}, fmt.Errorf("%w: crawler source id is unavailable", ErrDeletedVideoNotRestorable)
 		}
 		res, err := tx.ExecContext(ctx, `
 UPDATE deleted_videos
    SET restore_requested = 1
- WHERE id = ?`, id)
+	WHERE id = ?
+	  AND COALESCE(restore_requested, 0) = 0`, id)
 		if err != nil {
-			return err
+			return DeletedVideoRestoreResult{}, err
 		}
 		if rows, err := res.RowsAffected(); err == nil && rows == 0 {
-			return sql.ErrNoRows
+			return DeletedVideoRestoreResult{}, sql.ErrNoRows
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return DeletedVideoRestoreResult{}, err
+		}
+		return DeletedVideoRestoreResult{RestorePolicy: DeletedVideoRestorePolicyCrawler}, nil
 	}
 
-	res, err := tx.ExecContext(ctx, `DELETE FROM deleted_videos WHERE id = ?`, id)
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM deleted_videos
+ WHERE id = ?
+   AND COALESCE(restore_requested, 0) = 0`, id)
+	if err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return DeletedVideoRestoreResult{}, sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	return DeletedVideoRestoreResult{RestorePolicy: DeletedVideoRestorePolicyScan}, nil
+}
+
+type deletedVideoRestoreQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (c *Catalog) deletedVideoForRestore(
+	ctx context.Context,
+	query deletedVideoRestoreQuerier,
+	id string,
+) (*DeletedVideo, string, string, error) {
+	var deleted DeletedVideo
+	var sourceDeleted int
+	var driveKind string
+	var restorePayload string
+	err := query.QueryRowContext(ctx, `
+SELECT dv.id,
+       COALESCE(dv.drive_id, ''),
+       COALESCE(dv.file_id, ''),
+       COALESCE(dv.parent_id, ''),
+       COALESCE(dv.file_name, ''),
+       COALESCE(dv.size_bytes, 0),
+       COALESCE(dv.reason, ''),
+       COALESCE(dv.source_deleted, 0),
+       COALESCE(dv.restore_payload, ''),
+       COALESCE(d.kind, ''),
+       COALESCE(dv.deleted_at, 0)
+  FROM deleted_videos dv
+  LEFT JOIN drives d ON d.id = dv.drive_id
+ WHERE dv.id = ?
+   AND COALESCE(dv.restore_requested, 0) = 0`, id).Scan(
+		&deleted.ID,
+		&deleted.DriveID,
+		&deleted.FileID,
+		&deleted.ParentID,
+		&deleted.FileName,
+		&deleted.Size,
+		&deleted.Reason,
+		&sourceDeleted,
+		&restorePayload,
+		&driveKind,
+		&deleted.DeletedAt,
+	)
+	if err != nil {
+		return nil, "", "", err
+	}
+	deleted.SourceDeleted = sourceDeleted != 0
+	return &deleted, driveKind, restorePayload, nil
+}
+
+func deletedVideoNotRestorableError(deleted *DeletedVideo) error {
+	switch {
+	case deleted == nil:
+		return sql.ErrNoRows
+	case deleted.SourceDeleted:
+		return fmt.Errorf("%w: source file was deleted", ErrDeletedVideoNotRestorable)
+	case deleted.Reason == DeletedVideoReasonDuplicate:
+		return fmt.Errorf("%w: duplicate videos must use the retained canonical video", ErrDeletedVideoNotRestorable)
+	default:
+		return fmt.Errorf("%w: source does not support rediscovery", ErrDeletedVideoNotRestorable)
+	}
+}
+
+func (c *Catalog) restoreDeletedVideoDirect(
+	ctx context.Context,
+	id string,
+	source DeletedVideoSourceInfo,
+) (DeletedVideoRestoreResult, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	defer tx.Rollback()
+
+	deleted, driveKind, restorePayload, err := c.deletedVideoForRestore(ctx, tx, id)
+	if err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	deleted.RestorePolicy = deletedVideoRestorePolicy(deleted, driveKind)
+	if deleted.RestorePolicy != DeletedVideoRestorePolicyDirect {
+		if deleted.RestorePolicy == DeletedVideoRestorePolicyNone {
+			return DeletedVideoRestoreResult{}, deletedVideoNotRestorableError(deleted)
+		}
+		return DeletedVideoRestoreResult{}, fmt.Errorf("%w: restore policy changed to %s", ErrDeletedVideoNotRestorable, deleted.RestorePolicy)
+	}
+
+	// A row can coexist with a tombstone only when an older, non-atomic direct
+	// restore inserted the row but failed to remove its tombstone. Treat that row
+	// as the completed restore and only finish the tombstone transition. Replacing
+	// it would discard views, reactions, shares, or edits created in the meantime.
+	existing, existingErr := scanVideo(tx.QueryRowContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos WHERE id = ?`, id))
+	if existingErr == nil {
+		if existing.DriveID != deleted.DriveID || existing.FileID != deleted.FileID {
+			return DeletedVideoRestoreResult{}, fmt.Errorf(
+				"%w: existing video source does not match tombstone", ErrDeletedVideoNotRestorable)
+		}
+		if deletedVideoSourceChanged(deleted, existing, source) {
+			if err := resetPartiallyRestoredVideoSourceTx(ctx, tx, id, source); err != nil {
+				return DeletedVideoRestoreResult{}, err
+			}
+			existing, err = scanVideo(tx.QueryRowContext(ctx,
+				`SELECT `+allVideoCols+` FROM videos WHERE id = ?`, id))
+			if err != nil {
+				return DeletedVideoRestoreResult{}, err
+			}
+		}
+		if err := deletePendingDeletedVideoTx(ctx, tx, id); err != nil {
+			return DeletedVideoRestoreResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return DeletedVideoRestoreResult{}, err
+		}
+		return DeletedVideoRestoreResult{
+			RestorePolicy: DeletedVideoRestorePolicyDirect,
+			Video:         existing,
+		}, nil
+	}
+	if !errors.Is(existingErr, sql.ErrNoRows) {
+		return DeletedVideoRestoreResult{}, existingErr
+	}
+
+	payload, err := decodeDeletedVideoRestorePayload(deleted.ID, restorePayload)
+	if err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	video := directRestoreVideo(deleted, payload.Video, source)
+
+	// Normal tombstoning removes these relations. Clear any orphaned rows left by
+	// an interrupted legacy/manual repair before recreating the exact tag set.
+	for _, statement := range []string{
+		`DELETE FROM video_tags WHERE video_id = ?`,
+		`DELETE FROM video_shares WHERE video_id = ?`,
+		`DELETE FROM video_reaction_visits WHERE video_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, id); err != nil {
+			return DeletedVideoRestoreResult{}, err
+		}
+	}
+	if _, err := upsertVideoRow(ctx, tx, video); err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	if err := restoreDeletedVideoTagsTx(ctx, tx, video, payload); err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	restoredVideo, err := scanVideo(tx.QueryRowContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos WHERE id = ?`, id))
+	if err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	if err := deletePendingDeletedVideoTx(ctx, tx, id); err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DeletedVideoRestoreResult{}, err
+	}
+	return DeletedVideoRestoreResult{
+		RestorePolicy: DeletedVideoRestorePolicyDirect,
+		Video:         restoredVideo,
+	}, nil
+}
+
+func deletePendingDeletedVideoTx(ctx context.Context, tx *sql.Tx, id string) error {
+	res, err := tx.ExecContext(ctx, `
+DELETE FROM deleted_videos
+ WHERE id = ?
+   AND COALESCE(restore_requested, 0) = 0`, id)
 	if err != nil {
 		return err
 	}
 	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
 		return sql.ErrNoRows
 	}
-	return tx.Commit()
+	return nil
+}
+
+func resetPartiallyRestoredVideoSourceTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	id string,
+	source DeletedVideoSourceInfo,
+) error {
+	_, err := tx.ExecContext(ctx, `
+UPDATE videos
+   SET size_bytes = ?,
+       content_hash = '',
+       sampled_sha256 = '',
+       fingerprint_status = 'pending',
+       fingerprint_error = '',
+       duration_seconds = 0,
+       thumbnail_url = '',
+       thumbnail_updated_at = 0,
+       thumbnail_status = 'pending',
+       thumbnail_failures = 0,
+       preview_file_id = '',
+       preview_local = '',
+       preview_updated_at = 0,
+       preview_status = 'pending',
+       transcode_status = '',
+       transcode_error = '',
+       transcoded_file_id = '',
+       transcoded_size = 0,
+       updated_at = ?
+ WHERE id = ?`, source.Size, time.Now().UnixMilli(), id)
+	return err
 }
 
 // CrawlerRestoreRequest is a crawler tombstone that the user removed from the
@@ -1542,11 +1884,11 @@ SELECT id,
 			return nil, err
 		}
 		if strings.TrimSpace(payload) != "" {
-			var video Video
-			if err := json.Unmarshal([]byte(payload), &video); err != nil {
-				return nil, fmt.Errorf("catalog: decode restore payload for %s: %w", request.ID, err)
+			restored, err := decodeDeletedVideoRestorePayload(request.ID, payload)
+			if err != nil {
+				return nil, err
 			}
-			request.Video = &video
+			request.Video = restored.Video
 		}
 		out = append(out, request)
 	}
@@ -2115,6 +2457,44 @@ func (c *Catalog) ListVisibleVideoIDsByThumbnailReadiness(ctx context.Context) (
 	return readyIDs, pendingIDs, nil
 }
 
+// ListVisibleVideoIDsLatest returns a deterministic latest-first snapshot for
+// the home page's rotating "latest" section. Ready thumbnails keep the same
+// preference as /api/list while the limit bounds the session snapshot.
+func (c *Catalog) ListVisibleVideoIDsLatest(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT videos.id
+		   FROM videos
+		  WHERE COALESCE(videos.hidden, 0) = 0
+		    AND `+activeDriveWhereSQL+`
+		    AND `+uniqueVideoWhereSQL+`
+		  ORDER BY CASE WHEN COALESCE(videos.thumbnail_url, '') != '' THEN 0 ELSE 1 END,
+		           videos.published_at DESC,
+		           videos.id ASC
+		  LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	ids := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // VisibleVideosByIDs loads the still-visible subset of ids while preserving
 // the caller's order. Feed sessions are snapshots, so videos deleted, hidden,
 // or superseded by deduplication after the snapshot was created are skipped.
@@ -2610,10 +2990,10 @@ func (c *Catalog) ClearGeneratedAssets(ctx context.Context, videoID string, clea
 	parts := []string{}
 	args := []any{}
 	if clearPreview {
-		parts = append(parts, "preview_file_id = ''", "preview_local = ''", "preview_status = 'pending'")
+		parts = append(parts, "preview_file_id = ''", "preview_local = ''", "preview_updated_at = 0", "preview_status = 'pending'")
 	}
 	if clearThumbnail {
-		parts = append(parts, "thumbnail_url = ''", "thumbnail_status = 'pending'")
+		parts = append(parts, "thumbnail_url = ''", "thumbnail_updated_at = 0", "thumbnail_status = 'pending'")
 	}
 	if len(parts) == 0 {
 		return nil
@@ -2655,6 +3035,33 @@ type Drive struct {
 }
 
 func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
+	return c.upsertDrive(ctx, d, true, false)
+}
+
+// UpsertDrivePreservingSkipDirIDs writes the authoritative drive fields while
+// retaining the current skip_dir_ids value when the row already exists. It is
+// intended for admin edits whose request omitted skipDirIds: preserving the
+// value in SQL avoids a read-then-write race with the dedicated skip-dir API.
+// New rows still receive the normalized value from d (normally an empty list).
+func (c *Catalog) UpsertDrivePreservingSkipDirIDs(ctx context.Context, d *Drive) error {
+	return c.upsertDrive(ctx, d, false, false)
+}
+
+// UpsertDrivePatchingCredentials updates drive metadata while atomically
+// applying d.Credentials as a JSON merge patch to the latest stored
+// credentials. This prevents an admin edit from rolling back tokens refreshed
+// after the edit form was opened.
+func (c *Catalog) UpsertDrivePatchingCredentials(ctx context.Context, d *Drive) error {
+	return c.upsertDrive(ctx, d, true, true)
+}
+
+// UpsertDrivePatchingCredentialsPreservingSkipDirIDs combines credential patch
+// semantics with the omitted-skipDirIds behavior used by the admin form.
+func (c *Catalog) UpsertDrivePatchingCredentialsPreservingSkipDirIDs(ctx context.Context, d *Drive) error {
+	return c.upsertDrive(ctx, d, false, true)
+}
+
+func (c *Catalog) upsertDrive(ctx context.Context, d *Drive, replaceSkipDirIDs, patchCredentials bool) error {
 	normalizeDriveRootFields(d)
 	cred, _ := json.Marshal(d.Credentials)
 	skipDirs := d.SkipDirIDs
@@ -2675,14 +3082,20 @@ ON CONFLICT(id) DO UPDATE SET
   name           = excluded.name,
   root_id        = excluded.root_id,
   scan_root_id   = excluded.scan_root_id,
-  credentials    = excluded.credentials,
+  credentials    = CASE
+                     WHEN ? != 0 THEN json_patch(
+                       CASE WHEN json_valid(COALESCE(drives.credentials, '')) THEN drives.credentials ELSE '{}' END,
+                       excluded.credentials
+                     )
+                     ELSE excluded.credentials
+                   END,
   status         = excluded.status,
   last_error     = excluded.last_error,
   teaser_enabled = excluded.teaser_enabled,
-  skip_dir_ids   = excluded.skip_dir_ids,
+  skip_dir_ids   = CASE WHEN ? != 0 THEN excluded.skip_dir_ids ELSE drives.skip_dir_ids END,
   updated_at     = excluded.updated_at
 `, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON),
-		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli())
+		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli(), boolToInt(patchCredentials), boolToInt(replaceSkipDirIDs))
 	return err
 }
 
@@ -2776,8 +3189,73 @@ func (c *Catalog) GetDrive(ctx context.Context, id string) (*Drive, error) {
 }
 
 func (c *Catalog) DeleteDrive(ctx context.Context, id string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM drives WHERE id = ?`, id)
-	return err
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Drive-scoped scan and crawler state has no foreign-key ownership in the
+	// legacy schema. Delete it in the same transaction as the drive so removing
+	// a drive cannot leave hidden state behind or affect a later drive that
+	// reuses the same ID. Video rows are intentionally handled by the caller:
+	// migrated crawler videos already belong to their destination drive and must
+	// survive removal of the crawler that originally discovered them.
+	for _, query := range []string{
+		`DELETE FROM drive_scan_misses WHERE drive_id = ?`,
+		`DELETE FROM scans WHERE drive_id = ?`,
+		`DELETE FROM crawler_seen_sources WHERE drive_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, query, id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM drives WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// PatchDriveCredentials atomically merges the supplied credential keys into
+// the stored JSON object. Runtime token/cookie refreshes must use this method
+// instead of UpsertDrive: a driver instance can hold an old Drive snapshot,
+// and replacing the full row from that snapshot can roll back independently
+// saved settings such as skip_dir_ids or root_id.
+func (c *Catalog) PatchDriveCredentials(ctx context.Context, id string, updates map[string]string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("catalog: patch drive credentials: empty id")
+	}
+	cleaned := make(map[string]string, len(updates))
+	for rawKey, value := range updates {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			continue
+		}
+		cleaned[key] = value
+	}
+	if len(cleaned) == 0 {
+		return nil
+	}
+	payload, err := json.Marshal(cleaned)
+	if err != nil {
+		return fmt.Errorf("catalog: marshal drive credential patch: %w", err)
+	}
+	res, err := c.db.ExecContext(ctx, `
+UPDATE drives
+   SET credentials = json_patch(
+         CASE WHEN json_valid(COALESCE(credentials, '')) THEN credentials ELSE '{}' END,
+         ?
+       ),
+       updated_at = ?
+ WHERE id = ?`, string(payload), time.Now().UnixMilli(), id)
+	if err != nil {
+		return fmt.Errorf("catalog: patch drive credentials: %w", err)
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // SetDriveRuntimeStatus updates only the connection state observed while the
@@ -3022,8 +3500,8 @@ const allVideoCols = `
 id, drive_id, file_id, COALESCE(file_name, ''), COALESCE(content_hash, ''),
 COALESCE(sampled_sha256, ''), COALESCE(fingerprint_status, 'pending'), COALESCE(fingerprint_error, ''),
 COALESCE(parent_id, ''), COALESCE(dir_name, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
-duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(quality, ''), COALESCE(thumbnail_url, ''),
-COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_status, 'pending'),
+duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(quality, ''), COALESCE(thumbnail_url, ''), COALESCE(thumbnail_updated_at, 0),
+COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_updated_at, 0), COALESCE(preview_status, 'pending'),
 	COALESCE(transcode_status, ''), COALESCE(transcode_error, ''), COALESCE(transcoded_file_id, ''), COALESCE(transcoded_size, 0),
 	views, COALESCE(last_viewed_at, 0), favorites, comments, likes, COALESCE(last_liked_at, 0), dislikes,
 	COALESCE(hidden, 0), COALESCE(badges, '[]'), COALESCE(description, ''),
@@ -3041,7 +3519,16 @@ const activeDriveWhereSQL = `(videos.drive_id = 'local-upload'
 		  FROM drives
 	))`
 
-const uniqueVideoWhereSQL = `((COALESCE(videos.content_hash, '') = ''
+// uniqueVideoWhereSQL is the hot-path materialized form of the exact legacy
+// predicate below. SQLite triggers update it in the same statement/transaction
+// as every insert, delete, or dedup-key change.
+const uniqueVideoWhereSQL = `videos.is_canonical = 1`
+
+// dynamicUniqueVideoWhereSQL remains the source of truth for migration,
+// trigger recomputation and consistency tests. Keep its three independent
+// clauses intact: a row may map to different representatives by hash, sampled
+// fingerprint, and filename+size, so a single canonical_video_id is lossy.
+const dynamicUniqueVideoWhereSQL = `((COALESCE(videos.content_hash, '') = ''
 		OR NOT EXISTS (
 			SELECT 1
 			FROM videos AS dup
@@ -3079,7 +3566,7 @@ const uniqueVideoWhereSQL = `((COALESCE(videos.content_hash, '') = ''
 				dup.created_at < videos.created_at
 				OR (dup.created_at = videos.created_at AND dup.id < videos.id)
 			  )
-		)))`
+		  )))`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -3088,14 +3575,14 @@ type rowScanner interface {
 func scanVideo(row rowScanner) (*Video, error) {
 	v := &Video{}
 	var tagsJSON, badgesJSON string
-	var publishedAt, createdAt, updatedAt, lastViewedAt, lastLikedAt int64
+	var publishedAt, createdAt, updatedAt, thumbnailUpdatedAt, previewUpdatedAt, lastViewedAt, lastLikedAt int64
 	var hidden int
 	err := row.Scan(
 		&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.ContentHash,
 		&v.SampledSHA256, &v.FingerprintStatus, &v.FingerprintError,
 		&v.ParentID, &v.DirName, &v.Title, &v.Author, &tagsJSON,
-		&v.DurationSeconds, &v.Size, &v.Ext, &v.Quality, &v.ThumbnailURL,
-		&v.PreviewFileID, &v.PreviewLocal, &v.PreviewStatus,
+		&v.DurationSeconds, &v.Size, &v.Ext, &v.Quality, &v.ThumbnailURL, &thumbnailUpdatedAt,
+		&v.PreviewFileID, &v.PreviewLocal, &previewUpdatedAt, &v.PreviewStatus,
 		&v.TranscodeStatus, &v.TranscodeError, &v.TranscodedFileID, &v.TranscodedSize,
 		&v.Views, &lastViewedAt, &v.Favorites, &v.Comments, &v.Likes, &lastLikedAt, &v.Dislikes,
 		&hidden, &badgesJSON, &v.Description,
@@ -3110,6 +3597,12 @@ func scanVideo(row rowScanner) (*Video, error) {
 	v.PublishedAt = time.UnixMilli(publishedAt)
 	v.CreatedAt = time.UnixMilli(createdAt)
 	v.UpdatedAt = time.UnixMilli(updatedAt)
+	if thumbnailUpdatedAt > 0 {
+		v.ThumbnailUpdatedAt = time.UnixMilli(thumbnailUpdatedAt)
+	}
+	if previewUpdatedAt > 0 {
+		v.PreviewUpdatedAt = time.UnixMilli(previewUpdatedAt)
+	}
 	if lastViewedAt > 0 {
 		v.LastViewedAt = time.UnixMilli(lastViewedAt)
 	}
@@ -3132,12 +3625,343 @@ func normalizeDeletedVideoReason(reason string) string {
 	}
 }
 
+type deletedVideoRestorePayloadQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func buildDeletedVideoRestorePayload(
+	ctx context.Context,
+	query deletedVideoRestorePayloadQuerier,
+	video *Video,
+) ([]byte, error) {
+	if video == nil {
+		return nil, sql.ErrNoRows
+	}
+	payload := deletedVideoRestorePayload{
+		Version: deletedVideoRestorePayloadVersion,
+		Video:   video,
+	}
+	var tagsManual int
+	if err := query.QueryRowContext(ctx,
+		`SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, video.ID,
+	).Scan(&tagsManual); err != nil {
+		return nil, err
+	}
+	payload.TagsManual = tagsManual != 0
+
+	rows, err := query.QueryContext(ctx, `
+SELECT t.label,
+       COALESCE(vt.source, ''),
+       COALESCE(vt.evidence, ''),
+       COALESCE(vt.created_at, 0),
+       COALESCE(t.aliases, '[]'),
+       COALESCE(t.match_rules, '{}'),
+       COALESCE(t.source, 'user'),
+       COALESCE(t.origin, ''),
+       COALESCE(t.created_at, 0),
+       COALESCE(t.updated_at, 0)
+  FROM video_tags vt
+  JOIN tags t ON t.id = vt.tag_id
+ WHERE vt.video_id = ?
+ ORDER BY vt.created_at, t.id`, video.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var assignment deletedVideoTagRestoreAssignment
+		if err := rows.Scan(
+			&assignment.Label,
+			&assignment.Source,
+			&assignment.Evidence,
+			&assignment.CreatedAt,
+			&assignment.TagAliases,
+			&assignment.TagMatchRules,
+			&assignment.TagSource,
+			&assignment.TagOrigin,
+			&assignment.TagCreatedAt,
+			&assignment.TagUpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		payload.TagAssignments = append(payload.TagAssignments, assignment)
+		seen[strings.ToLower(strings.TrimSpace(assignment.Label))] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Heal old or externally-written rows whose JSON labels have no matching
+	// relation. Their provenance is unknowable; preserve an explicit manual lock
+	// when present and otherwise leave them replaceable by automatic retagging.
+	for _, label := range video.Tags {
+		key := strings.ToLower(strings.TrimSpace(label))
+		if key == "" || seen[key] {
+			continue
+		}
+		payload.TagAssignments = append(payload.TagAssignments,
+			fallbackDeletedVideoTagAssignment(label, payload.TagsManual))
+	}
+	return json.Marshal(payload)
+}
+
+func decodeDeletedVideoRestorePayload(id, encoded string) (deletedVideoRestorePayload, error) {
+	encoded = strings.TrimSpace(encoded)
+	if encoded == "" {
+		return deletedVideoRestorePayload{Version: deletedVideoRestorePayloadVersion}, nil
+	}
+	var probe struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(encoded), &probe); err != nil {
+		return deletedVideoRestorePayload{}, fmt.Errorf("catalog: decode restore payload for %s: %w", id, err)
+	}
+	var payload deletedVideoRestorePayload
+	if probe.Version > 0 {
+		if probe.Version != deletedVideoRestorePayloadVersion {
+			return deletedVideoRestorePayload{}, fmt.Errorf(
+				"catalog: decode restore payload for %s: unsupported version %d", id, probe.Version)
+		}
+		if err := json.Unmarshal([]byte(encoded), &payload); err != nil {
+			return deletedVideoRestorePayload{}, fmt.Errorf("catalog: decode restore payload for %s: %w", id, err)
+		}
+		if payload.Video == nil {
+			return deletedVideoRestorePayload{}, fmt.Errorf("catalog: decode restore payload for %s: missing video", id)
+		}
+	} else {
+		// Versions before this follow-up stored a raw Video JSON object. Assignment
+		// provenance cannot be recovered, so retaining its labels as manual is the
+		// only backward-compatible choice that does not discard user selections.
+		var video Video
+		if err := json.Unmarshal([]byte(encoded), &video); err != nil {
+			return deletedVideoRestorePayload{}, fmt.Errorf("catalog: decode restore payload for %s: %w", id, err)
+		}
+		payload = deletedVideoRestorePayload{
+			Version:    deletedVideoRestorePayloadVersion,
+			Video:      &video,
+			TagsManual: len(video.Tags) > 0,
+		}
+	}
+	if payload.Video != nil && len(payload.TagAssignments) == 0 {
+		for _, label := range payload.Video.Tags {
+			payload.TagAssignments = append(payload.TagAssignments,
+				fallbackDeletedVideoTagAssignment(label, payload.TagsManual))
+		}
+	}
+	if payload.Video != nil && len(payload.Video.Tags) == 0 && len(payload.TagAssignments) > 0 {
+		for _, assignment := range payload.TagAssignments {
+			payload.Video.Tags = append(payload.Video.Tags, assignment.Label)
+		}
+	}
+	return payload, nil
+}
+
+func fallbackDeletedVideoTagAssignment(label string, manual bool) deletedVideoTagRestoreAssignment {
+	assignment := deletedVideoTagRestoreAssignment{
+		Label:         strings.TrimSpace(label),
+		Source:        "auto",
+		TagAliases:    "[]",
+		TagMatchRules: "{}",
+		TagSource:     "generated",
+	}
+	if manual {
+		assignment.Source = "manual"
+		assignment.TagSource = "user"
+	}
+	return assignment
+}
+
+func restoreDeletedVideoTagsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	video *Video,
+	payload deletedVideoRestorePayload,
+) error {
+	if video == nil {
+		return sql.ErrNoRows
+	}
+	now := time.Now().UnixMilli()
+	for _, assignment := range payload.TagAssignments {
+		assignment.Label = strings.TrimSpace(assignment.Label)
+		if assignment.Label == "" {
+			continue
+		}
+		if !json.Valid([]byte(assignment.TagAliases)) {
+			assignment.TagAliases = "[]"
+		}
+		if !json.Valid([]byte(assignment.TagMatchRules)) {
+			assignment.TagMatchRules = "{}"
+		}
+		if strings.TrimSpace(assignment.TagSource) == "" {
+			assignment.TagSource = "generated"
+			if payload.TagsManual || assignment.Source == "manual" {
+				assignment.TagSource = "user"
+			}
+		}
+		if assignment.TagCreatedAt <= 0 {
+			assignment.TagCreatedAt = now
+		}
+		if assignment.TagUpdatedAt <= 0 {
+			assignment.TagUpdatedAt = assignment.TagCreatedAt
+		}
+		if assignment.CreatedAt <= 0 {
+			assignment.CreatedAt = now
+		}
+		if strings.TrimSpace(assignment.Source) == "" {
+			assignment.Source = "auto"
+			if payload.TagsManual {
+				assignment.Source = "manual"
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO tags (label, aliases, match_rules, source, origin, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(label) DO NOTHING`,
+			assignment.Label,
+			assignment.TagAliases,
+			assignment.TagMatchRules,
+			assignment.TagSource,
+			assignment.TagOrigin,
+			assignment.TagCreatedAt,
+			assignment.TagUpdatedAt,
+		); err != nil {
+			return err
+		}
+		var tagID int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT id FROM tags WHERE label = ? COLLATE NOCASE`, assignment.Label,
+		).Scan(&tagID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO video_tags (video_id, tag_id, source, evidence, created_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(video_id, tag_id) DO UPDATE SET
+  source = excluded.source,
+  evidence = excluded.evidence,
+  created_at = excluded.created_at`,
+			video.ID, tagID, assignment.Source, assignment.Evidence, assignment.CreatedAt,
+		); err != nil {
+			return err
+		}
+	}
+	return syncVideoTagsJSONTx(ctx, tx, video.ID, payload.TagsManual)
+}
+
+// directRestoreVideo rebuilds the catalog row for a direct restore. Derived
+// assets were deleted with the original row, so their paths and state are reset
+// for application workers. Provider-observed size/timestamps make legacy
+// payloads usable and invalidate fingerprints if the retained file changed.
+func directRestoreVideo(deleted *DeletedVideo, restoreVideo *Video, source DeletedVideoSourceInfo) *Video {
+	video := &Video{}
+	if restoreVideo != nil {
+		copy := *restoreVideo
+		copy.Tags = append([]string(nil), restoreVideo.Tags...)
+		copy.Badges = append([]string(nil), restoreVideo.Badges...)
+		video = &copy
+	}
+	originalSize := video.Size
+	video.ID = deleted.ID
+	video.DriveID = deleted.DriveID
+	video.FileID = deleted.FileID
+	video.ParentID = deleted.ParentID
+	if strings.TrimSpace(video.FileName) == "" {
+		video.FileName = strings.TrimSpace(deleted.FileName)
+	}
+	if strings.TrimSpace(video.FileName) == "" {
+		video.FileName = deleted.FileID
+	}
+	if strings.TrimSpace(video.Title) == "" {
+		video.Title = strings.TrimSuffix(video.FileName, path.Ext(video.FileName))
+	}
+	if strings.TrimSpace(video.Ext) == "" {
+		video.Ext = strings.TrimPrefix(strings.ToLower(path.Ext(video.FileName)), ".")
+	}
+	original := *video
+	original.Size = originalSize
+	if deletedVideoSourceChanged(deleted, &original, source) {
+		video.ContentHash = ""
+		video.SampledSHA256 = ""
+		video.FingerprintStatus = "pending"
+		video.FingerprintError = ""
+		video.DurationSeconds = 0
+	}
+	if video.SampledSHA256 == "" && video.FingerprintStatus == "ready" {
+		video.FingerprintStatus = "pending"
+		video.FingerprintError = ""
+	}
+	video.Size = source.Size
+	fallbackTime := source.ModTime
+	if fallbackTime.IsZero() && deleted.DeletedAt > 0 {
+		fallbackTime = time.UnixMilli(deleted.DeletedAt)
+	}
+	if fallbackTime.IsZero() {
+		fallbackTime = time.Now()
+	}
+	if video.CreatedAt.IsZero() {
+		video.CreatedAt = fallbackTime
+	}
+	if video.PublishedAt.IsZero() {
+		video.PublishedAt = video.CreatedAt
+	}
+	// The row was tombstoned, never hidden; restoring it must not resurrect the
+	// deprecated hidden flag even if an old payload carried it.
+	video.Hidden = false
+	video.ThumbnailURL = ""
+	video.ThumbnailUpdatedAt = time.Time{}
+	video.PreviewFileID = ""
+	video.PreviewLocal = ""
+	video.PreviewUpdatedAt = time.Time{}
+	video.PreviewStatus = "pending"
+	video.TranscodeStatus = ""
+	video.TranscodeError = ""
+	video.TranscodedFileID = ""
+	video.TranscodedSize = 0
+	return video
+}
+
+func deletedVideoSourceChanged(
+	deleted *DeletedVideo,
+	video *Video,
+	source DeletedVideoSourceInfo,
+) bool {
+	expectedSize := int64(0)
+	if deleted != nil {
+		expectedSize = deleted.Size
+	}
+	if expectedSize <= 0 && video != nil {
+		expectedSize = video.Size
+	}
+	if expectedSize > 0 && source.Size != expectedSize {
+		return true
+	}
+	if video != nil && video.Size != source.Size {
+		return true
+	}
+	// deleted_at is millisecond precision. Requiring a full millisecond beyond
+	// it avoids treating a source written in the same truncated millisecond as a
+	// post-tombstone replacement.
+	if deleted != nil && !source.ModTime.IsZero() && deleted.DeletedAt > 0 &&
+		source.ModTime.After(time.UnixMilli(deleted.DeletedAt).Add(time.Millisecond)) {
+		return true
+	}
+	return expectedSize <= 0 && video != nil &&
+		(video.ContentHash != "" || video.SampledSHA256 != "")
+}
+
+// deletedVideoRestorePolicy decides how (and whether) a tombstone can go back
+// to the library. The order matters: a missing source file and a deduplicated
+// row are unrestorable no matter which drive they came from, so those are
+// checked before the per-drive branches below.
 func deletedVideoRestorePolicy(v *DeletedVideo, driveKind string) string {
 	if v == nil ||
 		v.SourceDeleted ||
-		v.Reason == DeletedVideoReasonDuplicate ||
-		strings.TrimSpace(v.DriveID) == "local-upload" {
+		v.Reason == DeletedVideoReasonDuplicate {
 		return DeletedVideoRestorePolicyNone
+	}
+	if strings.TrimSpace(v.DriveID) == "local-upload" {
+		return DeletedVideoRestorePolicyDirect
 	}
 	if strings.TrimSpace(driveKind) == "scriptcrawler" {
 		return DeletedVideoRestorePolicyCrawler

@@ -1,15 +1,8 @@
-## 快速开始
+## 运行与部署
 
-依赖：**Go 1.23+**、**ffmpeg / ffprobe**（用于封面、预览视频、媒体探测/转码和内容级去重，必装；路径可在配置里改）。`sampled_sha256` 指纹由 Go 直接读取 Range 字节计算，不依赖 ffmpeg。SQLite 用纯 Go 驱动（modernc），无需系统库；依赖已 vendored，可离线构建。跑爬虫需要 `python3`。
+部署请使用仓库根目录 README 中的 Docker Compose 流程。Docker 镜像已包含后端、前端、ffmpeg / ffprobe 和爬虫所需的 Python 运行环境；配置、数据库、封面、预览和上传文件都保存在 Compose 挂载的 `./data/` 中。
 
-```bash
-cd backend
-go run ./cmd/server        # 首次启动自动从 config.example.yaml 生成 config.yaml，监听 127.0.0.1:9192
-go test ./...              # 单元测试；缺 ffmpeg / python3 时相关测试自动跳过
-go build -o server ./cmd/server
-```
-
-前端开发在仓库根目录 `npm run dev`，vite 会把 `/api`、`/p`、`/admin/api` 代理到 9192。所有配置项及注释见 [config.example.yaml](config.example.yaml)，正文只在涉及行为时提及个别配置。
+本文档仅说明后端架构和配置行为。所有配置项及注释见 [config.example.yaml](config.example.yaml)，正文只在涉及行为时提及个别配置。
 
 ## 目录
 
@@ -21,8 +14,8 @@ go build -o server ./cmd/server
   tests/                    前端测试（node --test）
   index.html  public/       前端入口与静态资源
   scripts/  .github/        构建脚本与 CI
-  install.sh  start.sh      一键安装、本地启动前后端
-  deploy.sh  Dockerfile     部署
+  Dockerfile docker-compose.yml
+                            Docker Compose 部署
   backend/                  Go 服务，见下
 ```
 
@@ -343,6 +336,6 @@ flowchart LR
 
 ### 8. 日志与排查
 
-- 一键脚本部署（systemd）：`journalctl -u video-site-backend` / `-u video-site-frontend`；`start.sh` 模式日志在 `$LOG_DIR`（默认 `/tmp/video-site-91/`）。
+- Docker Compose 日志：`docker compose logs -f video-site-91`。
 - 后端日志按模块带前缀，直接 grep：`[scanner]`、`[scriptcrawler]`、`[nightly]`、`[dedupe-maintenance]`、`[local-upload-maintenance]` 等。爬虫 Python 子进程的输出并入后端日志。
 - 常见排查入口：网盘异常看后台网盘页的健康状态与 `lastError`；预览/封面卡住多半是上游限流，等冷却期过或看 `[nightly]` 是否在等队列排空；去重删了什么搜 `duplicate deleted`，内容匹配过程搜 `content duplicate matched`。

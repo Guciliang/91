@@ -14,6 +14,7 @@ import (
 	"github.com/video-site/backend/internal/api"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/persistence"
 )
@@ -176,16 +177,15 @@ func (a *App) runBlacklistSourceDelete(ctx context.Context, reqs ...api.Blacklis
 		}
 		a.blacklistSourceDeleteMu.Unlock()
 
-		deleteErr := a.removeDeletedVideoSourceFile(ctx, item)
-		if deleteErr == nil {
-			deleteErr = a.purgeDeletedVideoTombstone(ctx, item.ID)
-		}
+		skipped, deleteErr := a.deleteBlacklistedVideoSource(ctx, item)
 
 		a.blacklistSourceDeleteMu.Lock()
 		a.blacklistSourceDeleteState.Processed++
 		if deleteErr != nil {
 			a.blacklistSourceDeleteState.Failed++
 			a.blacklistSourceDeleteState.LastError = deleteErr.Error()
+		} else if skipped {
+			a.blacklistSourceDeleteState.Skipped++
 		} else {
 			a.blacklistSourceDeleteState.Deleted++
 		}
@@ -193,6 +193,8 @@ func (a *App) runBlacklistSourceDelete(ctx context.Context, reqs ...api.Blacklis
 
 		if deleteErr != nil {
 			log.Printf("[blacklist-source-delete] id=%s drive=%s file=%s failed: %v", item.ID, item.DriveID, item.FileID, deleteErr)
+		} else if skipped {
+			log.Printf("[blacklist-source-delete] id=%s skipped: tombstone changed or is no longer pending", item.ID)
 		} else {
 			log.Printf("[blacklist-source-delete] id=%s drive=%s file=%s deleted", item.ID, item.DriveID, item.FileID)
 		}
@@ -206,6 +208,47 @@ func (a *App) runBlacklistSourceDelete(ctx context.Context, reqs ...api.Blacklis
 	}
 
 	a.finishBlacklistSourceDelete("completed", nil)
+}
+
+// deleteBlacklistedVideoSource revalidates a snapshot item while holding the
+// same per-video lock used by direct restore. A restored, claimed, or newly
+// recreated tombstone is a skip, not permission to delete the stale snapshot's
+// source file.
+func (a *App) deleteBlacklistedVideoSource(ctx context.Context, snapshot *catalog.DeletedVideo) (bool, error) {
+	if snapshot == nil {
+		return false, errors.New("remove blacklisted source: empty tombstone")
+	}
+	unlock := a.blacklistVideoLocks.lock(snapshot.ID)
+	defer unlock()
+	if err := persistence.RLockContext(ctx); err != nil {
+		return false, err
+	}
+	defer persistence.RUnlock()
+
+	items, err := a.cat.ListDeletedVideosPendingSourceDeletionByIDs(ctx, []string{snapshot.ID})
+	if err != nil {
+		return false, err
+	}
+	if len(items) == 0 {
+		return true, nil
+	}
+	current := items[0]
+	if current.DeletedAt != snapshot.DeletedAt ||
+		current.DriveID != snapshot.DriveID ||
+		current.FileID != snapshot.FileID ||
+		current.ParentID != snapshot.ParentID ||
+		current.FileName != snapshot.FileName ||
+		current.Size != snapshot.Size ||
+		current.Reason != snapshot.Reason {
+		return true, nil
+	}
+	if err := a.removeDeletedVideoSourceFile(ctx, current); err != nil {
+		return false, err
+	}
+	if err := a.purgeDeletedVideoTombstone(ctx, current.ID); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (a *App) removeDeletedVideoSourceFile(ctx context.Context, item *catalog.DeletedVideo) error {
@@ -340,6 +383,78 @@ func (a *App) removeVideoSourceFile(ctx context.Context, v *catalog.Video) (bool
 	return true, nil
 }
 
+// restoreDeletedVideo coordinates provider inspection, the catalog state
+// transition, and application side effects under the same per-video lock used
+// by source deletion. Catalog returns the restored row so direct restores enter
+// the same generation queues as newly uploaded videos.
+func (a *App) restoreDeletedVideo(ctx context.Context, videoID string) error {
+	if a == nil || a.cat == nil {
+		return sql.ErrNoRows
+	}
+	videoID = strings.TrimSpace(videoID)
+	if videoID == "" {
+		return sql.ErrNoRows
+	}
+	unlock := a.blacklistVideoLocks.lock(videoID)
+	defer unlock()
+	if err := persistence.RLockContext(ctx); err != nil {
+		return err
+	}
+
+	result, err := a.cat.RestoreDeletedVideo(ctx, videoID, func(driveID, fileID string) (catalog.DeletedVideoSourceInfo, error) {
+		return a.inspectRestorableSource(ctx, driveID, fileID)
+	})
+	persistence.RUnlock()
+	if err != nil {
+		return err
+	}
+	if result.Video != nil {
+		// The catalog commit is already durable. A client disconnect at this point
+		// must not strand the restored row in pending derived-asset state.
+		postRestoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		a.enqueueUploadedVideo(postRestoreCtx, result.Video)
+		cancel()
+		if a.onTagsChanged != nil {
+			a.onTagsChanged()
+		}
+	}
+	return nil
+}
+
+// inspectRestorableSource confirms that a direct-restore source is a playable
+// regular file and returns provider-owned metadata used to repair stale size,
+// timestamps, and fingerprints.
+func (a *App) inspectRestorableSource(ctx context.Context, driveID, fileID string) (catalog.DeletedVideoSourceInfo, error) {
+	driveID = strings.TrimSpace(driveID)
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: empty file id", driveID)
+	}
+	if a == nil || a.registry == nil {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: drive registry unavailable: %w", driveID, drives.ErrNotSupported)
+	}
+	if _, ok := a.registry.Get(driveID); !ok {
+		if err := a.ensureDriveAttached(ctx, driveID); err != nil {
+			return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: attach drive: %w", driveID, err)
+		}
+	}
+	drv, ok := a.registry.Get(driveID)
+	if !ok {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: drive not attached: %w", driveID, drives.ErrNotSupported)
+	}
+	entry, err := drv.Stat(ctx, fileID)
+	if err != nil {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: stat %s: %w", driveID, fileID, err)
+	}
+	if entry == nil || entry.IsDir {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: %s is not a regular file", driveID, fileID)
+	}
+	if entry.Size <= 0 {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: %s is empty", driveID, fileID)
+	}
+	return catalog.DeletedVideoSourceInfo{Size: entry.Size, ModTime: entry.ModTime}, nil
+}
+
 func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (int, error) {
 	if a == nil || a.cat == nil {
 		return 0, nil
@@ -372,6 +487,11 @@ func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (
 			return 0, fmt.Errorf("remove local assets for %s: %w", v.ID, err)
 		}
 	}
+	if d.Kind == scriptcrawler.Kind {
+		if err := a.removeScriptCrawlerStorageForDelete(d.ID); err != nil {
+			return 0, fmt.Errorf("remove crawler storage for %s: %w", d.ID, err)
+		}
+	}
 
 	removed := 0
 	for _, v := range items {
@@ -387,6 +507,27 @@ func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (
 		removed++
 	}
 	return removed, nil
+}
+
+// removeScriptCrawlerStorageForDelete removes the application-owned source
+// tree for a deleted crawler. The containment check is deliberately repeated
+// here instead of trusting the drive ID: this is a recursive destructive
+// operation and must never be able to target the shared scriptcrawlers root or
+// a path outside it.
+func (a *App) removeScriptCrawlerStorageForDelete(driveID string) error {
+	if a == nil || a.cfg == nil {
+		return errors.New("crawler storage root is unavailable")
+	}
+	root := a.scriptCrawlerRootDir()
+	rootPath, rootOK := localPathWithin(root, root)
+	targetPath, targetOK := localPathWithin(root, a.scriptCrawlerDriveDir(driveID))
+	if !rootOK || !targetOK || targetPath == rootPath {
+		return fmt.Errorf("unsafe crawler storage path for drive %q", driveID)
+	}
+	if err := os.RemoveAll(targetPath); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a *App) cleanupOrphanDriveVideos(ctx context.Context) (int, error) {

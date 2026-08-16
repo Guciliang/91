@@ -24,12 +24,11 @@ import (
 	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/auth"
 	"github.com/video-site/backend/internal/backup"
+	"github.com/video-site/backend/internal/backuptransfer"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/crawlerupload"
-	"github.com/video-site/backend/internal/drives/localstorage"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
-	"github.com/video-site/backend/internal/drives/webdav"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
@@ -276,6 +275,21 @@ func main() {
 	}
 	backupManager.Start(ctx)
 	defer backupManager.Close()
+	backupTransferManager, err := backuptransfer.New(backuptransfer.Config{
+		Backups: backupManager,
+		RootDir: filepath.Join(filepath.Dir(cfg.Storage.DBPath), "backups", ".peer-transfer"),
+	})
+	if err != nil {
+		log.Fatalf("configure backup transfer service: %v", err)
+	}
+	backupTransferManager.Start(ctx)
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := backupTransferManager.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[backup-transfer] shutdown: %v", err)
+		}
+	}()
 
 	apiServer := &api.Server{
 		Catalog:        cat,
@@ -302,6 +316,7 @@ func main() {
 		Catalog:         cat,
 		Auth:            authr,
 		Backups:         backupManager,
+		BackupTransfers: backupTransferManager,
 		Logs:            logStore,
 		ConfigManager:   configManager,
 		VersionFilePath: versionFilePath,
@@ -338,23 +353,7 @@ func main() {
 		},
 		LocalPreviewDir: cfg.Storage.LocalPreviewDir,
 		OnDriveSaved: func(driveID string) error {
-			d, err := cat.GetDrive(ctx, driveID)
-			if err != nil {
-				return err
-			}
-			if err := app.attachDrive(ctx, d); err != nil {
-				return err
-			}
-			app.scheduleCrawlerUploadMigration(ctx, driveID)
-			// 本地存储或 WebDAV 开启 .strm 越root后，之前因 strm 指向目录外而失败的封面/
-			// 预览/指纹应自动重试，省得用户再手动点三个"重试失败"按钮。
-			if (d.Kind == localstorage.Kind || d.Kind == webdav.Kind) &&
-				parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false) {
-				go app.regenFailedThumbnails(ctx, driveID)
-				go app.regenFailedPreviews(ctx, driveID)
-				go app.regenFailedFingerprints(ctx, driveID)
-			}
-			return nil
+			return app.reloadSavedDrive(ctx, driveID)
 		},
 		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
 			return app.cleanupDriveVideosForDelete(cleanupCtx, driveID)
@@ -412,6 +411,9 @@ func main() {
 		GetBlacklistSourceDeleteStatus: func() api.BlacklistSourceDeleteStatus {
 			return app.blacklistSourceDeleteStatus()
 		},
+		OnRemoveBlacklist: func(reqCtx context.Context, videoID string) error {
+			return app.restoreDeletedVideo(reqCtx, videoID)
+		},
 		OnStartTagRetag: func() bool {
 			return app.startTagRetag(ctx)
 		},
@@ -462,6 +464,7 @@ func main() {
 		log.LstdFlags,
 	)
 	r.Use(requestLogMiddleware(accessLogger, log.Default(), logStore))
+	r.Use(responseCompressionMiddleware)
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware(cfg.Server.AllowedOrigins))
 
@@ -469,7 +472,7 @@ func main() {
 	adminServer.Register(r)
 	mountFrontend(r)
 
-	// 凌晨流水线：每天按后台可热更新的 HH:mm 触发一次，串行跑
+	// 凌晨流水线：每天按后台可热更新的 HH:mm + IANA 时区触发一次，串行跑
 	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 删除检测 + 入队封面/预览视频
 	//   Phase 2 脚本爬虫 + 入队预览视频
 	//   Phase 3 爬虫本地视频 → 云盘上传
@@ -478,9 +481,11 @@ func main() {
 	// 标签匹配不在夜间流水线中全库重算；新视频入库和管理员修改标签规则时按事件刷新。
 	// admin "扫描所有网盘" 使用同一个 Runner 的独立 scan-all 模式，只运行
 	// Phase 1 和 Phase 5，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
+	liveSettings := app.liveConfigSettings()
 	app.nightlyRunner = nightly.New(nightly.Config{
 		Settings:              cat,
-		StartTime:             app.liveConfigSettings().NightlyStartTime,
+		StartTime:             liveSettings.NightlyStartTime,
+		Timezone:              liveSettings.NightlyTimezone,
 		ListScanTargets:       app.listScanTargetIDs,
 		RunScan:               app.runScan,
 		ListCrawlerDrives:     app.listCrawlerDriveIDs,

@@ -296,20 +296,26 @@ func TestHandleRemoveBlacklistRejectsNonRestorableVideo(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cat.Close() })
 
+	// 被去重删掉的视频不可恢复，应当去看保留下来的那一条。
 	now := time.Now()
-	if err := cat.UpsertVideo(ctx, &catalog.Video{
-		ID: "local-upload-video", DriveID: "local-upload", FileID: "upload.mp4",
-		Title: "Upload", PublishedAt: now, CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
-		t.Fatalf("seed video: %v", err)
+	for _, id := range []string{"canonical-video", "duplicate-video"} {
+		if err := cat.UpsertVideo(ctx, &catalog.Video{
+			ID: id, DriveID: "remote", FileID: id + ".mp4",
+			Title: id, PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
 	}
-	if err := cat.DeleteVideoWithTombstone(ctx, "local-upload-video"); err != nil {
+	if err := cat.DeleteVideoWithTombstoneOptions(ctx, "duplicate-video", catalog.DeleteVideoTombstoneOptions{
+		Reason:           catalog.DeletedVideoReasonDuplicate,
+		CanonicalVideoID: "canonical-video",
+	}); err != nil {
 		t.Fatalf("tombstone video: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodDelete, "/admin/api/blacklist/local-upload-video", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/admin/api/blacklist/duplicate-video", nil)
 	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", "local-upload-video")
+	rctx.URLParams.Add("id", "duplicate-video")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	rr := httptest.NewRecorder()
 
@@ -318,8 +324,163 @@ func TestHandleRemoveBlacklistRejectsNonRestorableVideo(t *testing.T) {
 	if rr.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body = %s", rr.Code, rr.Body.String())
 	}
-	if deleted, err := cat.IsVideoDeleted(ctx, "local-upload-video"); err != nil || !deleted {
+	if deleted, err := cat.IsVideoDeleted(ctx, "duplicate-video"); err != nil || !deleted {
 		t.Fatalf("non-restorable tombstone was removed: deleted=%v err=%v", deleted, err)
+	}
+}
+
+// 本地上传的视频没有任何重新发现的途径，取消拉黑必须当场把记录放回媒体库。
+func TestHandleRemoveBlacklistRestoresLocalUploadImmediately(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "local-upload-video", DriveID: "local-upload", FileID: "upload.mp4",
+		FileName: "upload.mp4", Title: "Upload", PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, "local-upload-video"); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+
+	verified := ""
+	server := &AdminServer{
+		Catalog: cat,
+		OnRemoveBlacklist: func(ctx context.Context, id string) error {
+			_, err := cat.RestoreDeletedVideo(ctx, id, func(driveID, fileID string) (catalog.DeletedVideoSourceInfo, error) {
+				verified = driveID + "/" + fileID
+				return catalog.DeletedVideoSourceInfo{Size: 1024, ModTime: now}, nil
+			})
+			return err
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/api/blacklist/local-upload-video", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "local-upload-video")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	server.handleRemoveBlacklist(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	if verified != "local-upload/upload.mp4" {
+		t.Fatalf("verified source = %q, want local-upload/upload.mp4", verified)
+	}
+	if _, err := cat.GetVideo(ctx, "local-upload-video"); err != nil {
+		t.Fatalf("video was not restored: %v", err)
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, "local-upload-video"); err != nil || deleted {
+		t.Fatalf("tombstone still present: deleted=%v err=%v", deleted, err)
+	}
+}
+
+// 源文件已经不在时必须拒绝恢复，否则库里会多出一条点开就播放失败的视频。
+func TestHandleRemoveBlacklistRejectsDirectRestoreWhenSourceMissing(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "local-upload-video", DriveID: "local-upload", FileID: "upload.mp4",
+		FileName: "upload.mp4", Title: "Upload", PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, "local-upload-video"); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+
+	server := &AdminServer{
+		Catalog: cat,
+		OnRemoveBlacklist: func(ctx context.Context, id string) error {
+			_, err := cat.RestoreDeletedVideo(ctx, id, func(string, string) (catalog.DeletedVideoSourceInfo, error) {
+				return catalog.DeletedVideoSourceInfo{}, errors.New("stat upload.mp4: no such file")
+			})
+			return err
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/api/blacklist/local-upload-video", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "local-upload-video")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	server.handleRemoveBlacklist(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", rr.Code, rr.Body.String())
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, "local-upload-video"); err != nil || !deleted {
+		t.Fatalf("tombstone was removed despite missing source: deleted=%v err=%v", deleted, err)
+	}
+	if _, err := cat.GetVideo(ctx, "local-upload-video"); err == nil {
+		t.Fatalf("video must not be restored when the source file is gone")
+	}
+}
+
+// 可扫描来源不该触发源文件校验：它们本来就要等下一轮扫盘，此刻文件在不在
+// 都不影响「删掉墓碑」这个动作。
+func TestHandleRemoveBlacklistSkipsSourceCheckForScannableDrive(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID: "remote-video", DriveID: "remote", FileID: "remote.mp4",
+		FileName: "remote.mp4", Title: "Remote", PublishedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if err := cat.DeleteVideoWithTombstone(ctx, "remote-video"); err != nil {
+		t.Fatalf("tombstone video: %v", err)
+	}
+
+	server := &AdminServer{
+		Catalog: cat,
+		OnRemoveBlacklist: func(ctx context.Context, id string) error {
+			_, err := cat.RestoreDeletedVideo(ctx, id, func(string, string) (catalog.DeletedVideoSourceInfo, error) {
+				t.Fatalf("scannable drive must not be source-checked")
+				return catalog.DeletedVideoSourceInfo{}, nil
+			})
+			return err
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/admin/api/blacklist/remote-video", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "remote-video")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rr := httptest.NewRecorder()
+
+	server.handleRemoveBlacklist(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	// 扫盘来源只是移除墓碑，不会当场重建记录。
+	if _, err := cat.GetVideo(ctx, "remote-video"); err == nil {
+		t.Fatalf("scannable restore must wait for the next scan")
+	}
+	if deleted, err := cat.IsVideoDeleted(ctx, "remote-video"); err != nil || deleted {
+		t.Fatalf("tombstone not removed: deleted=%v err=%v", deleted, err)
 	}
 }
 
@@ -781,6 +942,7 @@ func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpt
 		Name:       "Old name",
 		RootID:     "0",
 		ScanRootID: "0",
+		SkipDirIDs: []string{"keep-skipped"},
 		Credentials: map[string]string{
 			"cookie": "existing-cookie",
 		},
@@ -816,6 +978,53 @@ func TestHandleUpsertDrivePreservesExistingCredentialsWhenRequestCredentialsEmpt
 	}
 	if got.Credentials["cookie"] != "existing-cookie" {
 		t.Fatalf("cookie credential = %q, want existing-cookie", got.Credentials["cookie"])
+	}
+	if len(got.SkipDirIDs) != 1 || got.SkipDirIDs[0] != "keep-skipped" {
+		t.Fatalf("skip dir ids = %#v, want preserved setting", got.SkipDirIDs)
+	}
+}
+
+func TestHandleUpsertDriveClearsSkipDirsWhenExplicitlyRequested(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:         "quark-main",
+		Kind:       "quark",
+		Name:       "Quark",
+		RootID:     "0",
+		SkipDirIDs: []string{"remove-me"},
+		Credentials: map[string]string{
+			"cookie": "existing-cookie",
+		},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", strings.NewReader(`{
+		"id": "quark-main",
+		"kind": "quark",
+		"name": "Quark",
+		"rootId": "0",
+		"credentials": {},
+		"skipDirIds": []
+	}`))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "quark-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if len(got.SkipDirIDs) != 0 {
+		t.Fatalf("skip dir ids = %#v, want cleared", got.SkipDirIDs)
 	}
 }
 
@@ -904,6 +1113,112 @@ func TestHandleUpsertDriveReplacesExistingCredentialsWhenProvided(t *testing.T) 
 	}
 	if got.Credentials["cookie"] != "new-cookie" {
 		t.Fatalf("cookie credential = %q, want new-cookie", got.Credentials["cookie"])
+	}
+}
+
+func TestHandleUpsertPikPakPatchesCredentials(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "pikpak-main",
+		Kind:   "pikpak",
+		Name:   "PikPak",
+		RootID: "",
+		Credentials: map[string]string{
+			"username":      "old-user",
+			"password":      "old-password",
+			"access_token":  "runtime-access",
+			"refresh_token": "runtime-refresh",
+			"captcha_token": "runtime-captcha",
+			"device_id":     "runtime-device",
+		},
+		Status: "ok",
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", bytes.NewBufferString(`{
+		"id": "pikpak-main",
+		"kind": "pikpak",
+		"name": "Renamed PikPak",
+		"rootId": "",
+		"credentials": {"username": "new-user"}
+	}`))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "pikpak-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Name != "Renamed PikPak" || got.Credentials["username"] != "new-user" {
+		t.Fatalf("editable fields not updated: %+v", got)
+	}
+	for key, want := range map[string]string{
+		"password":      "old-password",
+		"access_token":  "runtime-access",
+		"refresh_token": "runtime-refresh",
+		"captcha_token": "runtime-captcha",
+		"device_id":     "runtime-device",
+	} {
+		if got.Credentials[key] != want {
+			t.Fatalf("credential %s = %q, want %q; all=%#v", key, got.Credentials[key], want, got.Credentials)
+		}
+	}
+}
+
+func TestHandleUpsertPikPakDoesNotInheritCredentialsFromAnotherKind(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &catalog.Drive{
+		ID:     "drive-main",
+		Kind:   "quark",
+		Name:   "Quark",
+		RootID: "0",
+		Credentials: map[string]string{
+			"cookie": "old-quark-cookie",
+		},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives", bytes.NewBufferString(`{
+		"id": "drive-main",
+		"kind": "pikpak",
+		"name": "PikPak",
+		"rootId": "",
+		"credentials": {"refresh_token": "pikpak-refresh"}
+	}`))
+	rr := httptest.NewRecorder()
+
+	(&AdminServer{Catalog: cat}).handleUpsertDrive(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := cat.GetDrive(ctx, "drive-main")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Kind != "pikpak" || got.Credentials["refresh_token"] != "pikpak-refresh" {
+		t.Fatalf("pikpak fields not saved: %+v", got)
+	}
+	if _, ok := got.Credentials["cookie"]; ok {
+		t.Fatalf("credentials retained from prior drive kind: %#v", got.Credentials)
 	}
 }
 
@@ -1306,6 +1621,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 			Credentials: map[string]string{
 				"last_crawl_at":   "1800000000",
 				"proxy":           " http://127.0.0.1:7890 ",
+				"upload_proxy":    " socks5h://upload-proxy.example:1080 ",
 				"script_path":     scriptPath,
 				"upload_drive_id": "p115-target",
 				"paused":          "true",
@@ -1394,6 +1710,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		Protocol         string `json:"protocol"`
 		Kind             string `json:"kind"`
 		Proxy            string `json:"proxy"`
+		UploadProxy      string `json:"uploadProxy"`
 		UploadDriveID    string `json:"uploadDriveId"`
 		Paused           bool   `json:"paused"`
 		TeaserEnabled    bool   `json:"teaserEnabled"`
@@ -1413,6 +1730,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		Protocol         string
 		Kind             string
 		Proxy            string
+		UploadProxy      string
 		UploadDriveID    string
 		Paused           bool
 		TeaserEnabled    bool
@@ -1431,6 +1749,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 			Protocol:         d.Protocol,
 			Kind:             d.Kind,
 			Proxy:            d.Proxy,
+			UploadProxy:      d.UploadProxy,
 			UploadDriveID:    d.UploadDriveID,
 			Paused:           d.Paused,
 			TeaserEnabled:    d.TeaserEnabled,
@@ -1457,6 +1776,9 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	}
 	if byID["crawler-main"].Proxy != "http://127.0.0.1:7890" {
 		t.Fatalf("crawler proxy = %q, want trimmed proxy", byID["crawler-main"].Proxy)
+	}
+	if byID["crawler-main"].UploadProxy != "socks5h://upload-proxy.example:1080" {
+		t.Fatalf("crawler upload proxy = %q, want trimmed proxy", byID["crawler-main"].UploadProxy)
 	}
 	if byID["crawler-main"].UploadDriveID != "p115-target" {
 		t.Fatalf("uploadDriveId = %q, want p115-target", byID["crawler-main"].UploadDriveID)
@@ -1665,6 +1987,7 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 		"id": "crawler-upload",
 		"scriptPath": "`+scriptPath+`",
 		"uploadDriveId": "p115-target",
+		"uploadProxy": "  http://upload-proxy.example:7890  ",
 		"teaserEnabled": false
 	}`))
 	rr := httptest.NewRecorder()
@@ -1678,6 +2001,9 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_drive_id"] != "p115-target" {
 		t.Fatalf("upload_drive_id = %q, want p115-target", got.Credentials["upload_drive_id"])
+	}
+	if got.Credentials["upload_proxy"] != "http://upload-proxy.example:7890" {
+		t.Fatalf("upload_proxy = %q, want normalized proxy", got.Credentials["upload_proxy"])
 	}
 	if got.TeaserEnabled {
 		t.Fatal("teaserEnabled = true, want false")
@@ -1702,6 +2028,9 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	}
 	if got.Credentials["upload_drive_id"] != "wopan-target" {
 		t.Fatalf("upload_drive_id = %q, want wopan-target", got.Credentials["upload_drive_id"])
+	}
+	if got.Credentials["upload_proxy"] != "http://upload-proxy.example:7890" {
+		t.Fatalf("omitted upload_proxy = %q, want preserved proxy", got.Credentials["upload_proxy"])
 	}
 	if got.TeaserEnabled {
 		t.Fatal("teaserEnabled after edit without field = true, want preserved false")
@@ -1777,6 +2106,18 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 	srv.handleUpsertCrawler(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("invalid target status = %d, body = %s, want 400", rr.Code, rr.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/admin/api/crawlers", strings.NewReader(`{
+		"id": "crawler-upload",
+		"scriptPath": "`+scriptPath+`",
+		"uploadDriveId": "p115-target",
+		"uploadProxy": "ftp://upload-proxy.example"
+	}`))
+	rr = httptest.NewRecorder()
+	srv.handleUpsertCrawler(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid upload proxy status = %d, body = %s, want 400", rr.Code, rr.Body.String())
 	}
 }
 
@@ -2018,7 +2359,7 @@ func TestCrawlerScriptDownloadURLKeepsNonGitHubURL(t *testing.T) {
 	}
 }
 
-func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
+func TestHandleDeleteCrawlerRemovesScriptLocalVideosAndDrive(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
 	cat, err := catalog.Open(filepath.Join(tmp, "catalog.db"))
@@ -2065,6 +2406,17 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "migrated-video-from-crawler",
+		DriveID:     "pikpak",
+		FileID:      "remote-file-id",
+		Title:       "Keep Migrated Video",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed migrated video: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/admin/api/crawlers/crawler-delete-me", nil)
 	rctx := chi.NewRouteContext()
@@ -2073,16 +2425,25 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 	rr := httptest.NewRecorder()
 
 	stopped := false
+	removed := false
 	(&AdminServer{
 		Catalog:         cat,
 		LocalPreviewDir: filepath.Join(tmp, "previews"),
-		OnDriveDeleteCleanup: func(context.Context, string) (int, error) {
-			t.Fatal("crawler delete must not delete imported videos")
-			return 0, nil
+		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
+			if driveID != "crawler-delete-me" {
+				t.Fatalf("cleanup drive = %q, want crawler-delete-me", driveID)
+			}
+			if err := cat.DeleteVideo(cleanupCtx, "video-from-crawler"); err != nil {
+				t.Fatalf("delete local crawler video: %v", err)
+			}
+			return 1, nil
 		},
 		OnStopDriveTasks: func(driveID string) bool {
 			stopped = driveID == "crawler-delete-me"
 			return true
+		},
+		OnDriveRemoved: func(driveID string) {
+			removed = driveID == "crawler-delete-me"
 		},
 	}).handleDeleteCrawler(rr, req)
 
@@ -2095,15 +2456,17 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 	if !stopped {
 		t.Fatal("stop hook was not called")
 	}
-	drive, err := cat.GetDrive(ctx, "crawler-delete-me")
-	if err != nil {
-		t.Fatalf("crawler drive should remain for existing videos: %v", err)
+	if !removed {
+		t.Fatal("drive removed hook was not called")
 	}
-	if drive.Credentials["script_path"] != "" || drive.Credentials["proxy"] != "" || drive.Credentials["target_new"] != "" || drive.Credentials["paused"] != "" {
-		t.Fatalf("crawler credentials were not cleared: %+v", drive.Credentials)
+	if _, err := cat.GetDrive(ctx, "crawler-delete-me"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("crawler drive lookup error = %v, want sql.ErrNoRows", err)
 	}
-	if _, err := cat.GetVideo(ctx, "video-from-crawler"); err != nil {
-		t.Fatalf("imported video should remain: %v", err)
+	if _, err := cat.GetVideo(ctx, "video-from-crawler"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("local crawler video lookup error = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := cat.GetVideo(ctx, "migrated-video-from-crawler"); err != nil {
+		t.Fatalf("migrated crawler video should remain: %v", err)
 	}
 	var got struct {
 		OK            bool `json:"ok"`
@@ -2113,7 +2476,7 @@ func TestHandleDeleteCrawlerRemovesImportedScript(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !got.OK || got.DeletedVideos != 0 || !got.DeletedScript {
+	if !got.OK || got.DeletedVideos != 1 || !got.DeletedScript {
 		t.Fatalf("response = %#v", got)
 	}
 }

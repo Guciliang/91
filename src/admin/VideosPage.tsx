@@ -1002,12 +1002,10 @@ function BlacklistTab({
           timer = window.setTimeout(poll, 2000);
           return;
         }
-        show(
-          status.failed > 0
-            ? `源文件删除完成：成功 ${status.deleted}，失败 ${status.failed}`
-            : `源文件删除完成：成功 ${status.deleted}`,
-          status.failed > 0 ? "info" : "success"
-        );
+        const summary = [`成功 ${status.deleted}`];
+        if (status.skipped > 0) summary.push(`跳过 ${status.skipped}`);
+        if (status.failed > 0) summary.push(`失败 ${status.failed}`);
+        show(`源文件删除完成：${summary.join("，")}`, status.failed > 0 ? "info" : "success");
         setSelectedIds(new Set());
         void refresh();
       } catch {
@@ -1062,9 +1060,11 @@ function BlacklistTab({
         return next;
       });
       show(
-        target.restorePolicy === "crawler"
-          ? "已取消拉黑，将在下次爬虫任务时生效"
-          : "已取消拉黑，将在下次手动或定时扫盘时生效",
+        target.restorePolicy === "direct"
+          ? "已取消拉黑，视频已恢复到媒体库"
+          : target.restorePolicy === "crawler"
+            ? "已取消拉黑，将在下次爬虫任务时生效"
+            : "已取消拉黑，将在下次手动或定时扫盘时生效",
         "success"
       );
       if (list.length === 1 && page > 1) {
@@ -1277,9 +1277,6 @@ function BlacklistTab({
                     <div className="admin-blacklist-filecell">
                       <span className="admin-blacklist-filename" title={v.fileName || undefined}>{v.fileName || <span className="admin-text-faint">（无文件名）</span>}</span>
                       {v.reason === "duplicate" && <span className="admin-blacklist-reason-pill">重复文件</span>}
-                      {v.driveId === "local-upload" && (
-                        <span className="admin-blacklist-reason-pill">本地上传</span>
-                      )}
                     </div>
                   </td>
                   <td data-label="来源" className="admin-mono-cell admin-blacklist-source-cell">
@@ -1292,7 +1289,8 @@ function BlacklistTab({
                           type="button"
                           className="admin-btn"
                           onClick={() => setRemoveTarget(v)}
-                          title="取消拉黑"
+                          disabled={sourceDeleteRunning}
+                          title={sourceDeleteRunning ? "源文件删除任务运行中" : "取消拉黑"}
                         >
                           取消拉黑
                         </button>
@@ -1308,20 +1306,16 @@ function BlacklistTab({
                         ) : null
                       ) : (
                         <span className="admin-blacklist-unavailable">
-                          {v.driveId === "local-upload" ? "不可自动恢复" : "不可恢复"}
+                          不可恢复
                         </span>
                       )}
                       {sourceDeletable && (
-                        <button
-                          type="button"
-                          className="admin-btn is-danger admin-blacklist-delete-source-btn"
+                        <VideoDeleteIconButton
                           onClick={() => setSourceDeleteTarget(v)}
                           disabled={sourceDeleteRunning}
-                          aria-label={`删除 ${v.fileName || v.id}`}
                           title="删除"
-                        >
-                          <Trash2 size={13} aria-hidden="true" />
-                        </button>
+                          ariaLabel={`删除 ${v.fileName || v.id}`}
+                        />
                       )}
                     </div>
                   </td>
@@ -1396,12 +1390,10 @@ function BlacklistTab({
         title="取消拉黑"
         message={
           removeTarget
-            ? removeTarget.restorePolicy === "crawler"
-              ? `确定取消拉黑「${removeTarget.fileName || removeTarget.id}」吗？此操作不会立即运行爬虫，将在下次爬虫任务时生效。`
-              : `确定取消拉黑「${removeTarget.fileName || removeTarget.id}」吗？视频将在下次扫盘时恢复`
+            ? `确定取消拉黑「${removeTarget.fileName || removeTarget.id}」吗？`
             : ""
         }
-        confirmText="取消拉黑"
+        confirmText="确认"
         centerMessage
         loading={removing}
         onCancel={() => {
@@ -1587,6 +1579,31 @@ function DeleteSourceOption({
   );
 }
 
+function VideoDeleteIconButton({
+  onClick,
+  title,
+  ariaLabel,
+  disabled = false,
+}: {
+  onClick: () => void;
+  title: string;
+  ariaLabel: string;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      className="admin-btn admin-video-action-icon-button is-danger"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={ariaLabel}
+    >
+      <Trash2 size={15} aria-hidden="true" />
+    </button>
+  );
+}
+
 function CurrentVideoCard({
   video,
   driveName,
@@ -1625,22 +1642,18 @@ function CurrentVideoCard({
         <div className="admin-video-card__utility-actions">
           <button
             type="button"
-            className="admin-btn admin-video-card__icon-button"
+            className="admin-btn admin-video-action-icon-button"
             onClick={onEdit}
             title="编辑视频"
             aria-label="编辑视频"
           >
             <Edit size={15} />
           </button>
-          <button
-            type="button"
-            className="admin-btn admin-video-card__icon-button is-danger"
+          <VideoDeleteIconButton
             onClick={onDelete}
             title="删除视频"
-            aria-label="删除视频"
-          >
-            <Trash2 size={15} />
-          </button>
+            ariaLabel="删除视频"
+          />
         </div>
         <label className="admin-video-card__select" title={selected ? "取消选择" : "选择视频"}>
           <input
