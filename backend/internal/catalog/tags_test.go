@@ -95,11 +95,11 @@ func TestListVideosNeedingThumbnailIncludesExistingThumbnailMissingDuration(t *t
 		t.Fatalf("count = %d, want 2", count)
 	}
 
-	counts, err := cat.CountThumbnailsByDrive(ctx)
+	stats, err := cat.CountDriveAssetStats(ctx)
 	if err != nil {
-		t.Fatalf("count thumbnails by drive: %v", err)
+		t.Fatalf("count drive asset stats: %v", err)
 	}
-	if got := counts["drive"]; got.Ready != 2 || got.Pending != 1 || got.Failed != 1 || got.DurationPending != 1 {
+	if got := stats.Thumbnails["drive"]; got.Ready != 2 || got.Pending != 1 || got.Failed != 1 || got.DurationPending != 1 {
 		t.Fatalf("thumbnail counts = %#v, want ready=2 pending=1 failed=1 durationPending=1", got)
 	}
 
@@ -113,11 +113,11 @@ func TestListVideosNeedingThumbnailIncludesExistingThumbnailMissingDuration(t *t
 	if count != 1 {
 		t.Fatalf("count after skip = %d, want 1", count)
 	}
-	counts, err = cat.CountThumbnailsByDrive(ctx)
+	stats, err = cat.CountDriveAssetStats(ctx)
 	if err != nil {
-		t.Fatalf("count thumbnails by drive after skip: %v", err)
+		t.Fatalf("count drive asset stats after skip: %v", err)
 	}
-	if got := counts["drive"]; got.Ready != 2 || got.Pending != 1 || got.Failed != 1 || got.DurationPending != 0 {
+	if got := stats.Thumbnails["drive"]; got.Ready != 2 || got.Pending != 1 || got.Failed != 1 || got.DurationPending != 0 {
 		t.Fatalf("thumbnail counts after skip = %#v, want ready=2 pending=1 failed=1 durationPending=0", got)
 	}
 }
@@ -1072,6 +1072,52 @@ func TestMigrateDoesNotRewriteAlreadySyncedVideoTags(t *testing.T) {
 	}
 }
 
+func TestMigrateRemovesRetiredVideoQuality(t *testing.T) {
+	ctx := context.Background()
+	path := t.TempDir() + "/catalog.db"
+	cat, err := Open(path)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &Video{
+		ID:          "video-quality",
+		DriveID:     "drive",
+		FileID:      "file-quality",
+		Title:       "retired quality video",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx, `ALTER TABLE videos ADD COLUMN quality TEXT`); err != nil {
+		t.Fatalf("add retired quality column: %v", err)
+	}
+	if _, err := cat.db.ExecContext(ctx, `UPDATE videos SET quality = 'HD' WHERE id = 'video-quality'`); err != nil {
+		t.Fatalf("seed retired quality: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if hasColumn(t, reopened, "videos", "quality") {
+		t.Fatal("retired quality column was not dropped")
+	}
+	got, err := reopened.GetVideo(ctx, "video-quality")
+	if err != nil {
+		t.Fatalf("get migrated video: %v", err)
+	}
+	if got.Title != "retired quality video" {
+		t.Fatalf("migrated video lost data: %#v", got)
+	}
+}
+
 func TestMigrateRemovesRetiredLLMTaggingArtifacts(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/catalog.db"
@@ -1256,6 +1302,9 @@ INSERT INTO videos (
 	}
 	if hasColumn(t, cat, "videos", "category") {
 		t.Fatal("legacy category column was not dropped")
+	}
+	if hasColumn(t, cat, "videos", "quality") {
+		t.Fatal("retired quality column was not dropped")
 	}
 	if indexExists(t, cat, "idx_legacy_videos_category") {
 		t.Fatal("legacy category index was not dropped")

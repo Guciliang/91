@@ -1,149 +1,107 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { RefreshCw } from "lucide-react";
-import { useSearchParams } from "react-router";
+import { useLocation, useSearchParams } from "react-router";
 import { AdminEmptyVisual } from "@/admin/AdminEmptyVisual";
 import { AppShell } from "@/components/AppShell";
+import { HomeFeedTabs } from "@/components/HomeFeedTabs";
+import { InfiniteFeedStatus } from "@/components/InfiniteFeedStatus";
 import { ListingLoadError } from "@/components/ListingLoadError";
-import { Pagination } from "@/components/Pagination";
 import { PromoStrip } from "@/components/PromoStrip";
 import { SearchPanel } from "@/components/SearchPanel";
-import { SectionHeader } from "@/components/SectionHeader";
-import { SortToolbar } from "@/components/SortToolbar";
+import { SortToolbar, type ViewMode } from "@/components/SortToolbar";
 import { TagCloud } from "@/components/TagCloud";
 import { VideoGrid } from "@/components/VideoGrid";
-import { fetchHomeVideos, fetchLatestHomeVideos } from "@/data/videos";
+import { VirtualVideoGrid } from "@/components/VirtualVideoGrid";
 import {
-  readListingPage,
+  homeLatestFeedSource,
+  homeRecommendationFeedSource,
+  listingFeedSource,
+} from "@/lib/infiniteFeedSource";
+import {
+  readHomeFeed,
   readListingSort,
   readListingView,
+  withHomeFeed,
   withListingNavigation,
   withListingPage,
   withListingView,
+  type HomeFeedKey,
 } from "@/lib/listingSearchParams";
 import { MOBILE_VIDEO_PAGE_SIZE, useIsMobile } from "@/lib/responsive";
-import { useListingQuery } from "@/lib/useListingQuery";
-import type { VideoItem } from "@/types";
+import { useInfiniteListing } from "@/lib/useInfiniteListing";
+import {
+  useListingRestoreTarget,
+  useListingScrollRestore,
+} from "@/lib/useListingScrollRestore";
+import type { SortKey } from "@/types";
 
-const DESKTOP_COUNT = 12;
-const MOBILE_COUNT = 8;
-const HOME_SEARCH_DESKTOP_PAGE_SIZE = 20;
+const HOME_DESKTOP_BATCH_SIZE = 20;
 
-// 首页推荐接口每次请求都会推进会话轮换游标。模块级快照因此在 SPA 会话内
-// 保持稳定，只有用户主动刷新、浏览器整页刷新或响应式布局需要补足卡片时才更新。
-let cachedRanking: VideoItem[] | null = null;
-let cachedLatest: VideoItem[] | null = null;
+// 距列表尾部还有两行时就续下一批，滚动到底之前数据已经在路上。
+const PREFETCH_ROWS = 2;
 
 export default function HomePage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
   const activeSearchQuery = searchParams.get("q")?.trim() ?? "";
   const activeTag = searchParams.get("tag")?.trim() ?? "";
   const hasActiveSearch = activeSearchQuery.length > 0;
   const hasActiveTag = activeTag.length > 0;
   const hasActiveFilter = hasActiveSearch || hasActiveTag;
-  const searchPage = readListingPage(searchParams);
   const searchSort = readListingSort(searchParams);
   const searchView = readListingView(searchParams);
+  const feed = readHomeFeed(searchParams);
   const isMobile = useIsMobile();
-  const displayCount = isMobile ? MOBILE_COUNT : DESKTOP_COUNT;
-  const searchPageSize = isMobile
-    ? MOBILE_VIDEO_PAGE_SIZE
-    : HOME_SEARCH_DESKTOP_PAGE_SIZE;
-  const searchResult = useListingQuery(
-    {
-      q: activeSearchQuery,
-      tag: activeTag,
-      sort: searchSort,
-      page: searchPage,
-      pageSize: searchPageSize,
-    },
-    { enabled: hasActiveFilter }
-  );
-  const searchSnapshot = searchResult.snapshot;
-  const searchItems = searchSnapshot?.items ?? [];
-  const searchHasContent = searchItems.length > 0;
-  const searchShowSkeleton =
-    searchResult.initialLoading ||
-    (searchResult.transitioning && !searchHasContent);
-  const searchShowContentError =
-    searchResult.phase === "error" && searchHasContent;
-  const searchShowEmptyError =
-    searchResult.phase === "error" && !searchHasContent;
   const eagerCount = isMobile ? 2 : 4;
 
-  const [rankingVideos, setRankingVideos] = useState<VideoItem[]>(cachedRanking ?? []);
-  const [latestVideos, setLatestVideos] = useState<VideoItem[]>(cachedLatest ?? []);
-  const [rankingLoading, setRankingLoading] = useState(cachedRanking === null);
-  const [rankingError, setRankingError] = useState(false);
-  const [rankingRevalidating, setRankingRevalidating] = useState(false);
-  const [latestLoading, setLatestLoading] = useState(cachedLatest === null);
-  const [latestError, setLatestError] = useState(false);
-  const [latestRevalidating, setLatestRevalidating] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const homeRequestVersion = useRef(0);
-  const rankingRequestVersion = useRef(0);
-  const latestRequestVersion = useRef(0);
-  const displayCountRef = useRef(displayCount);
-  const previousDisplayCountRef = useRef(displayCount);
-  const previousSearchPageSizeRef = useRef(searchPageSize);
-  const searchScrollOnCommitRef = useRef(false);
-  displayCountRef.current = displayCount;
+  // 推荐、最新以及任意搜索/标签组合都通过不可变快照无限滚动。source key
+  // 完整描述结果集身份，hook 统一负责累积、缓存、取消和返回位置恢复。
+  const batchSize = isMobile
+    ? MOBILE_VIDEO_PAGE_SIZE
+    : HOME_DESKTOP_BATCH_SIZE;
+  const feedSource = useMemo(
+    () =>
+      feed === "latest"
+        ? homeLatestFeedSource(batchSize)
+        : homeRecommendationFeedSource(),
+    [batchSize, feed]
+  );
+  const filterFeedSource = useMemo(
+    () =>
+      listingFeedSource({
+        q: activeSearchQuery,
+        tag: activeTag,
+        sort: searchSort,
+        pageSize: batchSize,
+      }),
+    [activeSearchQuery, activeTag, batchSize, searchSort]
+  );
+  const activeFeedSource = hasActiveFilter ? filterFeedSource : feedSource;
+  const isRandomRecommendationFeed =
+    !hasActiveFilter && feed === "recommend";
+  const restoreTarget = useListingRestoreTarget({
+    historyKey: location.key,
+    queryKey: activeFeedSource.key,
+    pageSize: activeFeedSource.batchSize,
+    // 随机快照只在当前 Document 内恢复：进详情再后退仍保持现场，浏览器
+    // 刷新生成新 Document 后则从空 token 开始重新随机。
+    feedSnapshotScope: isRandomRecommendationFeed ? "document" : "session",
+  });
+  const homeFeed = useInfiniteListing(activeFeedSource, {
+    restoreCount: restoreTarget.count,
+    restoreFeedToken: restoreTarget.feedToken,
+  });
+  useListingScrollRestore({
+    target: restoreTarget,
+    queryKey: activeFeedSource.key,
+    requestedCount: homeFeed.requestedCount,
+    feedToken: homeFeed.feedToken,
+    itemCount: homeFeed.items.length,
+  });
 
-  const loadRanking = useCallback(async (background: boolean) => {
-    const requestVersion = ++rankingRequestVersion.current;
-    const hasCachedContent = cachedRanking !== null;
-    setRankingLoading(!hasCachedContent);
-    setRankingRevalidating(background && hasCachedContent);
-    setRankingError(false);
-    try {
-      const rankingItems = await fetchHomeVideos(DESKTOP_COUNT);
-      if (requestVersion !== rankingRequestVersion.current) return;
-      cachedRanking = rankingItems;
-      setRankingVideos(rankingItems);
-      setRankingError(false);
-    } catch {
-      if (requestVersion !== rankingRequestVersion.current) return;
-      setRankingError(true);
-    } finally {
-      if (requestVersion === rankingRequestVersion.current) {
-        setRankingLoading(false);
-        setRankingRevalidating(false);
-      }
-    }
-  }, []);
-
-  const loadLatest = useCallback(async (background: boolean) => {
-    const requestVersion = ++latestRequestVersion.current;
-    const hasCachedContent = cachedLatest !== null;
-    setLatestLoading(!hasCachedContent);
-    setLatestRevalidating(background && hasCachedContent);
-    setLatestError(false);
-    try {
-      const latestItems = await fetchLatestHomeVideos(displayCountRef.current);
-      if (requestVersion !== latestRequestVersion.current) return;
-      cachedLatest = latestItems;
-      setLatestVideos(latestItems);
-      setLatestError(false);
-    } catch {
-      if (requestVersion !== latestRequestVersion.current) return;
-      setLatestError(true);
-    } finally {
-      if (requestVersion === latestRequestVersion.current) {
-        setLatestLoading(false);
-        setLatestRevalidating(false);
-      }
-    }
-  }, []);
-
-  const refreshRanking = useCallback(() => loadRanking(true), [loadRanking]);
-  const refreshLatest = useCallback(() => loadLatest(true), [loadLatest]);
-
-  const refreshHome = useCallback(async () => {
-    const requestVersion = ++homeRequestVersion.current;
-    setRefreshing(true);
-    await Promise.allSettled([loadRanking(false), loadLatest(false)]);
-    if (requestVersion !== homeRequestVersion.current) return;
-    setRefreshing(false);
-  }, [loadLatest, loadRanking]);
+  const feedItems = homeFeed.items;
+  const feedHasContent = feedItems.length > 0;
+  const previousFeedKeyRef = useRef(activeFeedSource.key);
 
   useEffect(() => {
     document.title = activeSearchQuery
@@ -154,80 +112,56 @@ export default function HomePage() {
   }, [activeSearchQuery, activeTag]);
 
   useEffect(() => {
-    if (cachedRanking === null) {
-      void loadRanking(false);
-    }
-
-    if (cachedLatest === null) {
-      void loadLatest(false);
-    } else if (cachedLatest.length < displayCountRef.current) {
-      void loadLatest(true);
-    } else {
-      setLatestVideos(cachedLatest);
-      setLatestLoading(false);
-    }
-
-    return () => {
-      homeRequestVersion.current += 1;
-      rankingRequestVersion.current += 1;
-      latestRequestVersion.current += 1;
-    };
-  }, [loadLatest, loadRanking]);
-
-  useEffect(() => {
-    if (hasActiveFilter) return;
-    const previousCount = previousDisplayCountRef.current;
-    if (displayCount <= previousCount) {
-      previousDisplayCountRef.current = displayCount;
-      return;
-    }
-    if (latestVideos.length >= displayCount) {
-      previousDisplayCountRef.current = displayCount;
-      return;
-    }
-    if (refreshing || latestLoading || latestRevalidating) return;
-
-    previousDisplayCountRef.current = displayCount;
-    void refreshLatest();
-  }, [
-    displayCount,
-    hasActiveFilter,
-    latestLoading,
-    latestRevalidating,
-    latestVideos.length,
-    refreshLatest,
-    refreshing,
-  ]);
-
-  useEffect(() => {
-    if (previousSearchPageSizeRef.current === searchPageSize) return;
-    previousSearchPageSizeRef.current = searchPageSize;
-    if (!hasActiveFilter || searchPage === 1) return;
+    // 无限滚动没有页码；清理旧书签或外部链接遗留的 page 参数。
+    if (!searchParams.has("page")) return;
     setSearchParams((current) => withListingPage(current, 1), { replace: true });
-  }, [hasActiveFilter, searchPage, searchPageSize, setSearchParams]);
+  }, [searchParams, setSearchParams]);
 
+  // 换 tab、排序、搜索或标签都会生成一个新结果集，直接回到顶部再累积。
+  // 平滑滚动会被虚拟列表的行高补偿打断而停在半路。
   useEffect(() => {
-    if (
-      !searchScrollOnCommitRef.current ||
-      searchSnapshot?.key !== searchResult.key
-    ) {
-      return;
-    }
-    searchScrollOnCommitRef.current = false;
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  }, [searchResult.key, searchSnapshot?.key]);
+    if (previousFeedKeyRef.current === activeFeedSource.key) return;
+    previousFeedKeyRef.current = activeFeedSource.key;
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [activeFeedSource.key]);
 
-  const ranking = rankingVideos.slice(0, displayCount);
-  const latest = latestVideos.slice(0, displayCount);
-  const homeLoading = rankingLoading || latestLoading;
-  const hasAnyVideos = ranking.length > 0 || latest.length > 0;
-  const hasHomeError = rankingError || latestError;
-  const showEmptyHome = !homeLoading && !hasHomeError && !hasAnyVideos;
-  const displayedSearchSort =
-    searchResult.phase === "error" && searchSnapshot
-      ? searchSnapshot.query.sort
-      : searchSort;
-  const displayedSearchPage = searchSnapshot?.query.page ?? searchPage;
+  const reloadFeed = homeFeed.reload;
+  const refreshHome = useCallback(() => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+    reloadFeed();
+  }, [reloadFeed]);
+
+  const showRefresh = isRandomRecommendationFeed;
+  const refreshing = showRefresh && homeFeed.initialLoading;
+
+  const handleSearchSortChange = useCallback(
+    (nextSort: SortKey) => {
+      setSearchParams(
+        (current) =>
+          withListingNavigation(current, { sort: nextSort, page: 1 }),
+        { replace: true }
+      );
+    },
+    [setSearchParams]
+  );
+
+  const handleSearchViewChange = useCallback(
+    (nextView: ViewMode) => {
+      setSearchParams((current) => withListingView(current, nextView), {
+        replace: true,
+      });
+    },
+    [setSearchParams]
+  );
+
+  const handleFeedChange = useCallback(
+    (nextFeed: HomeFeedKey) => {
+      setSearchParams((current) => withHomeFeed(current, nextFeed), {
+        replace: true,
+      });
+    },
+    [setSearchParams]
+  );
 
   return (
     <AppShell mobileAutoHideNav>
@@ -239,155 +173,77 @@ export default function HomePage() {
           placeholder=""
           className="search-panel--public search-panel--transparent"
         />
-        {hasAnyVideos || hasActiveFilter ? (
+        {feedHasContent || hasActiveFilter ? (
           <TagCloud linkBasePath="/" />
         ) : (
           <div className="tag-cloud-container is-reserved" aria-hidden="true" />
         )}
       </div>
 
-      {hasActiveFilter ? (
-        <div className="container page-section home-primary-section">
+      <div className="container page-section home-primary-section">
+        {hasActiveFilter ? (
           <SortToolbar
-            sort={displayedSearchSort}
+            sort={searchSort}
             view={searchView}
-            sortDisabled={searchResult.initialLoading || searchResult.transitioning}
-            onSortChange={(nextSort) => {
-              searchScrollOnCommitRef.current = true;
-              setSearchParams(
-                withListingNavigation(searchParams, {
-                  sort: nextSort,
-                  page: 1,
-                }),
-                { replace: true }
-              );
-            }}
-            onViewChange={(nextView) => {
-              setSearchParams(withListingView(searchParams, nextView), {
-                replace: true,
-              });
-            }}
+            sortDisabled={homeFeed.initialLoading}
+            onSortChange={handleSearchSortChange}
+            onViewChange={handleSearchViewChange}
           />
+        ) : (
+          <HomeFeedTabs
+            feed={feed}
+            onChange={handleFeedChange}
+          />
+        )}
 
-          {searchShowSkeleton ? (
-            <VideoGrid
-              videos={[]}
-              loading
-              compact={searchView === "compact"}
-              skeletonCount={searchPageSize}
-            />
-          ) : searchShowEmptyError ? (
-            <ListingLoadError
-              hasContent={false}
-              onRetry={searchResult.retry}
-              emptyClassName="admin-empty-state admin-empty-state--plain home-empty-state"
-            />
-          ) : searchSnapshot && searchItems.length === 0 ? (
-            <AdminEmptyVisual
-              variant="no-results"
-              text="未查询到"
-              className="admin-empty-state admin-empty-state--plain home-empty-state"
-            />
-          ) : (
-            <>
-              {searchShowContentError && (
-                <ListingLoadError
-                  hasContent
-                  displayedPage={displayedSearchPage}
-                  onRetry={searchResult.retry}
-                />
-              )}
-              <VideoGrid
-                videos={searchItems}
-                compact={searchView === "compact"}
-                refreshMode={
-                  searchResult.transitioning
-                    ? "blocking"
-                    : searchResult.revalidating
-                    ? "background"
-                    : undefined
-                }
-                eagerCount={eagerCount}
-                highPriorityCount={1}
-              />
-            </>
-          )}
-
-          {searchSnapshot && (
-            <Pagination
-              page={displayedSearchPage}
-              pageSize={searchSnapshot.query.pageSize}
-              total={searchSnapshot.total}
-              disabled={searchResult.transitioning}
-              pendingPage={searchResult.transitioning ? searchPage : undefined}
-              onChange={(nextPage) => {
-                searchScrollOnCommitRef.current = true;
-                setSearchParams(withListingPage(searchParams, nextPage));
-              }}
-            />
-          )}
-        </div>
-      ) : showEmptyHome ? (
-        <div className="container page-section home-primary-section">
+        {homeFeed.initialLoading && !feedHasContent ? (
+          <VideoGrid
+            videos={[]}
+            loading
+            compact={hasActiveFilter && searchView === "compact"}
+            skeletonCount={activeFeedSource.batchSize}
+          />
+        ) : homeFeed.failed && !feedHasContent ? (
+          <ListingLoadError
+            hasContent={false}
+            onRetry={homeFeed.retry}
+            emptyClassName="admin-empty-state admin-empty-state--plain home-empty-state"
+          />
+        ) : !feedHasContent ? (
           <AdminEmptyVisual
-            variant="empty"
-            text="当前库中没有视频"
+            variant={hasActiveFilter ? "no-results" : "empty"}
+            text={hasActiveFilter ? "未查询到" : "当前库中没有视频"}
             className="admin-empty-state admin-empty-state--plain home-empty-state"
           />
-        </div>
-      ) : (
-        <>
-          <div className="container page-section home-primary-section">
-            <SectionHeader title="随机推荐" />
-            {rankingError && ranking.length > 0 && (
-              <ListingLoadError
-                hasContent
-                onRetry={() => void refreshRanking()}
-              />
-            )}
-            <VideoGrid
-              videos={ranking}
-              loading={rankingLoading}
-              refreshMode={
-                refreshing && !rankingLoading
-                  ? "blocking"
-                  : rankingRevalidating
-                  ? "background"
-                  : undefined
-              }
-              emptyText={rankingError ? "随机推荐加载失败，请刷新重试" : undefined}
+        ) : (
+          <>
+            <VirtualVideoGrid
+              videos={feedItems}
+              compact={hasActiveFilter && searchView === "compact"}
               eagerCount={eagerCount}
               highPriorityCount={1}
-              skeletonCount={displayCount}
-            />
-          </div>
-
-          <div className="container page-section">
-            <SectionHeader title="最新视频" />
-            {latestError && latest.length > 0 && (
-              <ListingLoadError
-                hasContent
-                onRetry={() => void refreshLatest()}
-              />
-            )}
-            <VideoGrid
-              videos={latest}
-              loading={latestLoading}
-              refreshMode={
-                refreshing && !latestLoading
-                  ? "blocking"
-                  : latestRevalidating
-                  ? "background"
-                  : undefined
+              key={`${activeFeedSource.key}:${homeFeed.feedToken}`}
+              hasMore={homeFeed.hasMore}
+              loadingMore={homeFeed.loadingMore}
+              prefetchRows={PREFETCH_ROWS}
+              tailContent={
+                homeFeed.loadingMore ? (
+                  <InfiniteFeedStatus state="loading" />
+                ) : undefined
               }
-              emptyText={latestError ? "最新视频加载失败，请刷新重试" : undefined}
-              skeletonCount={displayCount}
+              onLoadMore={homeFeed.loadMore}
             />
-          </div>
-        </>
-      )}
 
-      {!hasActiveFilter && (
+            {homeFeed.failed ? (
+              <ListingLoadError hasContent onRetry={homeFeed.retry} />
+            ) : homeFeed.exhausted ? (
+              <InfiniteFeedStatus state="end" />
+            ) : null}
+          </>
+        )}
+      </div>
+
+      {showRefresh && (
         <button
           type="button"
           className={`home-refresh ${refreshing ? "is-refreshing" : ""}`}

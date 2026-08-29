@@ -1,4 +1,10 @@
-import type { VideoDetail, VideoItem, VideoSubtitle } from "@/types";
+import type {
+  VideoCollection,
+  VideoCollectionSummary,
+  VideoDetail,
+  VideoItem,
+  VideoSubtitle,
+} from "@/types";
 import type {
   VideoReaction,
   VideoReactionCounts,
@@ -64,10 +70,307 @@ export async function fetchListing(
   return result;
 }
 
+export type VideoFeedKind = "listing" | "recommend" | "latest";
+
+export type VideoFeedCursor = {
+  feedToken: string;
+  position: number;
+};
+
+export type VideoFeedResponse = {
+  items: VideoItem[];
+  total: number;
+  feedToken: string;
+  nextCursor: number;
+  exhausted: boolean;
+};
+
+export class VideoFeedExpiredError extends Error {
+  constructor() {
+    super("Video feed expired");
+    this.name = "VideoFeedExpiredError";
+  }
+}
+
+/**
+ * Idempotent snapshot feed. A first response with more data creates an ordered
+ * server-side snapshot; later requests address it with a token and cursor.
+ * A result completed by the first response intentionally has no token.
+ */
+export async function fetchVideoFeed(
+  input: {
+    kind: VideoFeedKind;
+    cursor: VideoFeedCursor;
+    count: number;
+    q?: string;
+    tag?: string;
+    sort?: string;
+  },
+  options: { signal?: AbortSignal } = {}
+): Promise<VideoFeedResponse> {
+  const params = new URLSearchParams({
+    kind: input.kind,
+    cursor: String(input.cursor.position),
+    count: String(input.count),
+  });
+  if (input.cursor.feedToken) params.set("feedToken", input.cursor.feedToken);
+  if (input.q?.trim()) params.set("q", input.q.trim());
+  if (input.tag?.trim()) params.set("tag", input.tag.trim());
+  if (input.sort) params.set("sort", input.sort);
+
+  let result: VideoFeedResponse;
+  try {
+    result = await apiGet<VideoFeedResponse>(`/api/feed?${params.toString()}`, options);
+  } catch (error) {
+    if (error instanceof HTTPStatusError && error.status === 410) {
+      throw new VideoFeedExpiredError();
+    }
+    throw error;
+  }
+
+  if (
+    !result ||
+    !Array.isArray(result.items) ||
+    !Number.isInteger(result.total) ||
+    result.total < 0 ||
+    typeof result.feedToken !== "string" ||
+    result.feedToken.length > 128 ||
+    (input.cursor.feedToken.length > 0 &&
+      result.feedToken !== input.cursor.feedToken) ||
+    !Number.isInteger(result.nextCursor) ||
+    result.nextCursor < input.cursor.position ||
+    result.nextCursor > result.total ||
+    typeof result.exhausted !== "boolean" ||
+    (!result.exhausted && result.feedToken.length === 0) ||
+    (!result.exhausted && result.nextCursor <= input.cursor.position) ||
+    result.exhausted !== (result.nextCursor >= result.total)
+  ) {
+    throw new Error("Invalid /api/feed response");
+  }
+  return result;
+}
+
 export function fetchVideoDetail(id: string): Promise<VideoDetail | null> {
   return apiGet<VideoDetail>(`/api/video/${encodeURIComponent(id)}`).catch(
     () => null
   );
+}
+
+const VIDEO_DETAIL_PREFETCH_TTL_MS = 30_000;
+const VIDEO_DETAIL_PREFETCH_LIMIT = 20;
+
+type PrefetchedVideoDetail = {
+  expiresAt: number;
+  request: Promise<VideoDetail | null>;
+};
+
+const prefetchedVideoDetailsByID = new Map<string, PrefetchedVideoDetail>();
+
+/**
+ * Start the small detail JSON request from the card's pointer-down event. The
+ * route module can load at the same time and consume this request after mount.
+ */
+export function prefetchVideoDetail(id: string): Promise<VideoDetail | null> {
+  const now = Date.now();
+  pruneVideoDetailPrefetches(now);
+  const existing = prefetchedVideoDetailsByID.get(id);
+  if (existing && existing.expiresAt > now) return existing.request;
+
+  const request = fetchVideoDetail(id);
+  const entry = {
+    expiresAt: now + VIDEO_DETAIL_PREFETCH_TTL_MS,
+    request,
+  };
+  prefetchedVideoDetailsByID.set(id, entry);
+  trimVideoDetailPrefetches();
+
+  void request.then((detail) => {
+    if (
+      detail === null &&
+      prefetchedVideoDetailsByID.get(id)?.request === request
+    ) {
+      prefetchedVideoDetailsByID.delete(id);
+    }
+  });
+  return request;
+}
+
+/**
+ * A prefetched response is navigation-scoped rather than a second long-lived
+ * detail cache. Consume it once so later background validation still reaches
+ * the server and can observe edits.
+ */
+export function consumePrefetchedVideoDetail(
+  id: string
+): Promise<VideoDetail | null> | null {
+  const entry = prefetchedVideoDetailsByID.get(id);
+  prefetchedVideoDetailsByID.delete(id);
+  if (!entry || entry.expiresAt <= Date.now()) return null;
+  return entry.request;
+}
+
+function pruneVideoDetailPrefetches(now: number) {
+  for (const [id, entry] of prefetchedVideoDetailsByID) {
+    if (entry.expiresAt <= now) prefetchedVideoDetailsByID.delete(id);
+  }
+}
+
+function trimVideoDetailPrefetches() {
+  while (prefetchedVideoDetailsByID.size > VIDEO_DETAIL_PREFETCH_LIMIT) {
+    const oldestID = prefetchedVideoDetailsByID.keys().next().value;
+    if (!oldestID) return;
+    prefetchedVideoDetailsByID.delete(oldestID);
+  }
+}
+
+export async function fetchVideoRecommendations(
+  id: string,
+  options: { signal?: AbortSignal } = {}
+): Promise<VideoItem[]> {
+  const items = await apiGet<VideoItem[]>(
+    `/api/video/${encodeURIComponent(id)}/recommendations`,
+    options
+  );
+  if (!Array.isArray(items)) {
+    throw new Error("Invalid video recommendations response");
+  }
+  return items;
+}
+
+const VIDEO_RECOMMENDATIONS_PREFETCH_TTL_MS = 30_000;
+const VIDEO_RECOMMENDATIONS_PREFETCH_LIMIT = 20;
+
+type PrefetchedVideoRecommendations = {
+  expiresAt: number;
+  request: Promise<VideoItem[]>;
+};
+
+const prefetchedVideoRecommendationsByID = new Map<
+  string,
+  PrefetchedVideoRecommendations
+>();
+
+/**
+ * Start recommendations only after a click is confirmed as navigation. Their
+ * request runs beside the core detail request but never joins its loading state.
+ */
+export function prefetchVideoRecommendations(
+  id: string
+): Promise<VideoItem[]> {
+  const now = Date.now();
+  pruneVideoRecommendationPrefetches(now);
+  const existing = prefetchedVideoRecommendationsByID.get(id);
+  if (existing && existing.expiresAt > now) return existing.request;
+
+  const request = fetchVideoRecommendations(id);
+  prefetchedVideoRecommendationsByID.set(id, {
+    expiresAt: now + VIDEO_RECOMMENDATIONS_PREFETCH_TTL_MS,
+    request,
+  });
+  trimVideoRecommendationPrefetches();
+
+  // Attach a rejection observer immediately: navigation may take long enough
+  // for a failed prefetch to settle before the detail component consumes it.
+  void request.catch(() => {
+    if (prefetchedVideoRecommendationsByID.get(id)?.request === request) {
+      prefetchedVideoRecommendationsByID.delete(id);
+    }
+  });
+  return request;
+}
+
+export function consumePrefetchedVideoRecommendations(
+  id: string
+): Promise<VideoItem[]> | null {
+  const entry = prefetchedVideoRecommendationsByID.get(id);
+  prefetchedVideoRecommendationsByID.delete(id);
+  if (!entry || entry.expiresAt <= Date.now()) return null;
+  return entry.request;
+}
+
+function pruneVideoRecommendationPrefetches(now: number) {
+  for (const [id, entry] of prefetchedVideoRecommendationsByID) {
+    if (entry.expiresAt <= now) {
+      prefetchedVideoRecommendationsByID.delete(id);
+    }
+  }
+}
+
+function trimVideoRecommendationPrefetches() {
+  while (
+    prefetchedVideoRecommendationsByID.size >
+    VIDEO_RECOMMENDATIONS_PREFETCH_LIMIT
+  ) {
+    const oldestID = prefetchedVideoRecommendationsByID.keys().next().value;
+    if (!oldestID) return;
+    prefetchedVideoRecommendationsByID.delete(oldestID);
+  }
+}
+
+export async function fetchVideoCollection(
+  id: string,
+  options: { signal?: AbortSignal; includePreview?: boolean } = {}
+): Promise<VideoCollection> {
+  const previewQuery = options.includePreview ? "?preview=1" : "";
+  const collection = await apiGet<VideoCollection>(
+    `/api/video/${encodeURIComponent(id)}/collection${previewQuery}`,
+    options
+  );
+  if (
+    !collection ||
+    typeof collection.name !== "string" ||
+    !Number.isInteger(collection.total) ||
+    collection.total < 0 ||
+    !Number.isInteger(collection.currentIndex) ||
+    collection.currentIndex < 0 ||
+    !Array.isArray(collection.items) ||
+    collection.total !== collection.items.length ||
+    collection.items.some(
+      (item) =>
+        !item ||
+        typeof item.id !== "string" ||
+        typeof item.href !== "string" ||
+        typeof item.title !== "string" ||
+        typeof item.thumbnail !== "string" ||
+        typeof item.duration !== "string" ||
+        (item.previewSrc !== undefined &&
+          typeof item.previewSrc !== "string") ||
+        (options.includePreview && typeof item.previewSrc !== "string") ||
+        !Number.isInteger(item.views) ||
+        item.views < 0 ||
+        typeof item.publishedAt !== "string"
+    ) ||
+    (collection.total > 0 &&
+      (collection.currentIndex < 1 ||
+        collection.currentIndex > collection.total))
+  ) {
+    throw new Error("Invalid video collection response");
+  }
+  return collection;
+}
+
+export async function fetchVideoCollectionSummary(
+  id: string,
+  options: { signal?: AbortSignal } = {}
+): Promise<VideoCollectionSummary | null> {
+  const summary = await apiGet<VideoCollectionSummary>(
+    `/api/video/${encodeURIComponent(id)}/collection/summary`,
+    options
+  );
+  if (
+    !summary ||
+    typeof summary.name !== "string" ||
+    !Number.isInteger(summary.total) ||
+    summary.total < 0 ||
+    !Number.isInteger(summary.currentIndex) ||
+    summary.currentIndex < 0 ||
+    (summary.total === 0 && summary.currentIndex !== 0) ||
+    (summary.total > 0 &&
+      (summary.currentIndex < 1 || summary.currentIndex > summary.total))
+  ) {
+    throw new Error("Invalid video collection summary response");
+  }
+  return summary.total > 1 ? summary : null;
 }
 
 export function fetchVideoSubtitles(id: string): Promise<VideoSubtitle[]> {
@@ -318,10 +621,9 @@ export function fetchTags(): Promise<TagItem[]> {
       if (requestVersion === tagCacheVersion) cachedTags = tags;
       return tags;
     })
-    .catch(() => cachedTags ?? [])
     .finally(() => {
       if (pendingTags === request) pendingTags = null;
-  });
+    });
   pendingTags = request;
   return request;
 }

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Link, useSearchParams } from "react-router";
 import { fetchTags, readCachedTags, type TagItem } from "@/data/videos";
 import { withListingNavigation } from "@/lib/listingSearchParams";
@@ -10,7 +18,10 @@ type TagCloudProps = {
   onTagSelect?: () => void;
 };
 
-export function TagCloud({ linkBasePath = "/list", onTagSelect }: TagCloudProps) {
+export const TagCloud = memo(function TagCloud({
+  linkBasePath = "/list",
+  onTagSelect,
+}: TagCloudProps) {
   const [params] = useSearchParams();
   const activeTag = params.get("tag")?.trim() ?? "";
   const initialTagsRef = useRef<TagItem[] | null>(readCachedTags());
@@ -39,6 +50,9 @@ export function TagCloud({ linkBasePath = "/list", onTagSelect }: TagCloudProps)
     fetchTags()
       .then((list) => {
         if (active) setTags(list);
+      })
+      .catch(() => {
+        if (active) setTags([]);
       })
       .finally(() => {
         if (active) setLoaded(true);
@@ -177,4 +191,4 @@ export function TagCloud({ linkBasePath = "/list", onTagSelect }: TagCloudProps)
       </div>
     </div>
   );
-}
+});

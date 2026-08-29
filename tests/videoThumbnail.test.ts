@@ -24,10 +24,9 @@ const css = readFileSync(
 );
 
 test("video thumbnails hide failed images behind a stable lifecycle placeholder", () => {
-  assert.match(thumbnailSource, /type ThumbnailState = "loading" \| "retrying" \| "ready" \| "failed"/);
-  assert.match(thumbnailSource, /src\.startsWith\("\/p\/thumb\/"\)/);
-  assert.match(thumbnailSource, /retry < MAX_LOCAL_THUMBNAIL_RETRIES/);
+  assert.match(thumbnailSource, /type ThumbnailState = "loading" \| "ready" \| "failed"/);
   assert.match(thumbnailSource, /setState\("failed"\)/);
+  assert.doesNotMatch(thumbnailSource, /setTimeout|MAX_LOCAL_THUMBNAIL_RETRIES|withRetryParam/);
   assert.match(thumbnailSource, /className={`thumb-image \$\{state === "ready" \? "is-ready" : ""\}`}/);
   assert.match(cardSource, /<VideoThumbnail[\s\S]*?src=\{video\.thumbnail\}/);
   assert.doesNotMatch(cardSource, /<VideoThumbnail[\s\S]*?key=\{video\.thumbnail\}/);
@@ -35,6 +34,9 @@ test("video thumbnails hide failed images behind a stable lifecycle placeholder"
   assert.match(css, /\.thumb-image\s*\{[^}]*opacity:\s*0/s);
   assert.match(css, /\.thumb-image\.is-ready\s*\{[^}]*opacity:\s*1/s);
   assert.match(thumbnailSource, /className="thumb-placeholder"/);
+  const placeholderRule = css.match(/\.thumb-placeholder\s*\{[^}]*\}/s)?.[0] ?? "";
+  assert.match(placeholderRule, /background:\s*linear-gradient\(145deg/);
+  assert.doesNotMatch(placeholderRule, /radial-gradient|accent-softer/);
   assert.doesNotMatch(thumbnailSource, /thumb-placeholder__mark/);
   assert.doesNotMatch(css, /\.thumb-placeholder__mark/);
 });
@@ -49,6 +51,15 @@ test("cached thumbnails reconcile completion before they can remain hidden", () 
   assert.doesNotMatch(thumbnailSource, /setState\(src \? "loading" : "failed"\)/);
 });
 
+test("deferred thumbnails do not create an image resource", () => {
+  assert.match(thumbnailSource, /enabled\?: boolean/);
+  assert.match(thumbnailSource, /enabled = true/);
+  assert.match(
+    thumbnailSource,
+    /if \(!enabled\) \{[\s\S]*?className="thumb-placeholder"[\s\S]*?data-state="deferred"[\s\S]*?return \(\s*<ThumbnailResource/
+  );
+});
+
 test("only likely first-viewport thumbnails receive eager and high priority hints", () => {
   assert.match(thumbnailSource, /loading=\{eager \|\| highPriority \? "eager" : "lazy"\}/);
   assert.match(thumbnailSource, /fetchPriority=\{highPriority \? "high" : "auto"\}/);
@@ -56,11 +67,15 @@ test("only likely first-viewport thumbnails receive eager and high priority hint
   assert.match(thumbnailSource, /alt=""/);
   assert.match(gridSource, /eager=\{index < eagerCount\}/);
   assert.match(gridSource, /highPriority=\{index < highPriorityCount\}/);
-  assert.match(homeSource, /<SectionHeader title="随机推荐"[\s\S]*?eagerCount=\{eagerCount\}[\s\S]*?highPriorityCount=\{1\}/);
-  assert.match(homeSource, /<SectionHeader title="最新视频"[\s\S]*?<VideoGrid[\s\S]*?videos=\{latest\}[\s\S]*?skeletonCount=\{displayCount\}/);
-  assert.doesNotMatch(
-    homeSource.match(/<SectionHeader title="最新视频"[\s\S]*?<\/div>/)?.[0] ?? "",
-    /eagerCount|highPriorityCount/
+  // 首页两个 tab 共用一个虚拟网格，优先级提示只给首屏那几张。
+  assert.match(
+    homeSource,
+    /<VirtualVideoGrid[\s\S]*?videos=\{feedItems\}[\s\S]*?eagerCount=\{eagerCount\}[\s\S]*?highPriorityCount=\{1\}/
+  );
+  assert.match(homeSource, /const eagerCount = isMobile \? 2 : 4;/);
+  assert.match(
+    homeSource,
+    /<VideoGrid[\s\S]*?videos=\{\[\]\}[\s\S]*?loading[\s\S]*?skeletonCount=\{activeFeedSource\.batchSize\}/
   );
 });
 
@@ -68,4 +83,17 @@ test("preview loading uses an indeterminate indicator instead of fake progress",
   assert.match(css, /\.preview-loader\s*\{[^}]*width:\s*30%[^}]*animation:\s*preview-loading 1\.1s ease-in-out infinite/s);
   assert.match(css, /@keyframes preview-loading/);
   assert.doesNotMatch(css, /@keyframes preview-progress[\s\S]*?width:\s*100%/);
+});
+
+test("preview badge tightly wraps its label", () => {
+  const rule = css.match(/\.preview-tag\s*\{[^}]*\}/s)?.[0] ?? "";
+  assert.match(rule, /display:\s*inline-flex/);
+  assert.match(rule, /width:\s*max-content/);
+  assert.match(rule, /padding:\s*3px 6px/);
+  assert.match(rule, /line-height:\s*1/);
+  assert.match(rule, /letter-spacing:\s*0/);
+  assert.doesNotMatch(
+    css,
+    /\.source-badge,\s*\.preview-tag\s*\{[^}]*height:/s
+  );
 });

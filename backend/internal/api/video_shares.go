@@ -186,11 +186,7 @@ func (s *Server) handleSharedVideoStream(w http.ResponseWriter, r *http.Request)
 		http.NotFound(w, r)
 		return
 	}
-	fileID := v.FileID
-	if v.TranscodeStatus == "ready" && v.TranscodedFileID != "" {
-		fileID = v.TranscodedFileID
-	}
-	s.Proxy.ServeStream(w, r, v.DriveID, fileID)
+	s.Proxy.ServeStream(w, r, v.DriveID, v.FileID)
 }
 
 func (s *Server) handleSharedVideoPreview(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +246,7 @@ func (s *Server) availableVideo(ctx context.Context, id string) (*catalog.Video,
 	if s.Catalog == nil {
 		return nil, sql.ErrNoRows
 	}
-	v, err := s.Catalog.GetVideo(ctx, id)
+	v, err := s.videoByPublicID(ctx, id)
 	if err != nil || v.Hidden {
 		return nil, sql.ErrNoRows
 	}
@@ -267,6 +263,17 @@ func (s *Server) availableVideo(ctx context.Context, id string) (*catalog.Video,
 		return nil, sql.ErrNoRows
 	}
 	return v, nil
+}
+
+func (s *Server) videoByPublicID(ctx context.Context, id string) (*catalog.Video, error) {
+	if s.Catalog == nil {
+		return nil, sql.ErrNoRows
+	}
+	resolvedID, err := s.Catalog.ResolveVideoID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return s.Catalog.GetVideo(ctx, resolvedID)
 }
 
 func (s *Server) mapSharedVideoDetail(ctx context.Context, v *catalog.Video, shareID string) VideoDetailDTO {
@@ -287,8 +294,7 @@ func (s *Server) mapSharedVideoDetail(ctx context.Context, v *catalog.Video, sha
 			Name:   v.Author,
 			Badges: []string{},
 		},
-		RelatedVideos: []VideoDTO{},
-		CommentsList:  []Comment{},
+		CommentsList: []Comment{},
 	}
 }
 

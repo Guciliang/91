@@ -86,6 +86,50 @@ func TestUpsertDrivePreservingSkipDirIDsKeepsConcurrentSetting(t *testing.T) {
 	}
 }
 
+func TestUpsertDriveWithOptionsPreservesOmittedTeaserSetting(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:            "drive",
+		Kind:          "onedrive",
+		Name:          "Old name",
+		RootID:        "root",
+		TeaserEnabled: true,
+		Credentials:   map[string]string{"refresh_token": "keep-token"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	if err := cat.SetDriveTeaserEnabled(ctx, "drive", false); err != nil {
+		t.Fatalf("save latest teaser setting: %v", err)
+	}
+	if err := cat.UpsertDriveWithOptions(ctx, &Drive{
+		ID:            "drive",
+		Kind:          "onedrive",
+		Name:          "New name",
+		RootID:        "root",
+		TeaserEnabled: true, // stale form snapshot; omitted by the request
+		Credentials:   map[string]string{},
+	}, DriveUpsertOptions{PatchCredentials: true}); err != nil {
+		t.Fatalf("partial config upsert: %v", err)
+	}
+
+	got, err := cat.GetDrive(ctx, "drive")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Name != "New name" || got.TeaserEnabled {
+		t.Fatalf("drive after partial save = %+v, want new name and preserved disabled teaser", got)
+	}
+	if got.Credentials["refresh_token"] != "keep-token" {
+		t.Fatalf("credentials = %#v, want latest token preserved", got.Credentials)
+	}
+}
+
 func TestPatchDriveCredentialsPreservesSettingsChangedAfterAttach(t *testing.T) {
 	ctx := context.Background()
 	cat, err := Open(t.TempDir() + "/catalog.db")
@@ -144,6 +188,89 @@ func TestPatchDriveCredentialsPreservesSettingsChangedAfterAttach(t *testing.T) 
 		got.Credentials["captcha_token"] != "new-captcha" ||
 		got.Credentials["username"] != "account" {
 		t.Fatalf("credentials = %#v, want merged token patch", got.Credentials)
+	}
+}
+
+func TestPatchDriveCredentialsIfMatchRejectsReplacedRefreshToken(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID:     "drive",
+		Kind:   "onedrive",
+		Name:   "OneDrive",
+		RootID: "root",
+		Credentials: map[string]string{
+			"access_token":  "old-access",
+			"refresh_token": "old-refresh",
+		},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	applied, err := cat.PatchDriveCredentialsIfMatch(ctx, "drive", "onedrive", "refresh_token", "old-refresh", map[string]string{
+		"access_token":  "runtime-access",
+		"refresh_token": "runtime-refresh",
+	})
+	if err != nil {
+		t.Fatalf("matching conditional patch: %v", err)
+	}
+	if !applied {
+		t.Fatal("matching conditional credential patch was rejected")
+	}
+	if err := cat.PatchDriveCredentials(ctx, "drive", map[string]string{"refresh_token": "admin-refresh"}); err != nil {
+		t.Fatalf("replace refresh token: %v", err)
+	}
+
+	applied, err = cat.PatchDriveCredentialsIfMatch(ctx, "drive", "onedrive", "refresh_token", "runtime-refresh", map[string]string{
+		"access_token":  "late-access",
+		"refresh_token": "late-refresh",
+	})
+	if err != nil {
+		t.Fatalf("conditional patch: %v", err)
+	}
+	if applied {
+		t.Fatal("stale conditional credential patch was applied")
+	}
+	got, err := cat.GetDrive(ctx, "drive")
+	if err != nil {
+		t.Fatalf("get drive: %v", err)
+	}
+	if got.Credentials["access_token"] != "runtime-access" || got.Credentials["refresh_token"] != "admin-refresh" {
+		t.Fatalf("credentials = %#v, want administrator replacement preserved", got.Credentials)
+	}
+}
+
+func TestPatchDriveCredentialsIfMatchRejectsChangedKind(t *testing.T) {
+	ctx := context.Background()
+	cat, err := Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID: "drive", Kind: "onedrive", Name: "Drive", RootID: "root",
+		Credentials: map[string]string{"refresh_token": "same-token"},
+	}); err != nil {
+		t.Fatalf("seed drive: %v", err)
+	}
+	if err := cat.UpsertDrive(ctx, &Drive{
+		ID: "drive", Kind: "googledrive", Name: "Drive", RootID: "root",
+		Credentials: map[string]string{"refresh_token": "same-token"},
+	}); err != nil {
+		t.Fatalf("change drive kind: %v", err)
+	}
+	applied, err := cat.PatchDriveCredentialsIfMatch(ctx, "drive", "onedrive", "refresh_token", "same-token", map[string]string{
+		"access_token": "late-old-kind-token",
+	})
+	if err != nil {
+		t.Fatalf("conditional patch: %v", err)
+	}
+	if applied {
+		t.Fatal("old-kind credential callback was applied to replacement provider")
 	}
 }
 
@@ -398,6 +525,25 @@ func TestSetDriveRuntimeStatusTracksPlaybackFailureAndRecovery(t *testing.T) {
 	}
 	if got.RootID != "configured-root" || !got.TeaserEnabled || len(got.SkipDirIDs) != 1 || got.SkipDirIDs[0] != "keep-skipped" {
 		t.Fatalf("drive settings changed: %+v", got)
+	}
+
+	// A stale admin/config snapshot must not own runtime status. This is the
+	// metadata-only save path used while the mounted Driver keeps running.
+	drive.Name = "Renamed 115"
+	drive.Status = "disconnected"
+	drive.LastError = ""
+	if err := cat.UpsertDrive(ctx, drive); err != nil {
+		t.Fatalf("upsert drive config: %v", err)
+	}
+	got, err = cat.GetDrive(ctx, drive.ID)
+	if err != nil {
+		t.Fatalf("get drive after config upsert: %v", err)
+	}
+	if got.Name != "Renamed 115" {
+		t.Fatalf("name = %q, want config update", got.Name)
+	}
+	if got.Status != "error" || !strings.Contains(got.LastError, "not login") {
+		t.Fatalf("status=%q lastError=%q, config upsert overwrote runtime state", got.Status, got.LastError)
 	}
 
 	if err := cat.SetDriveRuntimeStatus(ctx, drive.ID, "ok", ""); err != nil {

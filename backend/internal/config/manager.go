@@ -24,9 +24,11 @@ var ErrVersionConflict = errors.New("config.yaml changed since it was loaded")
 // LiveSettings is the subset of config.yaml that the running process can
 // safely apply without rebuilding its long-lived dependencies.
 type LiveSettings struct {
+	NightlyDisabled    bool   `json:"nightlyDisabled"`
 	NightlyStartTime   string `json:"nightlyStartTime"`
 	NightlyTimezone    string `json:"nightlyTimezone"`
 	BuiltinTagsEnabled bool   `json:"builtinTagsEnabled"`
+	PreviewConcurrency int    `json:"previewConcurrency"`
 }
 
 // LegacyRuntimeSettings carries values written by the short-lived SQLite
@@ -77,9 +79,11 @@ func NewManager(path string) (*Manager, error) {
 
 func DefaultLiveSettings() LiveSettings {
 	return LiveSettings{
+		NightlyDisabled:    DefaultNightlyDisabled,
 		NightlyStartTime:   DefaultNightlyStartTime,
 		NightlyTimezone:    DefaultNightlyTimezone,
 		BuiltinTagsEnabled: DefaultBuiltinTagsEnabled,
+		PreviewConcurrency: DefaultPreviewConcurrency,
 	}
 }
 
@@ -88,9 +92,11 @@ func liveSettingsFromConfig(cfg *Config) LiveSettings {
 		return DefaultLiveSettings()
 	}
 	return LiveSettings{
+		NightlyDisabled:    cfg.Nightly.Disabled,
 		NightlyStartTime:   cfg.Nightly.StartTime,
 		NightlyTimezone:    cfg.Nightly.Timezone,
 		BuiltinTagsEnabled: cfg.Tags.IsBuiltinPackEnabled(),
+		PreviewConcurrency: cfg.Preview.Concurrency,
 	}
 }
 
@@ -286,14 +292,6 @@ func (m *Manager) MigrateLegacyRuntimeSettings(legacy LegacyRuntimeSettings) (bo
 		changed = true
 	}
 
-	if dedupe, exists := mappingValue(document, "dedupe"); exists {
-		if deleteMappingValue(dedupe, "duplicate_review_enabled") {
-			changed = true
-		}
-		if len(dedupe.Content) == 0 && deleteMappingValue(document, "dedupe") {
-			changed = true
-		}
-	}
 	// Drive definitions have always been persisted and loaded from SQLite. Any
 	// YAML drives node is therefore dead configuration and can contain stale
 	// credentials. Remove the complete node regardless of whether it is empty.
@@ -469,7 +467,9 @@ func removeLiveDocumentValues(document any) {
 	removeNestedValue(root, "nightly", "start_time")
 	removeNestedValue(root, "nightly", "cron_hour")
 	removeNestedValue(root, "nightly", "timezone")
+	removeNestedValue(root, "nightly", "disabled")
 	removeNestedValue(root, "tags", "builtin_pack_enabled")
+	removeNestedValue(root, "preview", "concurrency")
 }
 
 func removeNestedValue(root map[string]any, section, key string) {

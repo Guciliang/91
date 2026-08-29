@@ -52,19 +52,15 @@ test("configuration panel is a dedicated protected admin route", () => {
   assert.match(appSource, /path="settings"[\s\S]*?<SettingsPage \/>/);
   assert.match(layoutSource, /to="\/admin\/settings"/);
   assert.match(layoutSource, />配置面板</);
-  assert.doesNotMatch(appSource, /duplicate-reviews|DuplicateReviewsPage/);
-  assert.doesNotMatch(layoutSource, /重复复核|duplicate-reviews/);
-  assert.doesNotMatch(apiSource, /DuplicateReviewPair|listDuplicateReviews|resolveDuplicateReview/);
-  assert.doesNotMatch(adminCss, /admin-duperev/);
 });
 
 test("configuration panel groups typed fields from the real YAML document", () => {
   assert.match(pageSource, /title="定时任务"/);
-  assert.match(pageSource, /description="按指定时区控制每日扫盘和库内视频维护时间"/);
+  assert.match(pageSource, /description="控制每日扫盘和库内视频维护"/);
   assert.match(pageSource, /label="启动时间"/);
-  assert.match(pageSource, /label="任务时区"/);
-  assert.doesNotMatch(pageSource, /label="任务时区"\s+description=/);
-  assert.match(pageSource, /label="任务时区"[\s\S]*?layout="inline"/);
+  assert.match(pageSource, /label="时区配置"/);
+  assert.doesNotMatch(pageSource, /label="时区配置"\s+description=/);
+  assert.match(pageSource, /label="时区配置"[\s\S]*?layout="inline"/);
   assert.match(pageSource, /<select[\s\S]*?id="nightly-timezone"/);
   assert.match(
     pageSource,
@@ -92,10 +88,61 @@ test("configuration panel groups typed fields from the real YAML document", () =
   assert.match(pageSource, /api\.getConfigYAML\(\)/);
   assert.match(pageSource, /api\.updateConfigYAML\(pendingSave\.after, pendingSave\.version\)/);
   assert.match(pageSource, /有未保存更改/);
-  assert.doesNotMatch(pageSource, /重复复核|duplicateReviewEnabled|duplicate_review_enabled/);
   assert.match(apiSource, /If-Match/);
   assert.match(apiSource, /ConfigConflictError/);
   assert.match(apiSource, /nightlyTimezone: string/);
+});
+
+test("preview concurrency is a per-storage hot-reloadable visual setting", () => {
+  assert.match(pageSource, /id: "config-preview"/);
+  assert.match(pageSource, /title="预览视频"/);
+  assert.match(pageSource, /控制每个存储生成预览视频的并发数/);
+  assert.match(pageSource, /label="并发数"/);
+  assert.match(pageSource, /请根据服务器性能和网盘API并发风控适当调整，建议最高不超过3/);
+  assert.match(pageSource, /id="preview-concurrency"/);
+  assert.match(pageSource, /PREVIEW_CONCURRENCY_OPTIONS\.map/);
+  assert.match(
+    pageSource,
+    /updateVisualField\(\s*"previewConcurrency",\s*Number\(event\.target\.value\)/
+  );
+  assert.match(configYamlSource, /previewConcurrency: number/);
+  assert.match(configYamlSource, /\["preview", "concurrency"\]/);
+  assert.match(configYamlSource, /previewConcurrencyEdits/);
+  assert.match(apiSource, /previewConcurrency: number/);
+  assert.match(adminCss, /\.admin-config-picker-field--concurrency\s*\{/);
+});
+
+test("nightly schedule stop switch uses the shared YAML save flow", () => {
+  assert.match(pageSource, /\n\s+label="停止定时任务"/);
+  assert.match(
+    pageSource,
+    /label="启动时间"[\s\S]*?label="时区配置"[\s\S]*?label="停止定时任务"/
+  );
+  assert.doesNotMatch(pageSource, /开启后不再自动执行每日任务/);
+  assert.match(pageSource, /id="nightly-disabled-toggle"/);
+  assert.match(pageSource, /aria-checked=\{draft\.nightlyDisabled\}/);
+  assert.match(pageSource, /aria-labelledby="nightly-disabled-label"/);
+  assert.match(
+    pageSource,
+    /const scheduleControlsDisabled = controlsDisabled \|\| draft\.nightlyDisabled/
+  );
+  assert.match(
+    pageSource,
+    /id="nightly-start-time"[\s\S]*?disabled=\{scheduleControlsDisabled\}/
+  );
+  assert.match(
+    pageSource,
+    /id="nightly-timezone"[\s\S]*?disabled=\{scheduleControlsDisabled\}/
+  );
+  assert.match(
+    pageSource,
+    /updateVisualField\("nightlyDisabled", !draft\.nightlyDisabled\)/
+  );
+  assert.doesNotMatch(pageSource, /visualDirtyFields\.has\("nightlyDisabled"\)/);
+  assert.match(configYamlSource, /nightlyDisabled: boolean/);
+  assert.match(configYamlSource, /\["nightly", "disabled"\]/);
+  assert.match(configYamlSource, /nightlyDisabledEdits/);
+  assert.match(apiSource, /settings:\s*\{[\s\S]*?nightlyDisabled: boolean/);
 });
 
 test("built-in tag changes use the configuration draft and shared save review", () => {
@@ -123,7 +170,8 @@ test("built-in tag changes use the configuration draft and shared save review", 
   assert.match(configYamlSource, /builtinTagsEnabled: boolean/);
   assert.match(configYamlSource, /\["tags", "builtin_pack_enabled"\]/);
   assert.match(configYamlSource, /builtinTagsEnabledEdits/);
-  assert.match(configYamlSource, /builtin_pack_enabled: \$\{rendered\}/);
+  assert.match(configYamlSource, /key: "builtin_pack_enabled"/);
+  assert.match(configYamlSource, /`\$\{field\.key\}: \$\{rendered\}`/);
   assert.match(diffModalSource, /const hasChanges = diff\.additions \+ diff\.deletions > 0/);
   assert.match(diffModalSource, /aria-label="config\.yaml 变更对比"/);
   assert.doesNotMatch(diffModalSource, /settingChanges|应用设置|Database|TriangleAlert/);
@@ -138,7 +186,7 @@ test("configuration panel keeps the CPA workspace mounted while loading", () => 
   assert.match(pageSource, /if \(!loading && \(loadError \|\| !loaded\)\)/);
   assert.match(pageSource, /aria-busy=\{loading\}/);
   assert.match(pageSource, /const controlsDisabled = loading \|\| saving \|\| loaded === null/);
-  assert.match(pageSource, /loading\s*\? "加载配置中"/);
+  assert.match(pageSource, /loading\s*\? "正在同步"/);
   assert.match(sourceWorkspaceSource, /<Suspense fallback=\{null\}>/);
   assert.doesNotMatch(
     `${pageSource}\n${sourceWorkspaceSource}`,
@@ -161,8 +209,20 @@ test("configuration source workspace stays visible while CodeMirror loads", () =
   assert.match(pageSource, /preloadConfigSourceEditor\(\)\.catch/);
 });
 
+test("configuration diff code loads only while preparing a save", () => {
+  assert.doesNotMatch(pageSource, /import \{ ConfigDiffModal \} from/);
+  assert.match(pageSource, /import\("\.\/settings\/ConfigDiffModal"\)/);
+  assert.match(pageSource, /const LazyConfigDiffModal = lazy\(loadConfigDiffModal\)/);
+  assert.match(pageSource, /Promise\.all\(\[\s*api\.getConfigYAML\(\),\s*loadConfigDiffModal\(\)/s);
+  assert.match(pageSource, /\{pendingSave && \([\s\S]*?<LazyConfigDiffModal/);
+});
+
 test("configuration panel follows the CLIProxy configuration workspace UI", () => {
-  assert.match(pageTitleSource, /title: "配置管理"/);
+  assert.match(pageTitleSource, /title: "配置面板"/);
+  assert.match(pageSource, /const CONFIG_FIELD_COUNT = Object\.keys\(DEFAULT_DRAFT\)\.length/);
+  assert.match(pageSource, /\{CONFIG_FIELD_COUNT\} 项常用配置/);
+  assert.match(pageSource, /statusText="同步失败"/);
+  assert.match(pageSource, /\? "正在同步"[\s\S]*?\? "配置有误"[\s\S]*?\? "正在保存"[\s\S]*?\? "有未保存更改"[\s\S]*?: "已同步"/);
   assert.match(pageSource, /可视化编辑/);
   assert.match(pageSource, /源码编辑/);
   assert.doesNotMatch(pageSource, /placeholder="搜索配置项\.\.\."/);
@@ -183,36 +243,67 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
   assert.match(diffModalSource, /@@ -\{hunk\.oldStart\}/);
   assert.match(diffModalSource, /is-addition/);
   assert.match(diffModalSource, /is-deletion/);
-  assert.match(adminCss, /\.admin-config-tabs\s*\{[^}]*display:\s*grid/s);
   assert.match(
     pageSource,
-    /aria-selected=\{activeTab === "visual"\}[\s\S]*?disabled=\{loading \|\| saving\}/
+    /className="admin-config-mode-switch"\s+role="group"\s+aria-label="配置编辑模式"/
   );
   assert.match(
     pageSource,
-    /aria-selected=\{activeTab === "source"\}[\s\S]*?disabled=\{loading \|\| saving\}/
-  );
-  assert.match(layoutSource, /isSettingsPage \? " admin-main--settings"/);
-  assert.match(
-    adminCss,
-    /\.admin-main--settings\s*\{[^}]*--admin-config-content-width:\s*1480px;/s
+    /<header className="admin-config-header">\s*<ConfigPageMeta[\s\S]*?className="admin-config-mode-switch"/
   );
   assert.match(
     adminCss,
-    /\.admin-config-page\s*\{[^}]*width:\s*min\(100%, var\(--admin-config-content-width, 1480px\)\);[^}]*margin:\s*0 auto;/s
+    /\.admin-config-mode-switch\s*\{[^}]*display:\s*inline-flex;[^}]*border-radius:\s*var\(--radius-pill\);[^}]*background:\s*var\(--bg-surface\);/s
   );
   assert.match(
     adminCss,
-    /\.admin-main--settings \.admin-current-page-header\s*\{[^}]*width:\s*min\(100%, var\(--admin-config-content-width\)\);[^}]*margin:\s*0 auto 10px;/s
+    /\.admin-config-mode-switch button\.is-active\s*\{[^}]*background:\s*var\(--bg-page\);[^}]*box-shadow:\s*var\(--shadow-sm\);/s
   );
   assert.match(
     adminCss,
-    /\.admin-config-section-nav\s*\{[^}]*position:\s*sticky[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\)/s
+    /\.admin-config-header\s*\{[^}]*justify-content:\s*space-between;[^}]*gap:\s*8px 16px;/s
+  );
+  assert.doesNotMatch(pageSource, /className="admin-config-tabs"/);
+  assert.match(
+    pageSource,
+    /aria-pressed=\{activeTab === "visual"\}[\s\S]*?disabled=\{loading \|\| saving\}/
+  );
+  assert.match(
+    pageSource,
+    /aria-pressed=\{activeTab === "source"\}[\s\S]*?disabled=\{loading \|\| saving\}/
+  );
+  assert.doesNotMatch(layoutSource, /isSettingsPage|admin-main--settings/);
+  assert.doesNotMatch(adminCss, /admin-main--settings|admin-config-content-width/);
+  assert.doesNotMatch(
+    adminCss,
+    /\.admin-config-page\s*\{[^}]*(?:max-)?width\s*:/s
+  );
+  assert.doesNotMatch(
+    adminCss,
+    /\.admin-config-header\s*\{[^}]*(?:max-)?width\s*:/s
   );
   assert.match(
     adminCss,
-    /@media \(min-width: 769px\) and \(max-width: 1024px\)[\s\S]*?\.admin-config-section-nav\s*\{[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/s
+    /\.admin-config-meta\s*\{[^}]*font-family:\s*ui-monospace[^}]*font-variant-numeric:\s*tabular-nums;/s
   );
+  assert.match(
+    adminCss,
+    /\.admin-config-meta::before\s*\{[^}]*content:\s*"▍";[^}]*color:\s*var\(--success\);/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-config-section-nav\s*\{[^}]*position:\s*sticky[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*border-bottom:\s*1px solid var\(--border-default\)/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-config-section-nav button::after\s*\{[^}]*bottom:\s*-1px;[^}]*height:\s*2px;[^}]*background:\s*transparent;/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-config-section-nav button\.is-active::after\s*\{[^}]*background:\s*var\(--text-strong\);/s
+  );
+  assert.doesNotMatch(adminCss, /\.admin-config-section-nav\s*\{[^}]*grid-template-columns:/s);
+  assert.doesNotMatch(pageSource, /admin-config-section-nav__index/);
   assert.match(adminCss, /\.admin-config-sections\s*\{[^}]*display:\s*block/s);
   assert.match(
     adminCss,
@@ -331,6 +422,7 @@ test("configuration section navigation directly renders the selected panel", () 
   assert.match(pageSource, /aria-selected=\{activeSection === section\.id\}/);
   assert.match(pageSource, /onClick=\{\(\) => setActiveSection\(section\.id\)\}/);
   assert.match(pageSource, /activeSection === "config-automation"/);
+  assert.match(pageSource, /activeSection === "config-preview"/);
   assert.match(pageSource, /activeSection === "config-tags"/);
   assert.doesNotMatch(pageSource, /activeSection === "config-dedupe"/);
   assert.doesNotMatch(pageSource, /scrollTo\(/);
@@ -351,6 +443,7 @@ test("compact configuration rows stay inline on mobile", () => {
 
   assert.match(markup, /class="admin-config-row admin-config-row--inline"/);
   assert.match(pageSource, /label="启动时间"[\s\S]*?layout="inline"/);
+  assert.match(pageSource, /label="并发数"[\s\S]*?layout="inline"/);
   assert.match(pageSource, /label="内置标签"[\s\S]*?layout="inline"/);
   assert.match(
     adminCss,

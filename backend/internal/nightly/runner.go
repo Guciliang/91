@@ -8,6 +8,8 @@
 //	Phase 1: for each non-crawler cloud drive
 //	           scan + delete-detection + enqueue thumb + enqueue preview video
 //	         wait until all thumb / preview-video queues are idle
+//	Phase 1b: reconcile generated thumbnails/previews against local storage
+//	          enqueue repaired pending rows and wait for their queues to drain
 //	Phase 2: if any script crawler configured
 //	           crawl + enqueue preview video for new videos
 //	         wait until preview-video queues are idle
@@ -15,7 +17,7 @@
 //	         honored within this call)
 //	Phase 4: scan crawler local directories and restore user-requested videos
 //	Phase 5: full-library duplicate video maintenance:
-//	         exact size+sampled_sha256 dedupe, then title/duration/thumbnail dedupe
+//	         exact size+sampled_sha256, title/duration/thumbnail, then content-frame dedupe
 //
 // The pipeline runs until all phases finish, the process exits, or an admin
 // stop request cancels the run. Provider cooldowns may make a single phase take
@@ -68,6 +70,9 @@ type Config struct {
 	Settings   SettingStore
 	CronHour   int // legacy/default hour; zero falls back to 1 unless StartTime is set
 	CronMinute int // default 0
+	// Disabled prevents natural daily triggers without affecting manual scan-all
+	// requests or canceling a pipeline that is already running.
+	Disabled bool
 	// StartTime is the preferred daily schedule in 24-hour HH:mm form. It can
 	// represent midnight and takes precedence over CronHour/CronMinute.
 	StartTime string
@@ -95,6 +100,12 @@ type Config struct {
 	// across all drives are drained (queue empty + no in-flight task). It must
 	// honor ctx cancellation.
 	WaitPreviewQueuesIdle func(ctx context.Context) error
+
+	// RunLocalAssetReconciliation repairs catalog rows whose generated local
+	// thumbnail or preview file is missing. It must finish admitting repaired
+	// pending rows to registered worker queues before returning. The result is
+	// the number of generated asset references reset across both asset types.
+	RunLocalAssetReconciliation func(ctx context.Context) (int, error)
 
 	// RunMigration runs crawlerupload.Migrator.RunOnce for Phase 3.
 	RunMigration func(ctx context.Context) error
@@ -191,7 +202,7 @@ func (r *Runner) Run(ctx context.Context) {
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
 	startTime, timezone := r.Schedule()
-	log.Printf("[nightly] runner started; start_time=%s timezone=%s", startTime, timezone)
+	log.Printf("[nightly] runner started; start_time=%s timezone=%s disabled=%t", startTime, timezone, r.Disabled())
 	for {
 		select {
 		case <-ctx.Done():
@@ -201,7 +212,7 @@ func (r *Runner) Run(ctx context.Context) {
 			r.tryNaturalRun(ctx)
 		case <-r.scheduleChanged:
 			startTime, timezone := r.Schedule()
-			log.Printf("[nightly] schedule updated; start_time=%s timezone=%s", startTime, timezone)
+			log.Printf("[nightly] schedule updated; start_time=%s timezone=%s disabled=%t", startTime, timezone, r.Disabled())
 			// Re-evaluate immediately so saving the current minute does not have
 			// to wait for the next heartbeat and accidentally miss today's run.
 			r.tryNaturalRun(ctx)
@@ -229,10 +240,10 @@ func (r *Runner) UpdateStartTime(value string) error {
 	return nil
 }
 
-// UpdateSchedule atomically changes both components of the natural daily
-// schedule. Validation completes before the lock is acquired, so a rejected
-// update cannot leave a mixed start-time/timezone pair behind.
-func (r *Runner) UpdateSchedule(startTime, timezone string) error {
+// UpdateSchedule atomically changes the natural daily schedule and whether it
+// is disabled. Validation completes before the lock is acquired, so a rejected
+// update cannot leave a partially applied schedule behind.
+func (r *Runner) UpdateSchedule(startTime, timezone string, disabled bool) error {
 	hour, minute, normalizedStartTime, err := parseStartTime(startTime)
 	if err != nil {
 		return err
@@ -247,6 +258,7 @@ func (r *Runner) UpdateSchedule(startTime, timezone string) error {
 	r.cfg.CronMinute = minute
 	r.cfg.StartTime = normalizedStartTime
 	r.cfg.Timezone = normalizedTimezone
+	r.cfg.Disabled = disabled
 	r.location = location
 	r.scheduleMu.Unlock()
 
@@ -275,6 +287,13 @@ func (r *Runner) Timezone() string {
 	return r.cfg.Timezone
 }
 
+// Disabled reports whether natural daily triggers are currently stopped.
+func (r *Runner) Disabled() bool {
+	r.scheduleMu.RLock()
+	defer r.scheduleMu.RUnlock()
+	return r.cfg.Disabled
+}
+
 // Schedule returns a consistent start-time/timezone pair.
 func (r *Runner) Schedule() (string, string) {
 	r.scheduleMu.RLock()
@@ -283,9 +302,10 @@ func (r *Runner) Schedule() (string, string) {
 }
 
 // TriggerScanAll asks the runner to scan every configured non-crawler cloud
-// drive, wait for newly discovered video assets, and then run full-library
-// duplicate maintenance. It deliberately excludes crawler, migration, and
-// retained-video restore phases, and does not consume today's scheduled run.
+// drive, wait for newly discovered video assets, reconcile generated local
+// assets, and then run full-library duplicate maintenance. It deliberately
+// excludes crawler, migration, and retained-video restore phases, and does not
+// consume today's scheduled run.
 func (r *Runner) TriggerScanAll() bool {
 	return r.queueManualRun()
 }
@@ -361,11 +381,15 @@ func (r *Runner) Status() Status {
 
 // tryNaturalRun checks the cron decision and runs the pipeline if due today.
 func (r *Runner) tryNaturalRun(ctx context.Context) {
-	instant := r.cfg.Now()
 	r.scheduleMu.RLock()
+	disabled := r.cfg.Disabled
 	location := r.location
 	hour, minute := r.cfg.CronHour, r.cfg.CronMinute
 	r.scheduleMu.RUnlock()
+	if disabled {
+		return
+	}
+	instant := r.cfg.Now()
 	now := instant.In(location)
 	if now.Hour() != hour || now.Minute() != minute {
 		return
@@ -487,6 +511,9 @@ func (r *Runner) runPipeline(ctx context.Context) {
 	if !r.runScanPhase(ctx, "nightly", "phase 1") {
 		return
 	}
+	if !r.runLocalAssetReconciliationPhase(ctx, "nightly", "phase 1b") {
+		return
+	}
 
 	// ---------- Phase 2 ----------
 	if r.shouldStop(ctx, "nightly", "phase 2") {
@@ -552,6 +579,9 @@ func (r *Runner) runScanAllPipeline(ctx context.Context) {
 	if !r.runScanPhase(ctx, "scan-all", "scan") {
 		return
 	}
+	if !r.runLocalAssetReconciliationPhase(ctx, "scan-all", "asset reconciliation") {
+		return
+	}
 	r.runDedupeAssetCleanupPhase(ctx, "scan-all", "dedupe")
 }
 
@@ -575,12 +605,34 @@ func (r *Runner) runScanPhase(ctx context.Context, component, phase string) bool
 			log.Printf("[%s] %s: scanning drive=%s", component, phase, id)
 			r.cfg.RunScan(ctx, id)
 		}
-		log.Printf("[%s] %s: waiting for preview queues to drain", component, phase)
-		if err := r.waitIdle(ctx, component, phase); err != nil {
-			return false
-		}
+	}
+	log.Printf("[%s] %s: waiting for preview queues to drain", component, phase)
+	if err := r.waitIdle(ctx, component, phase); err != nil {
+		return false
 	}
 	return true
+}
+
+func (r *Runner) runLocalAssetReconciliationPhase(ctx context.Context, component, phase string) bool {
+	if r.shouldStop(ctx, component, phase) {
+		return false
+	}
+	if r.cfg.RunLocalAssetReconciliation == nil {
+		return true
+	}
+	log.Printf("[%s] %s: reconciling generated local assets", component, phase)
+	resets, err := r.cfg.RunLocalAssetReconciliation(ctx)
+	if err != nil {
+		log.Printf("[%s] %s local asset reconciliation: %v", component, phase, err)
+	}
+	if r.shouldStop(ctx, component, phase) {
+		return false
+	}
+	if resets <= 0 {
+		return true
+	}
+	log.Printf("[%s] %s: waiting for %d repaired local asset(s)", component, phase, resets)
+	return r.waitIdle(ctx, component, phase) == nil
 }
 
 func (r *Runner) shouldStop(ctx context.Context, component, phase string) bool {

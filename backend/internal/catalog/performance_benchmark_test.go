@@ -67,31 +67,27 @@ func BenchmarkCatalogPublicReads20K(b *testing.B) {
 		}
 	})
 
-	b.Run("list_tag_without_total_related_pool", func(b *testing.B) {
+	b.Run("recommendation_tag_candidates_48", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if _, _, err := cat.ListVideos(ctx, ListParams{
-				Tag:                "benchmark",
-				Sort:               "latest",
+			if _, err := cat.ListRecommendationCandidates(ctx, RecommendationCandidateParams{
+				Tags:               []string{"benchmark"},
+				ExcludeIDs:         ids[:4],
 				ThumbnailReadyOnly: true,
-				SkipTotal:          true,
-				Page:               1,
-				PageSize:           30,
+				Limit:              48,
 			}); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
 
-	b.Run("list_global_without_total_related_pool", func(b *testing.B) {
+	b.Run("recommendation_global_candidates_48", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if _, _, err := cat.ListVideos(ctx, ListParams{
-				Sort:               "latest",
+			if _, err := cat.ListRecommendationCandidates(ctx, RecommendationCandidateParams{
+				ExcludeIDs:         ids[:4],
 				ThumbnailReadyOnly: true,
-				SkipTotal:          true,
-				Page:               1,
-				PageSize:           200,
+				Limit:              48,
 			}); err != nil {
 				b.Fatal(err)
 			}
@@ -144,6 +140,16 @@ func BenchmarkCatalogPublicReads20K(b *testing.B) {
 		chunk := ids[:32]
 		for i := 0; i < b.N; i++ {
 			if _, err := cat.VisibleVideosByIDs(ctx, chunk); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("visible_summary_chunk_32", func(b *testing.B) {
+		b.ReportAllocs()
+		chunk := ids[:32]
+		for i := 0; i < b.N; i++ {
+			if _, err := cat.VisibleVideoSummariesByIDs(ctx, chunk); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -234,11 +240,11 @@ VALUES ('benchmark', '[]', '{}', 'user', ?, ?)
 INSERT INTO videos (
   id, drive_id, file_id, file_name, content_hash, sampled_sha256,
   fingerprint_status, title, author, tags, duration_seconds, size_bytes,
-  ext, quality, thumbnail_url, thumbnail_updated_at, thumbnail_status,
+  ext, thumbnail_url, thumbnail_updated_at, thumbnail_status,
   preview_status, published_at, created_at, updated_at
 )
 VALUES (?, 'benchmark-drive', ?, ?, ?, ?, 'ready', ?, 'benchmark', ?, 600, ?,
-        'mp4', 'HD', ?, ?, 'ready', 'pending', ?, ?, ?)
+        'mp4', ?, ?, 'ready', 'pending', ?, ?, ?)
 `)
 	if err != nil {
 		b.Fatal(err)

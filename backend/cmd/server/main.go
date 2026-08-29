@@ -106,6 +106,15 @@ func main() {
 	if err := os.MkdirAll(cfg.Storage.LocalPreviewDir, 0o755); err != nil {
 		log.Fatalf("mkdir preview dir: %v", err)
 	}
+	assetLease, err := acquireAssetDirectoryLease(cfg.Storage.LocalPreviewDir, cfg.Storage.DBPath)
+	if err != nil {
+		log.Fatalf("acquire generated asset directory lease: %v", err)
+	}
+	defer func() {
+		if closeErr := assetLease.Close(); closeErr != nil {
+			log.Printf("release generated asset directory lease: %v", closeErr)
+		}
+	}()
 
 	cat, err := catalog.Open(cfg.Storage.DBPath)
 	if err != nil {
@@ -141,7 +150,6 @@ func main() {
 		context.Background(),
 		legacyNightlyStartTimeSetting,
 		legacyBuiltinTagsEnabledSetting,
-		obsoleteDuplicateReviewEnabledSetting,
 	); err != nil {
 		log.Fatalf("remove migrated SQLite configuration: %v", err)
 	}
@@ -184,6 +192,7 @@ func main() {
 		workers:            make(map[string]*preview.Worker),
 		thumbWorkers:       make(map[string]*preview.ThumbWorker),
 		fingerprintWorkers: make(map[string]*fingerprint.Worker),
+		previewConcurrency: cfg.Preview.Concurrency,
 		scriptCrawlers:     make(map[string]*scriptcrawler.Crawler),
 	}
 	app.proxy = proxy.New(app.registry)
@@ -192,6 +201,7 @@ func main() {
 	app.crawlerUploader = crawlerupload.New(crawlerupload.Config{
 		Catalog:          cat,
 		Registry:         app.registry,
+		GetDrive:         app.activeDriveConfig,
 		CommonThumbDir:   app.commonThumbsDir(),
 		OnUploadProgress: app.updateCrawlerUploadProgress,
 	})
@@ -206,14 +216,29 @@ func main() {
 		log.Fatalf("apply initial live configuration: %v", err)
 	}
 
-	if _, err := app.normalizeLegacyThumbnailFiles(ctx); err != nil {
-		log.Printf("[thumbnail-maintenance] migration failed: %v", err)
+	legacyCrawlerStats, err := app.cleanupLegacyDeletedCrawlers(ctx)
+	if err != nil {
+		log.Printf(
+			"[scriptcrawler-maintenance] cleanup incomplete removed_crawlers=%d removed_videos=%d: %v",
+			legacyCrawlerStats.RemovedCrawlers,
+			legacyCrawlerStats.RemovedVideos,
+			err,
+		)
+	} else if legacyCrawlerStats.RemovedCrawlers > 0 {
+		log.Printf(
+			"[scriptcrawler-maintenance] removed legacy deleted crawlers=%d videos=%d",
+			legacyCrawlerStats.RemovedCrawlers,
+			legacyCrawlerStats.RemovedVideos,
+		)
 	}
 	app.loadTheme(ctx)
-	if removed, err := app.cleanupOrphanDriveVideos(ctx); err != nil {
-		log.Printf("[cleanup] orphan drive videos: %v", err)
-	} else if removed > 0 {
-		log.Printf("[cleanup] removed %d orphan drive videos", removed)
+	if orphans, err := app.cat.ListVideosWithMissingDrive(ctx); err != nil {
+		log.Printf("[catalog-maintenance] inspect orphan drive videos: %v", err)
+	} else if len(orphans) > 0 {
+		log.Printf(
+			"[catalog-maintenance] preserved %d videos with missing drive metadata; assets are removed only by an explicit drive deletion",
+			len(orphans),
+		)
 	}
 	if err := app.attachLocalUpload(ctx); err != nil {
 		log.Printf("[local-upload] attach failed: %v", err)
@@ -351,9 +376,14 @@ func main() {
 			setupRequired = false
 			return nil
 		},
-		LocalPreviewDir: cfg.Storage.LocalPreviewDir,
-		OnDriveSaved: func(driveID string) error {
-			return app.reloadSavedDrive(ctx, driveID)
+		LocalPreviewDir:        cfg.Storage.LocalPreviewDir,
+		BeginDriveConfigUpdate: app.beginDriveConfigUpdate,
+		OnDriveRuntimeConfigChanged: func(driveID string) error {
+			return app.reloadDriveRuntime(ctx, driveID)
+		},
+		OnPrepareDriveDelete: func(deleteCtx context.Context, driveID string) error {
+			app.stopDriveTasks(ctx, driveID)
+			return app.waitDriveTasksStopped(deleteCtx, driveID)
 		},
 		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
 			return app.cleanupDriveVideosForDelete(cleanupCtx, driveID)
@@ -396,12 +426,6 @@ func main() {
 		OnRegenFailedFingerprints: func(driveID string) {
 			go app.regenFailedFingerprints(ctx, driveID)
 		},
-		OnStartDriveTranscode: func(driveID string) (bool, string) {
-			return app.startDriveTranscode(ctx, driveID)
-		},
-		OnStopDriveTranscode: func(driveID string) bool {
-			return app.stopDriveTranscode(driveID)
-		},
 		OnDeleteVideo: func(reqCtx context.Context, videoID string, deleteSource bool) (api.DeleteVideoResult, error) {
 			return app.deleteVideo(reqCtx, videoID, deleteSource)
 		},
@@ -437,7 +461,7 @@ func main() {
 			worker := app.workers[driveID]
 			thumbWorker := app.thumbWorkers[driveID]
 			app.mu.Unlock()
-			go app.enqueueDriveGeneration(ctx, driveID, worker, thumbWorker)
+			app.scheduleDriveGenerationEnqueue(ctx, driveID, worker, thumbWorker)
 		},
 		GetTheme: func() string { return app.Theme() },
 		SetTheme: func(theme string) error {
@@ -473,27 +497,30 @@ func main() {
 	mountFrontend(r)
 
 	// 凌晨流水线：每天按后台可热更新的 HH:mm + IANA 时区触发一次，串行跑
-	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 删除检测 + 入队封面/预览视频
+	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 连续缺失确认清理 + 入队封面/预览视频
+	//   Phase 1b 对账本地封面/预览文件 + 将丢失资产重置入队并等待补生成
 	//   Phase 2 脚本爬虫 + 入队预览视频
 	//   Phase 3 爬虫本地视频 → 云盘上传
 	//   Phase 4 扫描爬虫本地目录并恢复已取消拉黑的视频
 	//   Phase 5 全库重复视频维护：精确指纹去重 + 标题/时长/封面近似去重
 	// 标签匹配不在夜间流水线中全库重算；新视频入库和管理员修改标签规则时按事件刷新。
 	// admin "扫描所有网盘" 使用同一个 Runner 的独立 scan-all 模式，只运行
-	// Phase 1 和 Phase 5，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
+	// 云盘扫描、本地资产对账和全库重复维护，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
 	liveSettings := app.liveConfigSettings()
 	app.nightlyRunner = nightly.New(nightly.Config{
-		Settings:              cat,
-		StartTime:             liveSettings.NightlyStartTime,
-		Timezone:              liveSettings.NightlyTimezone,
-		ListScanTargets:       app.listScanTargetIDs,
-		RunScan:               app.runScan,
-		ListCrawlerDrives:     app.listCrawlerDriveIDs,
-		RunCrawlerCrawl:       app.runScriptCrawlerCrawl,
-		WaitPreviewQueuesIdle: app.waitAllPreviewQueuesIdle,
-		RunMigration:          app.crawlerUploader.RunOnce,
-		RestoreCrawlerVideos:  app.restoreScriptCrawlerVideos,
-		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
+		Settings:                    cat,
+		Disabled:                    liveSettings.NightlyDisabled,
+		StartTime:                   liveSettings.NightlyStartTime,
+		Timezone:                    liveSettings.NightlyTimezone,
+		ListScanTargets:             app.listScanTargetIDs,
+		RunScan:                     app.runScan,
+		ListCrawlerDrives:           app.listCrawlerDriveIDs,
+		RunCrawlerCrawl:             app.runScriptCrawlerCrawl,
+		WaitPreviewQueuesIdle:       app.waitAllPreviewQueuesIdle,
+		RunLocalAssetReconciliation: app.reconcileLocalGeneratedAssets,
+		RunMigration:                app.runCrawlerUploadMigration,
+		RestoreCrawlerVideos:        app.restoreScriptCrawlerVideos,
+		RunDedupeAssetCleanup:       app.cleanupDuplicateVideoAssets,
 	})
 	go configManager.Watch(ctx)
 	go app.nightlyRunner.Run(ctx)
@@ -513,6 +540,7 @@ func main() {
 		}
 	}()
 	go app.attachExistingDrives(ctx)
+	go app.runStartupThumbnailNormalization(ctx)
 	go app.migrateHiddenVideosToTombstone(ctx)
 
 	// 等待退出信号或恢复任务要求的受控重启。

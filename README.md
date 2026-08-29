@@ -33,7 +33,7 @@
 - 默认只允许 `.strm` 指向当前网盘根目录内的文件。确有跨目录需求时，可在网盘编辑页启用“`.strm` 允许指向 WebDAV 根目录外”；本地存储对应的选项为“`.strm` 允许指向目录外”。
 - 同一 WebDAV 端点的完整 URL 会按 WebDAV 路径处理，继续使用当前网盘的认证信息；因此可用于 OpenList 挂载中位于扫描根目录外的文件。
 - 其他 HTTP(S) 地址，以及带查询参数、片段或 URL 用户信息的地址，会作为外部链接处理，系统不会向目标发送 WebDAV 账号密码。
-- WebDAV/OpenList 目标若会重定向到 115 等限制并发下载的上游，预览视频会逐段串行生成，并在每段前重新获取链接。生成速度会略慢，但可避免多段并发读取导致的 `403 access denied`；直接使用 Cookie 配置的 115 维持原有的逐段刷新策略。
+- WebDAV/OpenList 目标若会重定向到 115 等限制并发下载的上游，预览视频会逐段串行生成，并在每段前重新获取链接。生成速度会略慢，但可避免多段并发读取导致的 `403 access denied`；直接使用 Cookie 配置的 115 仍会串行生成，并只在读取或签名链接失败后刷新。
 
 ## 预览图
 <img src="ReadMeImage/home.webp" alt="首页展示" width="100%" />
@@ -109,6 +109,23 @@ docker compose build --no-cache    # 完全重新构建
 
 ## 致谢
 
+- [Cli-Proxy-API-Management-Center](https://github.com/router-for-me/Cli-Proxy-API-Management-Center) — 参考其页面设计
+- [ArtPlayer](https://github.com/zhw2590582/ArtPlayer) — 当前项目使用的视频播放器
 - [OpenList](https://github.com/OpenListTeam/OpenList) — 优秀的开源项目
 - [LinuxDo](https://linux.do/) — 学 AI 上 L 站
 - [NodeSeek](https://nodeseek.com/) — MJJ 上 N 站
+
+## 捐赠
+
+如果这个项目对你有帮助，欢迎请我喝杯咖啡。
+
+<table>
+  <tr>
+    <td width="50%"><img src="ReadMeImage/donate-wechat.webp" alt="微信" width="100%" /></td>
+    <td width="50%"><img src="ReadMeImage/donate-alipay.webp" alt="支付宝" width="100%" /></td>
+  </tr>
+  <tr>
+    <td align="center">微信</td>
+    <td align="center">支付宝</td>
+  </tr>
+</table>

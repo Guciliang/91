@@ -3,9 +3,11 @@ package preview
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -158,9 +160,9 @@ func TestThumbWorkerSkipsDurationBackfillWhenExistingThumbnailCannotBeProbed(t *
 	}
 }
 
-func TestThumbWorkerFallsBackToLocalPreviewWhenDriveStreamFails(t *testing.T) {
+func TestThumbWorkerUsesOriginalVideoWhenLocalPreviewExists(t *testing.T) {
 	ctx := context.Background()
-	cat, video := seedPreviewTestVideo(t, "thumb-worker-local-preview")
+	cat, video := seedPreviewTestVideo(t, "thumb-worker-original-with-local-preview")
 	localPreview := filepath.Join(t.TempDir(), "preview.mp4")
 	if err := os.WriteFile(localPreview, []byte("preview"), 0o644); err != nil {
 		t.Fatalf("write local preview: %v", err)
@@ -170,8 +172,8 @@ func TestThumbWorkerFallsBackToLocalPreviewWhenDriveStreamFails(t *testing.T) {
 		t.Fatalf("update video: %v", err)
 	}
 
-	gen := &fakeThumbGenerator{}
-	drv := &previewFakeDrive{streamErr: errors.New("remote unavailable")}
+	gen := &fakeThumbGenerator{probeDuration: 42}
+	drv := &previewFakeDrive{}
 	worker := NewThumbWorker(gen, cat, drv)
 
 	worker.process(ctx, video)
@@ -183,8 +185,14 @@ func TestThumbWorkerFallsBackToLocalPreviewWhenDriveStreamFails(t *testing.T) {
 	if got.ThumbnailURL != "/p/thumb/"+video.ID {
 		t.Fatalf("thumbnail = %q, want generated thumb URL", got.ThumbnailURL)
 	}
-	if gen.thumbnailURL != localPreview {
-		t.Fatalf("thumbnail source = %q, want local preview %q", gen.thumbnailURL, localPreview)
+	if gen.thumbnailURL != "https://video.example/clip.mp4" {
+		t.Fatalf("thumbnail source = %q, want original video stream", gen.thumbnailURL)
+	}
+	if gen.thumbnailDuration != 42 {
+		t.Fatalf("thumbnail duration = %.1f, want original video duration", gen.thumbnailDuration)
+	}
+	if gen.probeCalls != 1 || drv.streamCalls != 1 {
+		t.Fatalf("remote work probe=%d stream=%d, want original-source probe and generation", gen.probeCalls, drv.streamCalls)
 	}
 }
 
@@ -215,6 +223,80 @@ func TestPreviewWorkerGeneratesTeaserWithoutReplacingExistingThumbnail(t *testin
 	if got.PreviewLocal != "/tmp/"+video.ID+".mp4" {
 		t.Fatalf("preview local = %q, want moved teaser path", got.PreviewLocal)
 	}
+}
+
+func TestPreviewWorkerNotifiesDependentThumbnailAfterReady(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "preview-ready-notifies-thumbnail")
+	worker := NewWorker(&fakeTeaserGenerator{}, cat, &previewFakeDrive{})
+	var notified *catalog.Video
+	worker.OnPreviewReady = func(video *catalog.Video) {
+		notified = video
+	}
+
+	worker.process(ctx, video)
+
+	if notified == nil || notified.ID != video.ID {
+		t.Fatalf("notified video = %#v, want %s", notified, video.ID)
+	}
+	if notified.PreviewStatus != "ready" || notified.PreviewLocal == "" {
+		t.Fatalf("notified preview status=%q local=%q", notified.PreviewStatus, notified.PreviewLocal)
+	}
+}
+
+func TestPreviewReadyFollowUpSurvivesRunningThumbnailAttempt(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cat, video := seedPreviewTestVideo(t, "preview-ready-running-thumbnail")
+	gen := &followUpThumbGenerator{
+		started:      make(chan int, 2),
+		releaseFirst: make(chan struct{}),
+	}
+	worker := NewThumbWorker(gen, cat, &previewFakeDrive{})
+	go worker.Run(ctx)
+	if !worker.Enqueue(video) {
+		t.Fatal("enqueue initial thumbnail returned false")
+	}
+
+	select {
+	case call := <-gen.started:
+		if call != 1 {
+			t.Fatalf("first thumbnail call = %d, want 1", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial thumbnail generation did not start")
+	}
+	if err := cat.UpdatePreview(ctx, video.ID, "/tmp/preview.mp4", "ready"); err != nil {
+		t.Fatalf("mark preview ready: %v", err)
+	}
+	ready := *video
+	ready.PreviewLocal = "/tmp/preview.mp4"
+	ready.PreviewStatus = "ready"
+	if !worker.EnqueueFollowUp(&ready) {
+		t.Fatal("enqueue preview-ready follow-up returned false")
+	}
+	close(gen.releaseFirst)
+
+	select {
+	case call := <-gen.started:
+		if call != 2 {
+			t.Fatalf("follow-up thumbnail call = %d, want 2", call)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("preview-ready follow-up was swallowed by queue deduplication")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, err := cat.GetVideo(ctx, video.ID)
+		if err != nil {
+			t.Fatalf("get video: %v", err)
+		}
+		if got.ThumbnailURL == "/p/thumb/"+video.ID {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("follow-up thumbnail did not become ready")
 }
 
 func TestPreviewWorkerDeduplicatesQueuedVideos(t *testing.T) {
@@ -248,6 +330,155 @@ func TestPreviewWorkerDeduplicatesQueuedVideos(t *testing.T) {
 	worker.processQueued(ctx, queued)
 	if !worker.Enqueue(video) {
 		t.Fatal("enqueue after processing returned false, want true")
+	}
+}
+
+func TestPreviewWorkerRunsConfiguredConsumersConcurrently(t *testing.T) {
+	ctx := context.Background()
+	cat, first := seedPreviewTestVideo(t, "preview-concurrent-1")
+	videos := []*catalog.Video{first}
+	for i := 2; i <= 3; i++ {
+		video := *first
+		video.ID = fmt.Sprintf("preview-concurrent-%d", i)
+		video.FileID = fmt.Sprintf("file-id-%d", i)
+		if err := cat.UpsertVideo(ctx, &video); err != nil {
+			t.Fatalf("seed video %d: %v", i, err)
+		}
+		videos = append(videos, &video)
+	}
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseGenerator := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	gen := &blockingTeaserGenerator{
+		started: make(chan struct{}, len(videos)),
+		release: release,
+	}
+	worker := NewWorker(gen, cat, &concurrentPreviewDrive{})
+	worker.SetConcurrency(3)
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		worker.Run(runCtx)
+		close(runDone)
+	}()
+	// seedPreviewTestVideo registered the catalog cleanup first. Test cleanups
+	// run in reverse order, so this always stops the worker before the catalog
+	// is closed, including assertion-failure paths.
+	t.Cleanup(func() {
+		cancel()
+		releaseGenerator()
+		select {
+		case <-runDone:
+		case <-time.After(time.Second):
+			t.Error("preview worker did not stop during test cleanup")
+		}
+	})
+
+	for _, video := range videos {
+		if !worker.EnqueueBlocking(runCtx, video) {
+			t.Fatalf("enqueue %s returned false", video.ID)
+		}
+	}
+	for range videos {
+		select {
+		case <-gen.started:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatal("three preview tasks did not start concurrently")
+		}
+	}
+	status := worker.Status()
+	if status.State != "generating" || status.QueueLength != 0 {
+		t.Fatalf("status while blocked = %#v, want three active tasks and no queued tasks", status)
+	}
+
+	releaseGenerator()
+	waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer waitCancel()
+	if err := worker.WaitIdle(waitCtx); err != nil {
+		t.Fatalf("wait for concurrent worker: %v", err)
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after cancellation")
+	}
+	for _, video := range videos {
+		stored, err := cat.GetVideo(ctx, video.ID)
+		if err != nil {
+			t.Fatalf("get %s: %v", video.ID, err)
+		}
+		if stored.PreviewStatus != "ready" {
+			t.Fatalf("preview status for %s = %q, want ready", video.ID, stored.PreviewStatus)
+		}
+	}
+}
+
+func TestPreviewWorkerAppliesConcurrencyUpdatesWhileRunning(t *testing.T) {
+	ctx := context.Background()
+	cat, first := seedPreviewTestVideo(t, "preview-resize-1")
+	second := *first
+	second.ID = "preview-resize-2"
+	second.FileID = "preview-resize-file-2"
+	if err := cat.UpsertVideo(ctx, &second); err != nil {
+		t.Fatalf("seed second video: %v", err)
+	}
+
+	release := make(chan struct{})
+	gen := &blockingTeaserGenerator{
+		started: make(chan struct{}, 2),
+		release: release,
+	}
+	worker := NewWorker(gen, cat, &concurrentPreviewDrive{})
+	worker.SetConcurrency(1)
+	runCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		worker.Run(runCtx)
+		close(runDone)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(time.Second):
+			t.Error("preview worker did not stop during test cleanup")
+		}
+	})
+
+	if !worker.EnqueueBlocking(runCtx, first) || !worker.EnqueueBlocking(runCtx, &second) {
+		t.Fatal("enqueue preview resize videos failed")
+	}
+	select {
+	case <-gen.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first preview task did not start")
+	}
+	select {
+	case <-gen.started:
+		t.Fatal("second preview task started before concurrency increased")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	worker.SetConcurrency(2)
+	if got := worker.CurrentConcurrency(); got != 2 {
+		t.Fatalf("current concurrency = %d, want 2", got)
+	}
+	select {
+	case <-gen.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second preview task did not start after concurrency increased")
+	}
+	close(release)
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer waitCancel()
+	if err := worker.WaitIdle(waitCtx); err != nil {
+		t.Fatalf("wait for resized worker: %v", err)
 	}
 }
 
@@ -378,6 +609,31 @@ func TestPreviewWorkerGeneratesTeaserForLargeVideo(t *testing.T) {
 	}
 }
 
+func TestPreviewWorkerDiscardsImplausibleStoredDuration(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "preview-implausible-duration")
+	video.Size = 24_184_736
+	video.DurationSeconds = 2_481_536
+	if err := cat.UpsertVideo(ctx, video); err != nil {
+		t.Fatalf("update video: %v", err)
+	}
+
+	gen := &fakeTeaserGenerator{}
+	worker := NewWorker(gen, cat, &previewFakeDrive{})
+	worker.process(ctx, video)
+
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.DurationSeconds != 0 {
+		t.Fatalf("duration = %d, want corrupt metadata cleared", got.DurationSeconds)
+	}
+	if gen.generatedDuration != 0 {
+		t.Fatalf("generation duration = %.1f, want unknown-duration safe plan", gen.generatedDuration)
+	}
+}
+
 func TestPreviewWorkerRateLimitLeavesCurrentPendingAndSkipsNextVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, first := seedPreviewTestVideo(t, "preview-rate-limit-1")
@@ -423,6 +679,49 @@ func TestPreviewWorkerRateLimitLeavesCurrentPendingAndSkipsNextVideo(t *testing.
 	}
 	if gen.generateCalls != 1 {
 		t.Fatalf("generate calls = %d, want second video skipped during cooldown", gen.generateCalls)
+	}
+}
+
+func TestPreviewWorkerRequeuesRecoverableFailureAfterCooldown(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	cat, video := seedPreviewTestVideo(t, "preview-rate-limit-requeue")
+	gen := &fakeTeaserGenerator{generateErrs: []error{
+		&drives.RateLimitError{
+			Provider:   "p115",
+			RetryAfter: time.Millisecond,
+			Err:        errors.New("429 Too Many Requests"),
+		},
+		nil,
+	}}
+	worker := NewWorker(gen, cat, &previewFakeDrive{kind: "p115"})
+
+	if !worker.EnqueueBlocking(ctx, video) {
+		t.Fatal("enqueue returned false")
+	}
+	first := <-worker.ch
+	worker.processQueued(ctx, first)
+
+	var retry *catalog.Video
+	select {
+	case retry = <-worker.ch:
+	case <-ctx.Done():
+		t.Fatal("recoverable preview failure was not requeued")
+	}
+	worker.processQueued(ctx, retry)
+
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.PreviewStatus != "ready" {
+		t.Fatalf("preview status = %q, want ready after retry", got.PreviewStatus)
+	}
+	if gen.generateCalls != 2 {
+		t.Fatalf("generate calls = %d, want initial attempt and one retry", gen.generateCalls)
+	}
+	if got := worker.Status().QueueLength; got != 0 {
+		t.Fatalf("queue length = %d, want empty after successful retry", got)
 	}
 }
 
@@ -530,8 +829,8 @@ func TestThumbWorkerP115MessageOnlyErrorFailsWithoutCooldown(t *testing.T) {
 	if !worker.Status().CooldownUntil.IsZero() {
 		t.Fatalf("cooldown until = %s, want no cooldown for message-only media error", worker.Status().CooldownUntil)
 	}
-	if gen.generateCalls != 1 {
-		t.Fatalf("generate calls = %d, want 1", gen.generateCalls)
+	if gen.generateCalls != 2 || drv.streamCalls != 2 {
+		t.Fatalf("calls generate=%d stream=%d, want one failure-driven link refresh before the terminal failure", gen.generateCalls, drv.streamCalls)
 	}
 }
 
@@ -763,6 +1062,33 @@ func TestThumbWorkerRefreshesRejectedGenerationStreamOnce(t *testing.T) {
 	}
 }
 
+func TestThumbWorkerRefreshesP115OriginalOnlyAfterReadFailure(t *testing.T) {
+	ctx := context.Background()
+	cat, video := seedPreviewTestVideo(t, "thumb-original-on-demand-refresh")
+	gen := &fakeThumbGenerator{generateErrs: []error{
+		errors.New("ffmpeg thumb: partial file after EOF"),
+		nil,
+	}}
+	drv := &previewFakeDrive{kind: "p115"}
+	worker := NewThumbWorker(gen, cat, drv)
+
+	worker.process(ctx, video)
+
+	if drv.streamCalls != 2 {
+		t.Fatalf("stream calls = %d, want initial resolution plus one failure-driven refresh", drv.streamCalls)
+	}
+	if gen.generateCalls != 2 {
+		t.Fatalf("generate calls = %d, want one retry with the refreshed link", gen.generateCalls)
+	}
+	got, err := cat.GetVideo(ctx, video.ID)
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if got.ThumbnailURL != "/p/thumb/"+video.ID {
+		t.Fatalf("thumbnail = %q, want recovered local thumbnail", got.ThumbnailURL)
+	}
+}
+
 func TestPreviewWorkerPrefersGenerationStreamWithoutOriginalRefreshes(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-generation-stream")
@@ -775,8 +1101,8 @@ func TestPreviewWorkerPrefersGenerationStreamWithoutOriginalRefreshes(t *testing
 	if len(gen.generatedURLs) != 1 || gen.generatedURLs[0] != "https://hls.example/initial.m3u8" {
 		t.Fatalf("preview sources = %#v", gen.generatedURLs)
 	}
-	if gen.refreshCalls != 0 || drv.streamCalls != 0 {
-		t.Fatalf("refresh calls = %d, original stream calls = %d", gen.refreshCalls, drv.streamCalls)
+	if drv.streamCalls != 0 {
+		t.Fatalf("original stream calls = %d, want none for a healthy generation stream", drv.streamCalls)
 	}
 }
 
@@ -795,8 +1121,8 @@ func TestPreviewWorkerFallsBackWhenGenerationStreamUnavailable(t *testing.T) {
 	if len(gen.generatedURLs) != 1 || gen.generatedURLs[0] != "https://video.example/clip.mp4" {
 		t.Fatalf("preview sources = %#v", gen.generatedURLs)
 	}
-	if gen.refreshCalls != 3 || drv.streamCalls != 4 {
-		t.Fatalf("refresh calls = %d, original stream calls = %d; want 3 and 4", gen.refreshCalls, drv.streamCalls)
+	if drv.streamCalls != 1 {
+		t.Fatalf("original stream calls = %d, want one on the healthy fallback path", drv.streamCalls)
 	}
 }
 
@@ -812,7 +1138,7 @@ func assertCooldownAround(t *testing.T, until time.Time, before time.Time, want 
 	}
 }
 
-func TestPreviewWorkerRefreshesP115LinksPerTeaserInput(t *testing.T) {
+func TestPreviewWorkerReusesP115LinkAcrossTeaserInputs(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-p115-refresh")
 	video.DurationSeconds = 81
@@ -826,11 +1152,8 @@ func TestPreviewWorkerRefreshesP115LinksPerTeaserInput(t *testing.T) {
 
 	worker.process(ctx, video)
 
-	if gen.refreshCalls != 3 {
-		t.Fatalf("refresh calls = %d, want 3 extra links for a four-input p115 teaser", gen.refreshCalls)
-	}
-	if drv.streamCalls != 4 {
-		t.Fatalf("stream calls = %d, want initial link plus 3 refreshed links", drv.streamCalls)
+	if drv.streamCalls != 1 {
+		t.Fatalf("stream calls = %d, want one task-scoped original link", drv.streamCalls)
 	}
 }
 
@@ -898,6 +1221,38 @@ type fakeThumbGenerator struct {
 	thumbnailURLs     []string
 }
 
+type followUpThumbGenerator struct {
+	mu           sync.Mutex
+	calls        int
+	started      chan int
+	releaseFirst chan struct{}
+}
+
+func (g *followUpThumbGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
+	return 42, nil
+}
+
+func (g *followUpThumbGenerator) GenerateThumbnail(ctx context.Context, _ *drives.StreamLink, videoID string, _ float64) (string, error) {
+	g.mu.Lock()
+	g.calls++
+	call := g.calls
+	g.mu.Unlock()
+	select {
+	case g.started <- call:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	if call == 1 {
+		select {
+		case <-g.releaseFirst:
+			return "", errors.New("invalid media")
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return "/tmp/" + videoID + ".jpg", nil
+}
+
 func (g *fakeThumbGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
 	g.probeCalls++
 	if g.probeErr != nil {
@@ -928,20 +1283,57 @@ func (g *fakeThumbGenerator) GenerateThumbnail(_ context.Context, link *drives.S
 }
 
 type fakeTeaserGenerator struct {
-	localPath     string
-	generateErr   error
-	generateCalls int
-	refreshCalls  int
-	generateErrs  []error
-	generatedURLs []string
+	localPath         string
+	generateErr       error
+	generateCalls     int
+	generateErrs      []error
+	generatedURLs     []string
+	generatedDuration float64
+	refreshCalls      int
+}
+
+type blockingTeaserGenerator struct {
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (g *blockingTeaserGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
+	return 60, nil
+}
+
+func (g *blockingTeaserGenerator) Generate(ctx context.Context, _ *drives.StreamLink, _ float64) (string, error) {
+	select {
+	case g.started <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	select {
+	case <-g.release:
+		return "/tmp/source-teaser.mp4", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (g *blockingTeaserGenerator) MoveToLocal(_ string, videoID string) (string, error) {
+	return "/tmp/" + videoID + ".mp4", nil
+}
+
+type concurrentPreviewDrive struct {
+	previewFakeDrive
+}
+
+func (d *concurrentPreviewDrive) StreamURL(_ context.Context, fileID string) (*drives.StreamLink, error) {
+	return &drives.StreamLink{URL: "https://video.example/" + fileID}, nil
 }
 
 func (g *fakeTeaserGenerator) Probe(context.Context, *drives.StreamLink) (float64, error) {
 	return 0, nil
 }
 
-func (g *fakeTeaserGenerator) Generate(_ context.Context, link *drives.StreamLink, _ float64) (string, error) {
+func (g *fakeTeaserGenerator) Generate(_ context.Context, link *drives.StreamLink, duration float64) (string, error) {
 	g.generateCalls++
+	g.generatedDuration = duration
 	if link != nil {
 		g.generatedURLs = append(g.generatedURLs, link.URL)
 	}
@@ -958,12 +1350,16 @@ func (g *fakeTeaserGenerator) Generate(_ context.Context, link *drives.StreamLin
 	return "/tmp/source-teaser.mp4", nil
 }
 
-func (g *fakeTeaserGenerator) GenerateWithLinkProvider(ctx context.Context, first *drives.StreamLink, duration float64, refresh func(context.Context) (*drives.StreamLink, error)) (string, error) {
-	for i := 0; i < 3; i++ {
-		if _, err := refresh(ctx); err != nil {
-			return "", err
+func (g *fakeTeaserGenerator) GenerateWithLinkRefresh(ctx context.Context, first *drives.StreamLink, duration float64, refresh func(context.Context) (*drives.StreamLink, error)) (string, error) {
+	// Redirecting WebDAV .strm links are refreshed once per serial segment;
+	// ordinary links use the generator's failure-driven refresh path.
+	if first != nil && first.PassThroughRedirects {
+		for i := 0; i < 3; i++ {
+			if _, err := refresh(ctx); err != nil {
+				return "", err
+			}
+			g.refreshCalls++
 		}
-		g.refreshCalls++
 	}
 	return g.Generate(ctx, first, duration)
 }

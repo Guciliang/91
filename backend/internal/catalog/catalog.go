@@ -29,6 +29,10 @@ type Catalog struct {
 	matcherMu      sync.Mutex
 	matcherVersion int64
 	matcher        *tagging.Matcher
+
+	// tagMaintenanceMu serializes rule edits with full-library maintenance so a
+	// matcher built from an older rule set cannot overwrite a just-edited tag.
+	tagMaintenanceMu sync.Mutex
 }
 
 // WriteBarrier owns a database connection with a BEGIN IMMEDIATE transaction.
@@ -66,7 +70,9 @@ func Open(path string) (*Catalog, error) {
 	return c, nil
 }
 
-func (c *Catalog) Close() error { return c.db.Close() }
+func (c *Catalog) Close() error {
+	return c.db.Close()
+}
 
 // BeginWriteBarrier waits for existing writers and prevents new write
 // transactions while still allowing read-only queries and online snapshots.
@@ -143,32 +149,64 @@ type Video struct {
 	DurationSeconds    int       `json:"durationSeconds"`
 	Size               int64     `json:"size"`
 	Ext                string    `json:"ext"`
-	Quality            string    `json:"quality"`
 	ThumbnailURL       string    `json:"thumbnailUrl"`
 	ThumbnailUpdatedAt time.Time `json:"thumbnailUpdatedAt"`
 	PreviewFileID      string    `json:"previewFileId"`
 	PreviewLocal       string    `json:"previewLocal"`
 	PreviewUpdatedAt   time.Time `json:"previewUpdatedAt"`
 	PreviewStatus      string    `json:"previewStatus"`
-	// TranscodeStatus：浏览器兼容性转码状态。
-	// ''=未检测 / pending=已入队 / ready=已转码 / skipped=无需转码 / failed=失败。
-	TranscodeStatus  string    `json:"transcodeStatus"`
-	TranscodeError   string    `json:"transcodeError"`
-	TranscodedFileID string    `json:"transcodedFileId"`
-	TranscodedSize   int64     `json:"transcodedSize"`
-	Views            int       `json:"views"`
-	LastViewedAt     time.Time `json:"lastViewedAt"`
-	Favorites        int       `json:"favorites"`
-	Comments         int       `json:"comments"`
-	Likes            int       `json:"likes"`
-	LastLikedAt      time.Time `json:"lastLikedAt"`
-	Dislikes         int       `json:"dislikes"`
-	Hidden           bool      `json:"hidden"`
-	Badges           []string  `json:"badges"`
-	Description      string    `json:"description"`
-	PublishedAt      time.Time `json:"publishedAt"`
-	CreatedAt        time.Time `json:"createdAt"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	Views              int       `json:"views"`
+	LastViewedAt       time.Time `json:"lastViewedAt"`
+	Favorites          int       `json:"favorites"`
+	Comments           int       `json:"comments"`
+	Likes              int       `json:"likes"`
+	LastLikedAt        time.Time `json:"lastLikedAt"`
+	Dislikes           int       `json:"dislikes"`
+	Hidden             bool      `json:"hidden"`
+	Badges             []string  `json:"badges"`
+	Description        string    `json:"description"`
+	PublishedAt        time.Time `json:"publishedAt"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+}
+
+// VideoSummary is the public card-sized projection of a video. List feeds use
+// this instead of loading the full persistence object, whose hashes, storage
+// locations, processing state and description are only needed by detail and
+// maintenance paths.
+type VideoSummary struct {
+	ID                 string
+	Title              string
+	Author             string
+	DurationSeconds    int
+	ThumbnailURL       string
+	ThumbnailUpdatedAt time.Time
+	PreviewUpdatedAt   time.Time
+	Views              int
+	Badges             []string
+	PublishedAt        time.Time
+}
+
+// RecommendationCandidateParams describes one bounded recommendation pool.
+// Tags are matched as a single "any tag" filter so callers do not need to run
+// one public-list query per tag. Empty Tags selects from the whole public
+// library.
+type RecommendationCandidateParams struct {
+	Tags               []string
+	ExcludeIDs         []string
+	ThumbnailReadyOnly bool
+	Limit              int
+}
+
+// VideoCollectionOrderItem is the smallest projection needed to calculate a
+// video's position in a naturally sorted directory collection. Summary
+// requests use it instead of hydrating full Video persistence objects.
+type VideoCollectionOrderItem struct {
+	ID        string
+	FileName  string
+	Title     string
+	DirName   string
+	CreatedAt time.Time
 }
 
 func (c *Catalog) UpsertVideo(ctx context.Context, v *Video) error {
@@ -238,15 +276,13 @@ func upsertVideoRow(ctx context.Context, exec videoRowExecer, v *Video) ([]strin
 	_, err := exec.ExecContext(ctx, `
 INSERT INTO videos (
   id, drive_id, file_id, file_name, content_hash, sampled_sha256, fingerprint_status, fingerprint_error, parent_id, dir_name, title, author, tags,
-	  duration_seconds, size_bytes, ext, quality, thumbnail_url, thumbnail_updated_at, thumbnail_status,
+	  duration_seconds, size_bytes, ext, thumbnail_url, thumbnail_updated_at, thumbnail_status,
 	  preview_file_id, preview_local, preview_updated_at, preview_status,
-	  transcode_status, transcode_error, transcoded_file_id, transcoded_size,
 	  views, last_viewed_at, favorites, comments, likes, last_liked_at, dislikes,
 	  hidden, badges, description, published_at, created_at, updated_at
 	) VALUES (
 	  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-	  ?, ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
-	  ?, ?, ?, ?,
+	  ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
 	  ?, ?, ?, ?,
 	  ?, ?, ?, ?, ?, ?, ?,
 	  ?, ?, ?, ?, ?, ?
@@ -255,6 +291,10 @@ ON CONFLICT(id) DO UPDATE SET
   file_name       = CASE
                       WHEN excluded.file_name != '' THEN excluded.file_name
                       ELSE videos.file_name
+                    END,
+  parent_id       = CASE
+                      WHEN excluded.parent_id != '' THEN excluded.parent_id
+                      ELSE videos.parent_id
                     END,
   dir_name        = CASE
                       WHEN excluded.dir_name != '' THEN excluded.dir_name
@@ -288,7 +328,6 @@ ON CONFLICT(id) DO UPDATE SET
   duration_seconds= excluded.duration_seconds,
   size_bytes      = excluded.size_bytes,
   ext             = excluded.ext,
-  quality         = excluded.quality,
   thumbnail_url   = excluded.thumbnail_url,
 	thumbnail_updated_at = CASE
 	                    WHEN COALESCE(excluded.thumbnail_url, '') = '' THEN 0
@@ -310,9 +349,8 @@ ON CONFLICT(id) DO UPDATE SET
   updated_at      = excluded.updated_at
 `,
 		v.ID, v.DriveID, v.FileID, v.FileName, v.ContentHash, v.SampledSHA256, fingerprintStatus, v.FingerprintError, v.ParentID, v.DirName, v.Title, v.Author, string(tagsJSON),
-		v.DurationSeconds, v.Size, v.Ext, v.Quality, v.ThumbnailURL, thumbnailUpdatedAt, v.ThumbnailURL,
+		v.DurationSeconds, v.Size, v.Ext, v.ThumbnailURL, thumbnailUpdatedAt, v.ThumbnailURL,
 		v.PreviewFileID, v.PreviewLocal, previewUpdatedAt, nullableStatus(v.PreviewStatus),
-		v.TranscodeStatus, v.TranscodeError, v.TranscodedFileID, v.TranscodedSize,
 		v.Views, unixMilliOrZero(v.LastViewedAt), v.Favorites, v.Comments, v.Likes, unixMilliOrZero(v.LastLikedAt), v.Dislikes,
 		boolToInt(v.Hidden), string(badgesJSON), v.Description,
 		v.PublishedAt.UnixMilli(), v.CreatedAt.UnixMilli(), v.UpdatedAt.UnixMilli(),
@@ -342,91 +380,26 @@ func (c *Catalog) UpdatePreview(ctx context.Context, id, previewLocal, status st
 		          ELSE 0
 		        END,
 		        preview_status = ?,
+		        thumbnail_status = CASE
+		          WHEN ? = 'ready'
+		           AND COALESCE(?, '') != ''
+		           AND COALESCE(thumbnail_url, '') = ''
+		            THEN 'pending'
+		          ELSE thumbnail_status
+		        END,
+		        thumbnail_failures = CASE
+		          WHEN ? = 'ready'
+		           AND COALESCE(?, '') != ''
+		           AND COALESCE(thumbnail_url, '') = ''
+		            THEN 0
+		          ELSE thumbnail_failures
+		        END,
 		        updated_at = ?
 		  WHERE id = ?`,
-		previewLocal, status, previewLocal, now, status, now, id)
+		previewLocal, status, previewLocal, now, status,
+		status, previewLocal, status, previewLocal,
+		now, id)
 	return err
-}
-
-// transcodeCandidateWhereSQL 圈定"可能需要浏览器兼容性转码"的视频：
-// webm 容器规范上只允许 vp8/vp9/av1 + vorbis/opus，浏览器必播，不进候选；
-// strm 是远程引用没有本体。mp4/m4v 虽然容器兼容，但里面可能装着
-// MPEG-4 Part 2 / HEVC 等浏览器解不了的视频轨（表现为黑屏有声音），
-// 所以也进候选，由转码 worker 先远程 probe 实际编码，兼容的直接标
-// skipped（不下载文件），不兼容的才转码。failed 也保留在候选里，
-// 重新点开始转码时会自动重试。
-const transcodeCandidateWhereSQL = `COALESCE(ext, '') NOT IN ('webm', 'strm')
-	AND COALESCE(transcode_status, '') IN ('', 'pending', 'failed')`
-
-// ListTranscodeCandidates 列出某盘所有转码候选视频。limit<=0 表示不限制。
-func (c *Catalog) ListTranscodeCandidates(ctx context.Context, driveID string, limit int) ([]*Video, error) {
-	query := `SELECT ` + allVideoCols + ` FROM videos
-		 WHERE drive_id = ? AND ` + transcodeCandidateWhereSQL + `
-		 ORDER BY created_at ASC, id ASC`
-	args := []any{driveID}
-	if limit > 0 {
-		query += ` LIMIT ?`
-		args = append(args, limit)
-	}
-	rows, err := c.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []*Video
-	for rows.Next() {
-		v, err := scanVideo(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, v)
-	}
-	return out, rows.Err()
-}
-
-// UpdateVideoTranscode 写回单条视频的转码结果。
-// status=ready 时 transcodedFileID/transcodedSize 指向转码产物；
-// 其它 status 调用方应传空值，本函数会按传入值原样覆盖。
-func (c *Catalog) UpdateVideoTranscode(ctx context.Context, id, status, errMsg, transcodedFileID string, transcodedSize int64) error {
-	_, err := c.db.ExecContext(ctx,
-		`UPDATE videos SET transcode_status = ?, transcode_error = ?, transcoded_file_id = ?, transcoded_size = ?, updated_at = ? WHERE id = ?`,
-		status, errMsg, transcodedFileID, transcodedSize, time.Now().UnixMilli(), id)
-	return err
-}
-
-// DriveTranscodeCounts 是单盘的转码进度统计。
-type DriveTranscodeCounts struct {
-	// Pending 是仍在候选集合里、还没有出结果的数量（含从未检测过的）。
-	Pending int
-	Ready   int
-	Failed  int
-	Skipped int
-}
-
-func (c *Catalog) CountTranscodesByDrive(ctx context.Context) (map[string]DriveTranscodeCounts, error) {
-	rows, err := c.db.QueryContext(ctx, `
-		SELECT drive_id,
-		        COUNT(CASE WHEN COALESCE(ext, '') NOT IN ('mp4', 'webm', 'm4v', 'strm')
-		                    AND COALESCE(transcode_status, '') IN ('', 'pending') THEN 1 END) AS pending_count,
-		        COUNT(CASE WHEN COALESCE(transcode_status, '') = 'ready' THEN 1 END) AS ready_count,
-		        COUNT(CASE WHEN COALESCE(transcode_status, '') = 'failed' THEN 1 END) AS failed_count,
-		        COUNT(CASE WHEN COALESCE(transcode_status, '') = 'skipped' THEN 1 END) AS skipped_count
-		  FROM videos
-		 GROUP BY drive_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]DriveTranscodeCounts)
-	for rows.Next() {
-		var driveID string
-		var counts DriveTranscodeCounts
-		if err := rows.Scan(&driveID, &counts.Pending, &counts.Ready, &counts.Failed, &counts.Skipped); err != nil {
-			return nil, err
-		}
-		out[driveID] = counts
-	}
-	return out, rows.Err()
 }
 
 func (c *Catalog) HideVideo(ctx context.Context, id string) error {
@@ -463,14 +436,28 @@ func (c *Catalog) ListHiddenVideos(ctx context.Context) ([]*Video, error) {
 	return out, rows.Err()
 }
 
-// MigrateVideoToDrive rewrites a crawler video row after it has been uploaded
-// to another drive. The video id is preserved so tags, favorites, likes and
-// view records keep pointing at the same logical video.
+// VideoDriveMigration is the complete storage identity of a video after a
+// cross-drive move. Directory identity belongs to the storage location and
+// must be committed with drive/file identity; otherwise readers can observe a
+// video on the destination drive while it still belongs to the source folder.
+type VideoDriveMigration struct {
+	DriveID     string
+	FileID      string
+	ContentHash string
+	ParentID    string
+	DirName     string
+	FileName    string
+	Title       string
+}
+
+// MigrateVideoToDrive atomically rewrites a crawler video row after it has been
+// uploaded to another drive. The video id is preserved so tags, favorites,
+// likes and view records keep pointing at the same logical video.
 //
-// scanner 后续看到 PikPak 目录下相同 hash / file_name 的文件时，会通过
+// scanner 后续看到目标目录下相同 hash / file_name 的文件时，会通过
 // findDuplicate 命中本行，不会再插入重复行。
-func (c *Catalog) MigrateVideoToDrive(ctx context.Context, videoID, newDriveID, newFileID, newContentHash string) error {
-	if videoID == "" || newDriveID == "" || newFileID == "" {
+func (c *Catalog) MigrateVideoToDrive(ctx context.Context, videoID string, target VideoDriveMigration) error {
+	if strings.TrimSpace(videoID) == "" || strings.TrimSpace(target.DriveID) == "" || strings.TrimSpace(target.FileID) == "" {
 		return fmt.Errorf("catalog: migrate video: empty id/drive/file")
 	}
 	res, err := c.db.ExecContext(ctx,
@@ -478,9 +465,25 @@ func (c *Catalog) MigrateVideoToDrive(ctx context.Context, videoID, newDriveID, 
 		   SET drive_id     = ?,
 		       file_id      = ?,
 		       content_hash = CASE WHEN ? != '' THEN ? ELSE content_hash END,
+		       parent_id    = ?,
+		       dir_name     = ?,
+		       file_name    = CASE WHEN ? != '' THEN ? ELSE file_name END,
+		       title        = CASE WHEN ? != '' THEN ? ELSE title END,
 		       updated_at   = ?
 		 WHERE id = ?`,
-		newDriveID, newFileID, newContentHash, newContentHash, time.Now().UnixMilli(), videoID)
+		target.DriveID,
+		target.FileID,
+		target.ContentHash,
+		target.ContentHash,
+		target.ParentID,
+		target.DirName,
+		target.FileName,
+		target.FileName,
+		target.Title,
+		target.Title,
+		time.Now().UnixMilli(),
+		videoID,
+	)
 	if err != nil {
 		return err
 	}
@@ -622,15 +625,20 @@ func (c *Catalog) IncrementView(ctx context.Context, id string) (int, error) {
 	return views, nil
 }
 
-// VideoMetaPatch 轻量更新视频元数据（仅非零值字段会被写入）
+// VideoMetaPatch 轻量更新视频元数据。大多数字段仍按非零值更新；带 Set
+// 标记的字段允许调用方显式写入零值。
 type VideoMetaPatch struct {
 	ThumbnailURL           string
 	ThumbnailStatus        string
 	ResetThumbnailFailures bool
 	DurationSeconds        int
+	DurationSecondsSet     bool
 	ContentHash            string
 	FileName               string
+	ParentID               string
+	ParentIDSet            bool
 	DirName                string
+	DirNameSet             bool
 	Title                  string
 	TitleSet               bool
 	Author                 string
@@ -672,9 +680,13 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 	if p.ResetThumbnailFailures {
 		parts = append(parts, "thumbnail_failures = 0")
 	}
-	if p.DurationSeconds > 0 {
+	if p.DurationSecondsSet || p.DurationSeconds > 0 {
 		parts = append(parts, "duration_seconds = ?")
-		args = append(args, p.DurationSeconds)
+		duration := p.DurationSeconds
+		if duration < 0 {
+			duration = 0
+		}
+		args = append(args, duration)
 	}
 	if p.ContentHash != "" {
 		parts = append(parts, "content_hash = ?")
@@ -684,7 +696,11 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 		parts = append(parts, "file_name = ?")
 		args = append(args, p.FileName)
 	}
-	if p.DirName != "" {
+	if p.ParentIDSet || p.ParentID != "" {
+		parts = append(parts, "parent_id = ?")
+		args = append(args, p.ParentID)
+	}
+	if p.DirNameSet || p.DirName != "" {
 		parts = append(parts, "dir_name = ?")
 		args = append(args, p.DirName)
 	}
@@ -832,6 +848,185 @@ func (c *Catalog) ListVideosByThumbnailStatus(ctx context.Context, driveID, stat
 	return out, nil
 }
 
+// LocalThumbnailReference is a snapshot of the persisted ownership link
+// between a video and its generated thumbnail. ThumbnailVersion is used as a
+// compare-and-swap token so a filesystem check cannot clear a thumbnail that
+// was regenerated after the snapshot was read.
+type LocalThumbnailReference struct {
+	VideoID          string
+	ThumbnailVersion int64
+}
+
+// ListCanonicalLocalThumbnailReferences returns videos whose persisted
+// thumbnail points at the generated local asset owned by that same video. The
+// catalog deliberately does not inspect the filesystem; the application layer
+// owns that boundary and decides which references no longer have a backing
+// file.
+func (c *Catalog) ListCanonicalLocalThumbnailReferences(ctx context.Context) ([]LocalThumbnailReference, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, COALESCE(thumbnail_updated_at, 0)
+		  FROM videos
+		 WHERE thumbnail_url = '/p/thumb/' || id
+		 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	references := make([]LocalThumbnailReference, 0)
+	for rows.Next() {
+		var reference LocalThumbnailReference
+		if err := rows.Scan(&reference.VideoID, &reference.ThumbnailVersion); err != nil {
+			return nil, err
+		}
+		references = append(references, reference)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return references, nil
+}
+
+// ResetMissingLocalThumbnails atomically returns stale generated-thumbnail
+// references to the normal pending state. The URL and version guards preserve
+// a thumbnail that may have been refreshed by a concurrent worker after the
+// caller inspected the filesystem.
+func (c *Catalog) ResetMissingLocalThumbnails(ctx context.Context, references []LocalThumbnailReference) (int, error) {
+	if len(references) == 0 {
+		return 0, nil
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.PrepareContext(ctx, `
+		UPDATE videos
+		   SET thumbnail_url = '',
+		       thumbnail_updated_at = 0,
+		       thumbnail_status = 'pending',
+		       thumbnail_failures = 0
+		 WHERE id = ?
+		   AND thumbnail_url = '/p/thumb/' || id
+		   AND COALESCE(thumbnail_updated_at, 0) = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer statement.Close()
+
+	seen := make(map[string]struct{}, len(references))
+	reset := 0
+	for _, reference := range references {
+		if _, duplicate := seen[reference.VideoID]; duplicate {
+			continue
+		}
+		seen[reference.VideoID] = struct{}{}
+		result, err := statement.ExecContext(ctx, reference.VideoID, reference.ThumbnailVersion)
+		if err != nil {
+			return 0, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		reset += int(affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return reset, nil
+}
+
+// LocalPreviewReference is the persisted ownership link between a video and
+// its generated teaser file. Filesystem validation belongs to the application
+// layer because the catalog must not depend on one host's storage layout.
+type LocalPreviewReference struct {
+	VideoID      string
+	PreviewLocal string
+}
+
+// ListReadyLocalPreviewReferences returns teaser files that the catalog claims
+// are ready. A ready row without a local path cannot be validated here and is
+// intentionally excluded; UpdatePreview never creates that state.
+func (c *Catalog) ListReadyLocalPreviewReferences(ctx context.Context) ([]LocalPreviewReference, error) {
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, preview_local
+		  FROM videos
+		 WHERE COALESCE(preview_status, 'pending') = 'ready'
+		   AND TRIM(COALESCE(preview_local, '')) != ''
+		 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	references := make([]LocalPreviewReference, 0)
+	for rows.Next() {
+		var reference LocalPreviewReference
+		if err := rows.Scan(&reference.VideoID, &reference.PreviewLocal); err != nil {
+			return nil, err
+		}
+		references = append(references, reference)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return references, nil
+}
+
+// ResetMissingLocalPreviews atomically returns stale ready references to the
+// normal generation queue. The exact-path guard protects a teaser that may
+// have been regenerated after the application inspected the filesystem.
+func (c *Catalog) ResetMissingLocalPreviews(ctx context.Context, references []LocalPreviewReference) (int, error) {
+	if len(references) == 0 {
+		return 0, nil
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	statement, err := tx.PrepareContext(ctx, `
+		UPDATE videos
+		   SET preview_file_id = '',
+		       preview_local = '',
+		       preview_updated_at = 0,
+		       preview_status = 'pending',
+		       updated_at = ?
+		 WHERE id = ?
+		   AND COALESCE(preview_status, 'pending') = 'ready'
+		   AND preview_local = ?`)
+	if err != nil {
+		return 0, err
+	}
+	defer statement.Close()
+
+	seen := make(map[string]struct{}, len(references))
+	reset := 0
+	now := time.Now().UnixMilli()
+	for _, reference := range references {
+		if _, duplicate := seen[reference.VideoID]; duplicate {
+			continue
+		}
+		seen[reference.VideoID] = struct{}{}
+		result, err := statement.ExecContext(ctx, now, reference.VideoID, reference.PreviewLocal)
+		if err != nil {
+			return 0, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		reset += int(affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return reset, nil
+}
+
 // ListVideosNeedingThumbnail returns videos that still need thumbnail-worker work.
 // Besides missing thumbnails, this includes videos with an existing thumbnail but
 // missing duration metadata, because the thumbnail worker probes duration while
@@ -927,6 +1122,84 @@ func (c *Catalog) ListVideosByDrive(ctx context.Context, driveID string) ([]*Vid
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// ListVisibleVideosByDirectory returns the public videos stored beside the
+// current video. A directory identity is scoped by drive: provider folder IDs
+// are not globally unique. Empty parent IDs are deliberately rejected because
+// crawler and standalone-upload rows use an empty value to mean "no directory";
+// grouping those rows would create one unrelated pseudo collection.
+func (c *Catalog) ListVisibleVideosByDirectory(ctx context.Context, driveID, parentID string) ([]*Video, error) {
+	driveID = strings.TrimSpace(driveID)
+	parentID = strings.TrimSpace(parentID)
+	if driveID == "" || parentID == "" {
+		return []*Video{}, nil
+	}
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT `+allVideoCols+` FROM videos
+		 WHERE videos.drive_id = ?
+		   AND videos.parent_id = ?
+		   AND COALESCE(videos.hidden, 0) = 0
+		   AND `+activeDriveWhereSQL+`
+		   AND `+uniqueVideoWhereSQL,
+		driveID, parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]*Video, 0)
+	for rows.Next() {
+		v, err := scanVideo(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// ListVisibleVideoCollectionOrderByDirectory returns only the fields required
+// to calculate a public directory collection's natural order and summary.
+func (c *Catalog) ListVisibleVideoCollectionOrderByDirectory(ctx context.Context, driveID, parentID string) ([]VideoCollectionOrderItem, error) {
+	driveID = strings.TrimSpace(driveID)
+	parentID = strings.TrimSpace(parentID)
+	if driveID == "" || parentID == "" {
+		return []VideoCollectionOrderItem{}, nil
+	}
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT videos.id,
+		        COALESCE(videos.file_name, ''),
+		        videos.title,
+		        COALESCE(videos.dir_name, ''),
+		        videos.created_at
+		   FROM videos
+		  WHERE videos.drive_id = ?
+		    AND videos.parent_id = ?
+		    AND COALESCE(videos.hidden, 0) = 0
+		    AND `+activeDriveWhereSQL+`
+		    AND `+uniqueVideoWhereSQL,
+		driveID, parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]VideoCollectionOrderItem, 0)
+	for rows.Next() {
+		var item VideoCollectionOrderItem
+		var createdAt int64
+		if err := rows.Scan(
+			&item.ID,
+			&item.FileName,
+			&item.Title,
+			&item.DirName,
+			&createdAt,
+		); err != nil {
+			return nil, err
+		}
+		item.CreatedAt = time.UnixMilli(createdAt)
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // ListVideoMaintenanceCandidates returns all current catalog videos without the
@@ -1062,6 +1335,10 @@ func (c *Catalog) ListCrawlerSourceIDs(ctx context.Context, kind, driveID string
 // source IDs are included in future seen files so scripts can skip them before
 // the backend downloads the same duplicate content again.
 func (c *Catalog) MarkCrawlerSourceSeen(ctx context.Context, kind, driveID, sourceID, status, canonicalVideoID, sampledSHA256 string, size int64) error {
+	return markCrawlerSourceSeen(ctx, c.db, kind, driveID, sourceID, status, canonicalVideoID, sampledSHA256, size)
+}
+
+func markCrawlerSourceSeen(ctx context.Context, exec videoRowExecer, kind, driveID, sourceID, status, canonicalVideoID, sampledSHA256 string, size int64) error {
 	kind = strings.TrimSpace(kind)
 	driveID = strings.TrimSpace(driveID)
 	sourceID = strings.TrimSpace(sourceID)
@@ -1079,7 +1356,7 @@ func (c *Catalog) MarkCrawlerSourceSeen(ctx context.Context, kind, driveID, sour
 		size = 0
 	}
 	now := time.Now().UnixMilli()
-	_, err := c.db.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO crawler_seen_sources (
   kind, drive_id, source_id, status, canonical_video_id, sampled_sha256, size_bytes, first_seen_at, last_seen_at
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1189,11 +1466,7 @@ func (c *Catalog) DeleteVideoWithTombstoneOptions(ctx context.Context, id string
 	if options.SourceDeleted {
 		return c.DeleteVideo(ctx, id)
 	}
-	options.Reason = normalizeDeletedVideoReason(options.Reason)
-	options.CanonicalVideoID = strings.TrimSpace(options.CanonicalVideoID)
-	if options.Reason != DeletedVideoReasonDuplicate {
-		options.CanonicalVideoID = ""
-	}
+	options = normalizeDeleteVideoTombstoneOptions(options)
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1204,6 +1477,28 @@ func (c *Catalog) DeleteVideoWithTombstoneOptions(ctx context.Context, id string
 	if err != nil {
 		return err
 	}
+	if err := deleteVideoWithTombstoneTx(ctx, tx, restoreVideo, options); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func normalizeDeleteVideoTombstoneOptions(options DeleteVideoTombstoneOptions) DeleteVideoTombstoneOptions {
+	options.Reason = normalizeDeletedVideoReason(options.Reason)
+	options.CanonicalVideoID = strings.TrimSpace(options.CanonicalVideoID)
+	if options.Reason != DeletedVideoReasonDuplicate {
+		options.CanonicalVideoID = ""
+	}
+	return options
+}
+
+// deleteVideoWithTombstoneTx moves one already-loaded video into the tombstone
+// table. Owning the transaction in the caller lets a full dedupe plan redirect
+// references and remove every group member atomically.
+func deleteVideoWithTombstoneTx(ctx context.Context, tx *sql.Tx, restoreVideo *Video, options DeleteVideoTombstoneOptions) error {
+	if restoreVideo == nil {
+		return sql.ErrNoRows
+	}
 	restorePayloadData, err := buildDeletedVideoRestorePayload(ctx, tx, restoreVideo)
 	if err != nil {
 		return fmt.Errorf("catalog: encode deleted video restore payload: %w", err)
@@ -1213,7 +1508,7 @@ func (c *Catalog) DeleteVideoWithTombstoneOptions(ctx context.Context, id string
 	restoreVideo.ContentHash = normalizeContentHash(restoreVideo.ContentHash)
 
 	// 先记录这次视频关联的 tag_id，便于事务末尾清理孤儿自动生成标签。
-	tagIDs, err := collectVideoTagIDs(ctx, tx, id)
+	tagIDs, err := collectVideoTagIDs(ctx, tx, restoreVideo.ID)
 	if err != nil {
 		return err
 	}
@@ -1242,16 +1537,16 @@ ON CONFLICT(id) DO UPDATE SET
 		options.Reason, boolToInt(options.SourceDeleted), options.CanonicalVideoID, restorePayload, now); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE video_id = ?`, restoreVideo.ID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM video_shares WHERE video_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_shares WHERE video_id = ?`, restoreVideo.ID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM video_reaction_visits WHERE video_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_reaction_visits WHERE video_id = ?`, restoreVideo.ID); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, id)
+	res, err := tx.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, restoreVideo.ID)
 	if err != nil {
 		return err
 	}
@@ -1261,7 +1556,7 @@ ON CONFLICT(id) DO UPDATE SET
 	if err := pruneOrphanGeneratedTagsByID(ctx, tx, tagIDs); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
@@ -1830,14 +2125,10 @@ UPDATE videos
        thumbnail_status = 'pending',
        thumbnail_failures = 0,
        preview_file_id = '',
-       preview_local = '',
-       preview_updated_at = 0,
-       preview_status = 'pending',
-       transcode_status = '',
-       transcode_error = '',
-       transcoded_file_id = '',
-       transcoded_size = 0,
-       updated_at = ?
+	       preview_local = '',
+	       preview_updated_at = 0,
+	       preview_status = 'pending',
+	       updated_at = ?
  WHERE id = ?`, source.Size, time.Now().UnixMilli(), id)
 	return err
 }
@@ -2272,14 +2563,17 @@ type ListParams struct {
 	PageSize              int
 }
 
-func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, error) {
-	if p.PageSize <= 0 {
-		p.PageSize = 24
-	}
-	if p.Page <= 0 {
-		p.Page = 1
-	}
+type videoListQuery struct {
+	whereSQL string
+	orderBy  string
+	args     []any
+}
 
+// buildVideoListQuery owns the public-list filtering and ordering contract.
+// Both paginated responses and cursor-feed snapshots must use this exact query;
+// otherwise the two views can silently disagree about which videos are visible
+// or how ties are ordered.
+func buildVideoListQuery(p ListParams) videoListQuery {
 	var where []string
 	var args []any
 	if p.Keyword != "" {
@@ -2332,35 +2626,49 @@ func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, 
 	where = append(where, activeDriveWhereSQL)
 	where = append(where, uniqueVideoWhereSQL)
 
-	whereSQL := ""
-	whereSQL = " WHERE " + strings.Join(where, " AND ")
+	whereSQL := " WHERE " + strings.Join(where, " AND ")
 
 	readyOrderPrefix := ""
 	if p.PreferReadyThumbnails {
-		readyOrderPrefix = "CASE WHEN COALESCE(thumbnail_url, '') != '' THEN 0 ELSE 1 END, "
+		readyOrderPrefix = "CASE WHEN COALESCE(videos.thumbnail_url, '') != '' THEN 0 ELSE 1 END, "
 	}
 
-	orderBy := " ORDER BY " + readyOrderPrefix + "published_at DESC"
+	// Every order ends in videos.id so a snapshot has one deterministic total
+	// order even when timestamps and reaction counters are tied.
+	orderBy := " ORDER BY " + readyOrderPrefix + "videos.published_at DESC, videos.id ASC"
 	switch p.Sort {
 	case "hot":
 		// 热度 = 点赞数；点赞数相同按最近点赞时间，最后用发布时间兜底。
-		orderBy = " ORDER BY " + readyOrderPrefix + "likes DESC, COALESCE(last_liked_at, 0) DESC, published_at DESC"
+		orderBy = " ORDER BY " + readyOrderPrefix + "videos.likes DESC, COALESCE(videos.last_liked_at, 0) DESC, videos.published_at DESC, videos.id ASC"
 	case "recent":
-		orderBy = " ORDER BY " + readyOrderPrefix + "COALESCE(last_viewed_at, 0) DESC, published_at DESC"
+		orderBy = " ORDER BY " + readyOrderPrefix + "COALESCE(videos.last_viewed_at, 0) DESC, videos.published_at DESC, videos.id ASC"
 	}
+
+	return videoListQuery{whereSQL: whereSQL, orderBy: orderBy, args: args}
+}
+
+func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, error) {
+	if p.PageSize <= 0 {
+		p.PageSize = 24
+	}
+	if p.Page <= 0 {
+		p.Page = 1
+	}
+	query := buildVideoListQuery(p)
 
 	var total int
 	if !p.SkipTotal {
-		if err := c.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM videos"+whereSQL, args...).Scan(&total); err != nil {
+		if err := c.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM videos"+query.whereSQL, query.args...).Scan(&total); err != nil {
 			return nil, 0, err
 		}
 	}
 
 	// list
 	offset := (p.Page - 1) * p.PageSize
+	queryArgs := append(append([]any(nil), query.args...), p.PageSize, offset)
 	rows, err := c.db.QueryContext(ctx,
-		"SELECT "+allVideoCols+" FROM videos"+whereSQL+orderBy+" LIMIT ? OFFSET ?",
-		append(args, p.PageSize, offset)...)
+		"SELECT "+allVideoCols+" FROM videos"+query.whereSQL+query.orderBy+" LIMIT ? OFFSET ?",
+		queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -2374,7 +2682,38 @@ func (c *Catalog) ListVideos(ctx context.Context, p ListParams) ([]*Video, int, 
 		}
 		out = append(out, v)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
 	return out, total, nil
+}
+
+// ListVideoIDs freezes the complete ordered identity set for one public-list
+// query. Feed handlers page through this immutable ID slice instead of applying
+// OFFSET repeatedly to a live, mutable ordering.
+func (c *Catalog) ListVideoIDs(ctx context.Context, p ListParams) ([]string, error) {
+	query := buildVideoListQuery(p)
+	rows, err := c.db.QueryContext(ctx,
+		"SELECT videos.id FROM videos"+query.whereSQL+query.orderBy,
+		query.args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // CountVisibleVideos 返回当前对前台可见的视频总数（未隐藏、且通过去重规则）。
@@ -2493,6 +2832,134 @@ func (c *Catalog) ListVisibleVideoIDsLatest(ctx context.Context, limit int) ([]s
 		return nil, err
 	}
 	return ids, nil
+}
+
+const videoSummaryCols = `
+videos.id, videos.title, COALESCE(videos.author, ''),
+COALESCE(videos.duration_seconds, 0), COALESCE(videos.thumbnail_url, ''),
+COALESCE(videos.thumbnail_updated_at, 0), COALESCE(videos.preview_updated_at, 0),
+COALESCE(videos.views, 0), COALESCE(videos.badges, '[]'), videos.published_at
+`
+
+// ListRecommendationCandidates loads one small, latest-first candidate window
+// using the same public visibility and deduplication rules as video listings.
+// It deliberately returns VideoSummary rather than the full persistence model:
+// recommendation cards do not need hashes, storage paths, processing state or
+// descriptions.
+func (c *Catalog) ListRecommendationCandidates(ctx context.Context, p RecommendationCandidateParams) ([]*VideoSummary, error) {
+	if p.Limit <= 0 {
+		return nil, nil
+	}
+
+	tags := uniqueStrings(cleanLabels(p.Tags))
+	excluded := cleanVideoIDs(p.ExcludeIDs)
+	where := []string{
+		"COALESCE(videos.hidden, 0) = 0",
+		activeDriveWhereSQL,
+		uniqueVideoWhereSQL,
+	}
+	args := make([]any, 0, len(tags)+len(excluded)+1)
+
+	if p.ThumbnailReadyOnly {
+		where = append(where, "COALESCE(videos.thumbnail_url, '') != ''")
+	}
+	if len(tags) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(tags)), ",")
+		where = append(where, `videos.id IN (
+			SELECT representative.representative_id
+			  FROM video_tags vt
+			  JOIN tags tag_filter ON tag_filter.id = vt.tag_id
+			  JOIN videos tagged ON tagged.id = vt.video_id
+			  JOIN video_dedup_representatives representative
+			    ON representative.video_id = tagged.id
+			 WHERE tag_filter.label COLLATE NOCASE IN (`+placeholders+`)
+			   AND COALESCE(tagged.hidden, 0) = 0
+		)`)
+		for _, tag := range tags {
+			args = append(args, tag)
+		}
+	}
+	if len(excluded) > 0 {
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(excluded)), ",")
+		where = append(where, "videos.id NOT IN ("+placeholders+")")
+		for _, id := range excluded {
+			args = append(args, id)
+		}
+	}
+	args = append(args, p.Limit)
+
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT `+videoSummaryCols+` FROM videos
+		  WHERE `+strings.Join(where, " AND ")+`
+		  ORDER BY videos.published_at DESC, videos.id ASC
+		  LIMIT ?`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]*VideoSummary, 0, p.Limit)
+	for rows.Next() {
+		video, err := scanVideoSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, video)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// VisibleVideoSummariesByIDs loads only the fields rendered by public video
+// cards. Detail, playback and maintenance fields deliberately stay out of this
+// hot path. Results retain the caller's snapshot order.
+func (c *Catalog) VisibleVideoSummariesByIDs(ctx context.Context, ids []string) ([]*VideoSummary, error) {
+	cleaned := cleanVideoIDs(ids)
+	if len(cleaned) == 0 {
+		return nil, nil
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(cleaned)), ",")
+	args := make([]any, 0, len(cleaned))
+	for _, id := range cleaned {
+		args = append(args, id)
+	}
+	rows, err := c.db.QueryContext(ctx,
+		`SELECT `+videoSummaryCols+` FROM videos
+		  WHERE videos.id IN (`+placeholders+`)
+		    AND COALESCE(videos.hidden, 0) = 0
+		    AND `+activeDriveWhereSQL+`
+		    AND `+uniqueVideoWhereSQL,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	byID := make(map[string]*VideoSummary, len(cleaned))
+	for rows.Next() {
+		video, err := scanVideoSummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		byID[video.ID] = video
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]*VideoSummary, 0, len(byID))
+	for _, id := range cleaned {
+		if video := byID[id]; video != nil {
+			out = append(out, video)
+		}
+	}
+	return out, nil
 }
 
 // VisibleVideosByIDs loads the still-visible subset of ids while preserving
@@ -2637,74 +3104,40 @@ type DriveFingerprintCounts struct {
 	Failed  int
 }
 
-func (c *Catalog) CountTeasersByDrive(ctx context.Context) (map[string]DriveTeaserCounts, error) {
-	rows, err := c.db.QueryContext(ctx,
-		`SELECT drive_id,
-		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'ready' THEN 1 END) AS ready_count,
-		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'pending' THEN 1 END) AS pending_count,
-		        COUNT(CASE WHEN COALESCE(preview_status, 'pending') = 'failed' THEN 1 END) AS failed_count
-		   FROM videos
-		  WHERE COALESCE(hidden, 0) = 0
-		    AND `+uniqueVideoWhereSQL+`
-		  GROUP BY drive_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make(map[string]DriveTeaserCounts)
-	for rows.Next() {
-		var driveID string
-		var counts DriveTeaserCounts
-		if err := rows.Scan(&driveID, &counts.Ready, &counts.Pending, &counts.Failed); err != nil {
-			return nil, err
-		}
-		out[driveID] = counts
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+// DriveAssetStats groups the three aggregate maps consumed together by the
+// admin drive list. A single query computes an exact snapshot while scanning
+// videos once rather than three times.
+type DriveAssetStats struct {
+	Teasers      map[string]DriveTeaserCounts
+	Thumbnails   map[string]DriveThumbnailCounts
+	Fingerprints map[string]DriveFingerprintCounts
 }
 
-func (c *Catalog) CountThumbnailsByDrive(ctx context.Context) (map[string]DriveThumbnailCounts, error) {
+// CountDriveAssetStats reads one exact snapshot for every drive. Thumbnail and
+// teaser counts retain the public canonical-video filter; fingerprint work
+// deliberately includes duplicate rows, matching the former independent
+// queries.
+func (c *Catalog) CountDriveAssetStats(ctx context.Context) (DriveAssetStats, error) {
 	rows, err := c.db.QueryContext(ctx,
 		`SELECT drive_id,
-		        COUNT(CASE WHEN COALESCE(thumbnail_url, '') != '' THEN 1 END) AS ready_count,
-		        COUNT(CASE WHEN COALESCE(thumbnail_url, '') = ''
-		                     AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped') THEN 1 END) AS pending_count,
-		        COUNT(CASE WHEN COALESCE(thumbnail_url, '') = ''
-		                     AND COALESCE(thumbnail_status, 'pending') = 'failed' THEN 1 END) AS failed_count,
-		        COUNT(CASE WHEN COALESCE(thumbnail_url, '') != ''
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(preview_status, 'pending') = 'ready' THEN 1 END) AS teaser_ready_count,
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(preview_status, 'pending') = 'pending' THEN 1 END) AS teaser_pending_count,
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(preview_status, 'pending') = 'failed' THEN 1 END) AS teaser_failed_count,
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(thumbnail_url, '') != '' THEN 1 END) AS thumbnail_ready_count,
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(thumbnail_url, '') = ''
+		                     AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped') THEN 1 END) AS thumbnail_pending_count,
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(thumbnail_url, '') = ''
+		                     AND COALESCE(thumbnail_status, 'pending') = 'failed' THEN 1 END) AS thumbnail_failed_count,
+		        COUNT(CASE WHEN is_canonical = 1
+		                     AND COALESCE(thumbnail_url, '') != ''
 		                     AND COALESCE(duration_seconds, 0) <= 0
-		                     AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped') THEN 1 END) AS duration_pending_count
-		   FROM videos
-		  WHERE COALESCE(hidden, 0) = 0
-		    AND `+uniqueVideoWhereSQL+`
-		  GROUP BY drive_id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make(map[string]DriveThumbnailCounts)
-	for rows.Next() {
-		var driveID string
-		var counts DriveThumbnailCounts
-		if err := rows.Scan(&driveID, &counts.Ready, &counts.Pending, &counts.Failed, &counts.DurationPending); err != nil {
-			return nil, err
-		}
-		out[driveID] = counts
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *Catalog) CountFingerprintsByDrive(ctx context.Context) (map[string]DriveFingerprintCounts, error) {
-	rows, err := c.db.QueryContext(ctx,
-		`SELECT drive_id,
+		                     AND COALESCE(thumbnail_status, 'pending') NOT IN ('failed', 'skipped') THEN 1 END) AS duration_pending_count,
 		        COUNT(CASE WHEN COALESCE(sampled_sha256, '') != ''
 		                      OR COALESCE(fingerprint_status, 'pending') = 'ready' THEN 1 END) AS ready_count,
 		        COUNT(CASE WHEN size_bytes > 0
@@ -2716,21 +3149,41 @@ func (c *Catalog) CountFingerprintsByDrive(ctx context.Context) (map[string]Driv
 		  WHERE COALESCE(hidden, 0) = 0
 		  GROUP BY drive_id`)
 	if err != nil {
-		return nil, err
+		return DriveAssetStats{}, err
 	}
 	defer rows.Close()
 
-	out := make(map[string]DriveFingerprintCounts)
+	out := DriveAssetStats{
+		Teasers:      make(map[string]DriveTeaserCounts),
+		Thumbnails:   make(map[string]DriveThumbnailCounts),
+		Fingerprints: make(map[string]DriveFingerprintCounts),
+	}
 	for rows.Next() {
 		var driveID string
-		var counts DriveFingerprintCounts
-		if err := rows.Scan(&driveID, &counts.Ready, &counts.Pending, &counts.Failed); err != nil {
-			return nil, err
+		var teaser DriveTeaserCounts
+		var thumbnail DriveThumbnailCounts
+		var fingerprint DriveFingerprintCounts
+		if err := rows.Scan(
+			&driveID,
+			&teaser.Ready,
+			&teaser.Pending,
+			&teaser.Failed,
+			&thumbnail.Ready,
+			&thumbnail.Pending,
+			&thumbnail.Failed,
+			&thumbnail.DurationPending,
+			&fingerprint.Ready,
+			&fingerprint.Pending,
+			&fingerprint.Failed,
+		); err != nil {
+			return DriveAssetStats{}, err
 		}
-		out[driveID] = counts
+		out.Teasers[driveID] = teaser
+		out.Thumbnails[driveID] = thumbnail
+		out.Fingerprints[driveID] = fingerprint
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return DriveAssetStats{}, err
 	}
 	return out, nil
 }
@@ -3026,16 +3479,34 @@ type Drive struct {
 	// 替代早期的全局 preview.enabled 开关；新建 drive 时 UpsertDrive 默认置 true。
 	TeaserEnabled bool `json:"teaserEnabled"`
 	// SkipDirIDs 是用户在管理后台为该盘选定的"扫描跳过目录"集合（网盘侧的目录 fileID）。
-	// scanner 在 walk 时命中其中任意一个就直接 continue —— 不递归、不收集文件，也
-	// 不参与 stats 统计。替代旧版硬编码"影视"目录的特例分支。
+	// scanner 发现阶段命中后不递归、不收集文件，也不参与 presence 统计。完整根
+	// 扫描时，该目录的历史记录会按连续缺失确认策略退出媒体库管理范围。
 	// 含义按"目录 ID 自身"匹配，所以同名目录在不同父级下需要分别选定。
 	SkipDirIDs []string  `json:"skipDirIds,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
+type DriveUpsertOptions struct {
+	ReplaceSkipDirIDs    bool
+	ReplaceTeaserEnabled bool
+	PatchCredentials     bool
+}
+
+// UpsertDrive persists a complete configuration. On an existing row it
+// deliberately preserves status/last_error; those fields are owned by the
+// mounted runtime and must be changed through SetDriveRuntimeStatus.
 func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
-	return c.upsertDrive(ctx, d, true, false)
+	return c.upsertDrive(ctx, d, DriveUpsertOptions{
+		ReplaceSkipDirIDs:    true,
+		ReplaceTeaserEnabled: true,
+	})
+}
+
+// UpsertDriveWithOptions lets partial admin forms preserve independently saved
+// settings atomically instead of performing stale read-then-write merges.
+func (c *Catalog) UpsertDriveWithOptions(ctx context.Context, d *Drive, options DriveUpsertOptions) error {
+	return c.upsertDrive(ctx, d, options)
 }
 
 // UpsertDrivePreservingSkipDirIDs writes the authoritative drive fields while
@@ -3044,7 +3515,7 @@ func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
 // value in SQL avoids a read-then-write race with the dedicated skip-dir API.
 // New rows still receive the normalized value from d (normally an empty list).
 func (c *Catalog) UpsertDrivePreservingSkipDirIDs(ctx context.Context, d *Drive) error {
-	return c.upsertDrive(ctx, d, false, false)
+	return c.upsertDrive(ctx, d, DriveUpsertOptions{ReplaceTeaserEnabled: true})
 }
 
 // UpsertDrivePatchingCredentials updates drive metadata while atomically
@@ -3052,16 +3523,23 @@ func (c *Catalog) UpsertDrivePreservingSkipDirIDs(ctx context.Context, d *Drive)
 // credentials. This prevents an admin edit from rolling back tokens refreshed
 // after the edit form was opened.
 func (c *Catalog) UpsertDrivePatchingCredentials(ctx context.Context, d *Drive) error {
-	return c.upsertDrive(ctx, d, true, true)
+	return c.upsertDrive(ctx, d, DriveUpsertOptions{
+		ReplaceSkipDirIDs:    true,
+		ReplaceTeaserEnabled: true,
+		PatchCredentials:     true,
+	})
 }
 
 // UpsertDrivePatchingCredentialsPreservingSkipDirIDs combines credential patch
 // semantics with the omitted-skipDirIds behavior used by the admin form.
 func (c *Catalog) UpsertDrivePatchingCredentialsPreservingSkipDirIDs(ctx context.Context, d *Drive) error {
-	return c.upsertDrive(ctx, d, false, true)
+	return c.upsertDrive(ctx, d, DriveUpsertOptions{
+		ReplaceTeaserEnabled: true,
+		PatchCredentials:     true,
+	})
 }
 
-func (c *Catalog) upsertDrive(ctx context.Context, d *Drive, replaceSkipDirIDs, patchCredentials bool) error {
+func (c *Catalog) upsertDrive(ctx context.Context, d *Drive, options DriveUpsertOptions) error {
 	normalizeDriveRootFields(d)
 	cred, _ := json.Marshal(d.Credentials)
 	skipDirs := d.SkipDirIDs
@@ -3083,19 +3561,27 @@ ON CONFLICT(id) DO UPDATE SET
   root_id        = excluded.root_id,
   scan_root_id   = excluded.scan_root_id,
   credentials    = CASE
+                     WHEN ? != 0 AND excluded.kind = 'googledrive' THEN json_remove(
+                       json_patch(
+                         CASE WHEN json_valid(COALESCE(drives.credentials, '')) THEN drives.credentials ELSE '{}' END,
+                         excluded.credentials
+                       ),
+                       '$.use_online_api', '$.api_url_address'
+                     )
                      WHEN ? != 0 THEN json_patch(
                        CASE WHEN json_valid(COALESCE(drives.credentials, '')) THEN drives.credentials ELSE '{}' END,
                        excluded.credentials
                      )
                      ELSE excluded.credentials
                    END,
-  status         = excluded.status,
-  last_error     = excluded.last_error,
-  teaser_enabled = excluded.teaser_enabled,
+  status         = drives.status,
+  last_error     = drives.last_error,
+  teaser_enabled = CASE WHEN ? != 0 THEN excluded.teaser_enabled ELSE drives.teaser_enabled END,
   skip_dir_ids   = CASE WHEN ? != 0 THEN excluded.skip_dir_ids ELSE drives.skip_dir_ids END,
   updated_at     = excluded.updated_at
 `, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON),
-		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli(), boolToInt(patchCredentials), boolToInt(replaceSkipDirIDs))
+		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli(), boolToInt(options.PatchCredentials), boolToInt(options.PatchCredentials),
+		boolToInt(options.ReplaceTeaserEnabled), boolToInt(options.ReplaceSkipDirIDs))
 	return err
 }
 
@@ -3103,11 +3589,14 @@ func normalizeDriveRootFields(d *Drive) {
 	if d == nil {
 		return
 	}
-	d.RootID = normalizeDriveRootID(d.Kind, d.RootID)
+	d.RootID = NormalizeDriveRootID(d.Kind, d.RootID)
 	d.ScanRootID = d.RootID
 }
 
-func normalizeDriveRootID(kind, rootID string) string {
+// NormalizeDriveRootID returns the canonical runtime root for a provider. API
+// validation uses the same function before reserving a configuration update so
+// root-change classification cannot diverge from persistence.
+func NormalizeDriveRootID(kind, rootID string) string {
 	rootID = strings.TrimSpace(rootID)
 	switch kind {
 	case "pikpak", "guangyapan":
@@ -3251,6 +3740,115 @@ UPDATE drives
  WHERE id = ?`, string(payload), time.Now().UnixMilli(), id)
 	if err != nil {
 		return fmt.Errorf("catalog: patch drive credentials: %w", err)
+	}
+	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// PatchDriveCredentialsIfMatch applies a runtime credential rotation only
+// while both its provider kind and source credential are still current. It
+// prevents a refresh that completed after an administrator changed provider or
+// supplied a replacement token/cookie from overwriting that explicit edit. A
+// false result is a normal stale-write rejection, not an error.
+func (c *Catalog) PatchDriveCredentialsIfMatch(
+	ctx context.Context,
+	id, expectedKind, anchorKey, anchorValue string,
+	updates map[string]string,
+) (bool, error) {
+	id = strings.TrimSpace(id)
+	expectedKind = strings.TrimSpace(expectedKind)
+	anchorKey = strings.TrimSpace(anchorKey)
+	if id == "" {
+		return false, fmt.Errorf("catalog: patch drive credentials if match: empty id")
+	}
+	if expectedKind == "" {
+		return false, fmt.Errorf("catalog: patch drive credentials if match: empty expected kind")
+	}
+	if anchorKey == "" {
+		return false, fmt.Errorf("catalog: patch drive credentials if match: empty anchor key")
+	}
+	cleaned := make(map[string]string, len(updates))
+	for rawKey, value := range updates {
+		key := strings.TrimSpace(rawKey)
+		if key != "" {
+			cleaned[key] = value
+		}
+	}
+	if len(cleaned) == 0 {
+		return true, nil
+	}
+	payload, err := json.Marshal(cleaned)
+	if err != nil {
+		return false, fmt.Errorf("catalog: marshal conditional drive credential patch: %w", err)
+	}
+	res, err := c.db.ExecContext(ctx, `
+UPDATE drives
+   SET credentials = json_patch(
+         CASE WHEN json_valid(COALESCE(credentials, '')) THEN credentials ELSE '{}' END,
+         ?
+       ),
+       updated_at = ?
+ WHERE id = ?
+   AND kind = ?
+   AND COALESCE(json_extract(
+         CASE WHEN json_valid(COALESCE(credentials, '')) THEN credentials ELSE '{}' END,
+         ?
+       ), '') = ?`, string(payload), time.Now().UnixMilli(), id, expectedKind, "$."+anchorKey, anchorValue)
+	if err != nil {
+		return false, fmt.Errorf("catalog: patch drive credentials if match: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("catalog: inspect conditional drive credential patch: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// UpdateDriveRuntimeState atomically records a runtime status transition and
+// a small credential-state patch without replacing configuration columns. It
+// is used by crawler completion, where last_crawl_at and the observed result
+// belong to one event. Administrative configuration must not call this method.
+func (c *Catalog) UpdateDriveRuntimeState(
+	ctx context.Context,
+	id, expectedKind, status, lastError string,
+	credentialUpdates map[string]string,
+) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("catalog: update drive runtime state: empty id")
+	}
+	expectedKind = strings.TrimSpace(expectedKind)
+	if expectedKind == "" {
+		return fmt.Errorf("catalog: update drive runtime state: empty expected kind")
+	}
+	if status != "ok" && status != "error" {
+		return fmt.Errorf("catalog: update drive runtime state: invalid status %q", status)
+	}
+	cleaned := make(map[string]string, len(credentialUpdates))
+	for rawKey, value := range credentialUpdates {
+		if key := strings.TrimSpace(rawKey); key != "" {
+			cleaned[key] = value
+		}
+	}
+	payload, err := json.Marshal(cleaned)
+	if err != nil {
+		return fmt.Errorf("catalog: marshal drive runtime credential patch: %w", err)
+	}
+	res, err := c.db.ExecContext(ctx, `
+UPDATE drives
+   SET credentials = json_patch(
+         CASE WHEN json_valid(COALESCE(credentials, '')) THEN credentials ELSE '{}' END,
+         ?
+       ),
+       status = ?,
+       last_error = ?,
+       updated_at = ?
+ WHERE id = ?
+   AND kind = ?`, string(payload), status, lastError, time.Now().UnixMilli(), id, expectedKind)
+	if err != nil {
+		return fmt.Errorf("catalog: update drive runtime state: %w", err)
 	}
 	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
 		return sql.ErrNoRows
@@ -3470,39 +4068,14 @@ func (c *Catalog) DeleteSettings(ctx context.Context, keys ...string) error {
 	return tx.Commit()
 }
 
-// DropLegacyDuplicateReviewTable retires the queue left by releases that sent
-// the 0.80-0.92 content-similarity band to manual review. Callers invoke this
-// only after a successful content-deduplication pass under the new automatic
-// threshold, so removing the queue can never replace processing its videos.
-func (c *Catalog) DropLegacyDuplicateReviewTable(ctx context.Context) (bool, error) {
-	var exists int
-	if err := c.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM sqlite_master
-		WHERE type = 'table' AND name = 'duplicate_review_pairs'
-	`).Scan(&exists); err != nil {
-		return false, err
-	}
-	if exists == 0 {
-		return false, nil
-	}
-	// IF EXISTS keeps the migration idempotent even if a maintenance command and
-	// the server reach this boundary at the same time after both observed the
-	// legacy table.
-	if _, err := c.db.ExecContext(ctx, `DROP TABLE IF EXISTS duplicate_review_pairs`); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // ---------- helpers ----------
 
 const allVideoCols = `
 id, drive_id, file_id, COALESCE(file_name, ''), COALESCE(content_hash, ''),
 COALESCE(sampled_sha256, ''), COALESCE(fingerprint_status, 'pending'), COALESCE(fingerprint_error, ''),
 COALESCE(parent_id, ''), COALESCE(dir_name, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
-duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(quality, ''), COALESCE(thumbnail_url, ''), COALESCE(thumbnail_updated_at, 0),
+duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(thumbnail_url, ''), COALESCE(thumbnail_updated_at, 0),
 COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_updated_at, 0), COALESCE(preview_status, 'pending'),
-	COALESCE(transcode_status, ''), COALESCE(transcode_error, ''), COALESCE(transcoded_file_id, ''), COALESCE(transcoded_size, 0),
 	views, COALESCE(last_viewed_at, 0), favorites, comments, likes, COALESCE(last_liked_at, 0), dislikes,
 	COALESCE(hidden, 0), COALESCE(badges, '[]'), COALESCE(description, ''),
 	published_at, created_at, updated_at
@@ -3572,6 +4145,35 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+func scanVideoSummary(row rowScanner) (*VideoSummary, error) {
+	video := &VideoSummary{}
+	var thumbnailUpdatedAt, previewUpdatedAt, publishedAt int64
+	var badgesJSON string
+	if err := row.Scan(
+		&video.ID,
+		&video.Title,
+		&video.Author,
+		&video.DurationSeconds,
+		&video.ThumbnailURL,
+		&thumbnailUpdatedAt,
+		&previewUpdatedAt,
+		&video.Views,
+		&badgesJSON,
+		&publishedAt,
+	); err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(badgesJSON), &video.Badges)
+	if thumbnailUpdatedAt > 0 {
+		video.ThumbnailUpdatedAt = time.UnixMilli(thumbnailUpdatedAt)
+	}
+	if previewUpdatedAt > 0 {
+		video.PreviewUpdatedAt = time.UnixMilli(previewUpdatedAt)
+	}
+	video.PublishedAt = time.UnixMilli(publishedAt)
+	return video, nil
+}
+
 func scanVideo(row rowScanner) (*Video, error) {
 	v := &Video{}
 	var tagsJSON, badgesJSON string
@@ -3581,9 +4183,8 @@ func scanVideo(row rowScanner) (*Video, error) {
 		&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.ContentHash,
 		&v.SampledSHA256, &v.FingerprintStatus, &v.FingerprintError,
 		&v.ParentID, &v.DirName, &v.Title, &v.Author, &tagsJSON,
-		&v.DurationSeconds, &v.Size, &v.Ext, &v.Quality, &v.ThumbnailURL, &thumbnailUpdatedAt,
+		&v.DurationSeconds, &v.Size, &v.Ext, &v.ThumbnailURL, &thumbnailUpdatedAt,
 		&v.PreviewFileID, &v.PreviewLocal, &previewUpdatedAt, &v.PreviewStatus,
-		&v.TranscodeStatus, &v.TranscodeError, &v.TranscodedFileID, &v.TranscodedSize,
 		&v.Views, &lastViewedAt, &v.Favorites, &v.Comments, &v.Likes, &lastLikedAt, &v.Dislikes,
 		&hidden, &badgesJSON, &v.Description,
 		&publishedAt, &createdAt, &updatedAt,
@@ -3914,10 +4515,6 @@ func directRestoreVideo(deleted *DeletedVideo, restoreVideo *Video, source Delet
 	video.PreviewLocal = ""
 	video.PreviewUpdatedAt = time.Time{}
 	video.PreviewStatus = "pending"
-	video.TranscodeStatus = ""
-	video.TranscodeError = ""
-	video.TranscodedFileID = ""
-	video.TranscodedSize = 0
 	return video
 }
 

@@ -2,22 +2,38 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_DRAFT,
   applyVisualFields,
   changedVisualFields,
   configDocument,
   parseConfig,
+  type SettingsDraft,
   type VisualField,
 } from "../src/admin/settings/configYaml";
 import { buildConfigDiff } from "../src/admin/settings/configDiff";
 
+const nightlyDisabled = new Set<VisualField>(["nightlyDisabled"]);
 const nightlyStartTime = new Set<VisualField>(["nightlyStartTime"]);
 const nightlyTimezone = new Set<VisualField>(["nightlyTimezone"]);
 const builtinTagsEnabled = new Set<VisualField>(["builtinTagsEnabled"]);
+const previewConcurrency = new Set<VisualField>(["previewConcurrency"]);
+
+function settingsDraft(overrides: Partial<SettingsDraft> = {}): SettingsDraft {
+  return { ...DEFAULT_DRAFT, ...overrides };
+}
+
+function updateNightlyDisabled(source: string, value = true) {
+  return applyVisualFields(
+    source,
+    settingsDraft({ nightlyDisabled: value }),
+    nightlyDisabled
+  );
+}
 
 function updateStartTime(source: string, value = "02:00") {
   return applyVisualFields(
     source,
-    { nightlyStartTime: value, nightlyTimezone: "Asia/Shanghai", builtinTagsEnabled: true },
+    settingsDraft({ nightlyStartTime: value }),
     nightlyStartTime
   );
 }
@@ -25,7 +41,7 @@ function updateStartTime(source: string, value = "02:00") {
 function updateBuiltinTags(source: string, value = false) {
   return applyVisualFields(
     source,
-    { nightlyStartTime: "01:00", nightlyTimezone: "Asia/Shanghai", builtinTagsEnabled: value },
+    settingsDraft({ builtinTagsEnabled: value }),
     builtinTagsEnabled
   );
 }
@@ -33,8 +49,16 @@ function updateBuiltinTags(source: string, value = false) {
 function updateTimezone(source: string, value = "Asia/Shanghai") {
   return applyVisualFields(
     source,
-    { nightlyStartTime: "01:00", nightlyTimezone: value, builtinTagsEnabled: true },
+    settingsDraft({ nightlyTimezone: value }),
     nightlyTimezone
+  );
+}
+
+function updatePreviewConcurrency(source: string, value = 3) {
+  return applyVisualFields(
+    source,
+    settingsDraft({ previewConcurrency: value }),
+    previewConcurrency
   );
 }
 
@@ -129,7 +153,7 @@ test("visual config returns the exact source when no visual field is dirty", () 
   assert.equal(
     applyVisualFields(
       source,
-      { nightlyStartTime: "02:00", nightlyTimezone: "Asia/Shanghai", builtinTagsEnabled: false },
+      settingsDraft({ nightlyStartTime: "02:00", builtinTagsEnabled: false }),
       new Set()
     ),
     source
@@ -164,6 +188,57 @@ test("visual config edits only the timezone scalar and preserves YAML style", ()
   assert.equal(
     updateTimezone("head: ok\n"),
     "head: ok\nnightly:\n  timezone: Asia/Shanghai\n"
+  );
+});
+
+test("visual config reads and validates the nightly stop switch", () => {
+  assert.equal(parseConfig("{}\n").draft.nightlyDisabled, false);
+  assert.equal(
+    parseConfig("nightly:\n  disabled: true\n").draft.nightlyDisabled,
+    true
+  );
+  assert.equal(
+    parseConfig("nightly:\n  disabled: false\n").draft.nightlyDisabled,
+    false
+  );
+  assert.throws(
+    () => parseConfig('nightly:\n  disabled: "true"\n'),
+    /nightly\.disabled 必须是布尔值/
+  );
+});
+
+test("visual config updates only the nightly disabled boolean", () => {
+  const source = [
+    "nightly:",
+    "  # keep the schedule comment",
+    "  disabled: false # hot reload",
+    "  start_time: 01:00",
+    "future:",
+    "  keep: yes",
+    "",
+  ].join("\n");
+  assert.equal(
+    updateNightlyDisabled(source),
+    source.replace("disabled: false", "disabled: true")
+  );
+});
+
+test("visual config inserts nightly disabled into block, flow, and empty mappings", () => {
+  assert.equal(
+    updateNightlyDisabled("nightly:\n  start_time: 01:00\ntail: ok\n"),
+    "nightly:\n  start_time: 01:00\n  disabled: true\ntail: ok\n"
+  );
+  assert.equal(
+    updateNightlyDisabled("nightly: { start_time: 01:00 }\ntail: ok\n"),
+    "nightly: { start_time: 01:00, disabled: true }\ntail: ok\n"
+  );
+  assert.equal(
+    updateNightlyDisabled("nightly:\ntail: ok\n"),
+    "nightly:\n  disabled: true\ntail: ok\n"
+  );
+  assert.equal(
+    updateNightlyDisabled("head: ok\n"),
+    "head: ok\nnightly:\n  disabled: true\n"
   );
 });
 
@@ -210,31 +285,91 @@ test("visual config inserts the built-in tag field into block, flow, and empty m
   );
 });
 
+test("visual config reads and validates per-storage preview concurrency", () => {
+  assert.equal(parseConfig("{}\n").draft.previewConcurrency, 1);
+  assert.equal(
+    parseConfig("preview:\n  concurrency: 3\n").draft.previewConcurrency,
+    3
+  );
+  assert.equal(
+    parseConfig("preview:\n  concurrency: 5\n").draft.previewConcurrency,
+    5
+  );
+  for (const invalid of [0, 6, 1.5]) {
+    assert.throws(
+      () => parseConfig(`preview:\n  concurrency: ${invalid}\n`),
+      /preview\.concurrency 必须是 1-5 之间的整数/
+    );
+  }
+  assert.throws(
+    () => parseConfig('preview:\n  concurrency: "3"\n'),
+    /preview\.concurrency 必须是 1-5 之间的整数/
+  );
+  assert.throws(() => parseConfig("preview: true\n"), /preview 必须是映射对象/);
+});
+
+test("visual config updates only preview concurrency and preserves YAML layout", () => {
+  const source = [
+    "preview:",
+    "  # keep preview settings",
+    "  concurrency: 1 # hot reload",
+    '  ffmpeg_path: "ffmpeg"',
+    "future:",
+    "  keep: yes",
+    "",
+  ].join("\n");
+  assert.equal(
+    updatePreviewConcurrency(source),
+    source.replace("concurrency: 1", "concurrency: 3")
+  );
+  assert.equal(
+    updatePreviewConcurrency("preview: { enabled: true }\ntail: ok\n"),
+    "preview: { enabled: true, concurrency: 3 }\ntail: ok\n"
+  );
+  assert.equal(
+    updatePreviewConcurrency("head: ok\n"),
+    "head: ok\npreview:\n  concurrency: 3\n"
+  );
+});
+
 test("visual config applies multiple missing YAML fields without overlapping edits", () => {
   const fields = new Set<VisualField>([
+    "nightlyDisabled",
     "nightlyStartTime",
     "nightlyTimezone",
+    "previewConcurrency",
     "builtinTagsEnabled",
   ]);
   assert.equal(
     applyVisualFields(
       "head: ok\n",
-      {
+      settingsDraft({
+        nightlyDisabled: true,
         nightlyStartTime: "03:30",
-        nightlyTimezone: "Asia/Shanghai",
+        previewConcurrency: 3,
         builtinTagsEnabled: false,
-      },
+      }),
       fields
     ),
-    "head: ok\nnightly:\n  start_time: 03:30\n  timezone: Asia/Shanghai\ntags:\n  builtin_pack_enabled: false\n"
+    "head: ok\nnightly:\n  disabled: true\n  start_time: 03:30\n  timezone: Asia/Shanghai\npreview:\n  concurrency: 3\ntags:\n  builtin_pack_enabled: false\n"
+  );
+});
+
+test("changed visual fields includes the nightly stop switch", () => {
+  assert.deepEqual(
+    changedVisualFields(
+      settingsDraft(),
+      settingsDraft({ nightlyDisabled: true })
+    ),
+    new Set<VisualField>(["nightlyDisabled"])
   );
 });
 
 test("changed visual fields includes the real config.yaml built-in tag field", () => {
   assert.deepEqual(
     changedVisualFields(
-      { nightlyStartTime: "01:00", nightlyTimezone: "Asia/Shanghai", builtinTagsEnabled: true },
-      { nightlyStartTime: "01:00", nightlyTimezone: "Asia/Shanghai", builtinTagsEnabled: false }
+      settingsDraft(),
+      settingsDraft({ builtinTagsEnabled: false })
     ),
     new Set<VisualField>(["builtinTagsEnabled"])
   );
@@ -243,13 +378,19 @@ test("changed visual fields includes the real config.yaml built-in tag field", (
 test("changed visual fields includes the nightly timezone", () => {
   assert.deepEqual(
     changedVisualFields(
-      { nightlyStartTime: "01:00", nightlyTimezone: "Etc/UTC", builtinTagsEnabled: true },
-      {
-        nightlyStartTime: "01:00",
-        nightlyTimezone: "Asia/Shanghai",
-        builtinTagsEnabled: true,
-      }
+      settingsDraft({ nightlyTimezone: "Etc/UTC" }),
+      settingsDraft()
     ),
     new Set<VisualField>(["nightlyTimezone"])
+  );
+});
+
+test("changed visual fields includes preview concurrency", () => {
+  assert.deepEqual(
+    changedVisualFields(
+      settingsDraft({ previewConcurrency: 1 }),
+      settingsDraft({ previewConcurrency: 4 })
+    ),
+    new Set<VisualField>(["previewConcurrency"])
   );
 });

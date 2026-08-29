@@ -258,6 +258,16 @@ func (a *App) removeDeletedVideoSourceFile(ctx context.Context, item *catalog.De
 	if strings.TrimSpace(item.FileID) == "" {
 		return fmt.Errorf("remove blacklisted source %s: empty file id", item.ID)
 	}
+	gate := a.driveOperationGate(item.DriveID)
+	taskRelease, generation, admitted := gate.beginTask(ctx, 0)
+	if !admitted {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("remove blacklisted source %s: drive configuration changed", item.ID)
+	}
+	defer taskRelease()
+	ctx = withDriveTaskAdmission(ctx, gate, generation)
 	video := &catalog.Video{
 		ID:       item.ID,
 		DriveID:  item.DriveID,
@@ -347,6 +357,13 @@ func (a *App) removeVideoSourceFile(ctx context.Context, v *catalog.Video) (bool
 	if fileID == "" {
 		return false, fmt.Errorf("remove video source %s: empty file id", v.ID)
 	}
+	gate := a.driveOperationGate(v.DriveID)
+	taskRelease, generation, admitted := gate.tryBeginTask(ctx, 0)
+	if !admitted {
+		return false, fmt.Errorf("remove video source %s: drive %s configuration update in progress", v.ID, v.DriveID)
+	}
+	defer taskRelease()
+	ctx = withDriveTaskAdmission(ctx, gate, generation)
 	if a == nil || a.registry == nil {
 		return false, fmt.Errorf("remove video source %s: drive registry unavailable: %w", v.ID, drives.ErrNotSupported)
 	}
@@ -433,6 +450,13 @@ func (a *App) inspectRestorableSource(ctx context.Context, driveID, fileID strin
 	if a == nil || a.registry == nil {
 		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: drive registry unavailable: %w", driveID, drives.ErrNotSupported)
 	}
+	gate := a.driveOperationGate(driveID)
+	taskRelease, generation, admitted := gate.tryBeginTask(ctx, 0)
+	if !admitted {
+		return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: configuration update in progress", driveID)
+	}
+	defer taskRelease()
+	ctx = withDriveTaskAdmission(ctx, gate, generation)
 	if _, ok := a.registry.Get(driveID); !ok {
 		if err := a.ensureDriveAttached(ctx, driveID); err != nil {
 			return catalog.DeletedVideoSourceInfo{}, fmt.Errorf("restore from drive %s: attach drive: %w", driveID, err)
@@ -464,10 +488,10 @@ func (a *App) cleanupDriveVideosForDelete(ctx context.Context, driveID string) (
 		return 0, err
 	}
 
-	// Stop generation/crawl workers before deleting assets so they do not keep
-	// writing files for a drive that is being removed.
-	a.detachDrive(driveID)
-
+	// The delete coordinator has already blocked admissions and waited for all
+	// generation/crawl workers to exit. Keep the runtime attached until cleanup
+	// succeeds so an I/O failure does not leave an otherwise existing drive
+	// detached; the successful-delete hook retires it after the catalog row goes.
 	items, err := a.videosForDriveDelete(ctx, d)
 	if err != nil {
 		return 0, err
@@ -530,49 +554,6 @@ func (a *App) removeScriptCrawlerStorageForDelete(driveID string) error {
 	return nil
 }
 
-func (a *App) cleanupOrphanDriveVideos(ctx context.Context) (int, error) {
-	if a == nil || a.cat == nil {
-		return 0, nil
-	}
-	items, err := a.cat.ListVideosWithMissingDrive(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if len(items) == 0 {
-		return 0, nil
-	}
-
-	localDir := ""
-	if a.cfg != nil {
-		localDir = a.cfg.Storage.LocalPreviewDir
-	}
-	persistence.RLock()
-	defer persistence.RUnlock()
-	for _, v := range items {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		if err := removeLocalVideoAssets(localDir, v); err != nil {
-			return 0, fmt.Errorf("remove local assets for orphan %s: %w", v.ID, err)
-		}
-	}
-
-	removed := 0
-	for _, v := range items {
-		if err := ctx.Err(); err != nil {
-			return removed, err
-		}
-		if err := a.cat.DeleteVideo(ctx, v.ID); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return removed, fmt.Errorf("delete orphan catalog video %s: %w", v.ID, err)
-		}
-		removed++
-	}
-	return removed, nil
-}
-
 func (a *App) videosForDriveDelete(ctx context.Context, d *catalog.Drive) ([]*catalog.Video, error) {
 	if d == nil {
 		return nil, nil
@@ -597,35 +578,5 @@ func removeLocalVideoAssets(localDir string, v *catalog.Video) error {
 	if localDir == "" || v == nil || v.ID == "" {
 		return nil
 	}
-	candidates := []string{
-		v.PreviewLocal,
-	}
-	candidates = append(candidates, mediaasset.PreviewPathCandidates(localDir, v.ID)...)
-	candidates = append(candidates, mediaasset.ThumbnailAssetPathCandidates(localDir, v.ID)...)
-	candidates = append(candidates, mediaasset.FrameSignaturePath(localDir, v.ID))
-	seen := make(map[string]struct{}, len(candidates))
-	for _, candidate := range candidates {
-		clean, ok := localPathWithin(localDir, candidate)
-		if !ok {
-			continue
-		}
-		if _, ok := seen[clean]; ok {
-			continue
-		}
-		seen[clean] = struct{}{}
-		info, err := os.Stat(clean)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			continue
-		}
-		if err := os.Remove(clean); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
+	return mediaasset.RemoveGeneratedVideoAssets(localDir, v.ID, v.PreviewLocal)
 }

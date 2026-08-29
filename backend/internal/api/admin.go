@@ -16,6 +16,33 @@ import (
 	"github.com/video-site/backend/internal/drives/quark"
 )
 
+type DriveConfigUpdateScope uint8
+
+const (
+	// DriveConfigUpdateRuntime covers kind, root, credentials, and provider
+	// options captured by a mounted Driver.
+	DriveConfigUpdateRuntime DriveConfigUpdateScope = 1 << iota
+	// DriveConfigUpdatePreview covers the per-drive preview switch.
+	DriveConfigUpdatePreview
+	// DriveConfigUpdateScan covers skip-directory settings.
+	DriveConfigUpdateScan
+	// DriveConfigUpdateDestructive reserves deletion. It blocks admissions while
+	// the API cancels and drains existing work; it is never coalesced as a normal
+	// deferred configuration callback.
+	DriveConfigUpdateDestructive
+)
+
+// DriveConfigUpdateLease serializes configuration writers for one drive.
+// Authorize reserves the transition before persistence. For configuration,
+// Commit applies the runtime callback immediately or coalesces it until the
+// current task generation drains. For deletion, Commit permanently retires the
+// old task gate after cleanup and row deletion succeed. Release is mandatory.
+type DriveConfigUpdateLease interface {
+	Authorize(scope DriveConfigUpdateScope) (busyReason string)
+	Commit(scope DriveConfigUpdateScope, apply func() error) (deferred bool, err error)
+	Release()
+}
+
 type AdminServer struct {
 	Catalog         *catalog.Catalog
 	Auth            *auth.Authenticator
@@ -44,25 +71,29 @@ type AdminServer struct {
 	OnSetup func(username, password string) error
 	// LocalPreviewDir is the local directory that stores generated preview videos and thumbs.
 	LocalPreviewDir string
-	// Hooks：外层注入实际执行者
-	OnDriveSaved              func(driveID string) error
-	OnDriveDeleteCleanup      func(ctx context.Context, driveID string) (int, error)
-	OnDriveRemoved            func(driveID string)
-	OnScanRequested           func(driveID string) bool
-	OnCrawlerUploadRequested  func(driveID string) (bool, string)
-	OnStopDriveTasks          func(driveID string) bool
-	OnStopAllTasks            func() int
-	OnRegenPreview            func(videoID string)
-	OnRegenAllPreviews        func()
-	OnRegenFailedPreviews     func(driveID string)
-	OnRegenFailedThumbnails   func(driveID string)
-	OnRegenFailedFingerprints func(driveID string)
-	// OnStartDriveTranscode 手动开启某盘的浏览器兼容性转码任务。
-	// 返回 (是否接受, 拒绝原因)。转码从不自动运行，只能在这里手动触发；
-	// 处理完候选列表后任务自然结束。
-	OnStartDriveTranscode func(driveID string) (bool, string)
-	// OnStopDriveTranscode 手动停止某盘正在进行的转码任务。返回是否有任务被停。
-	OnStopDriveTranscode           func(driveID string) bool
+	// Hooks：外层注入实际执行者。
+	// BeginDriveConfigUpdate reserves the per-drive writer slot before the API
+	// reads its current row. Active tasks keep their old snapshot; Commit applies
+	// immediately when idle or coalesces the latest update until those tasks drain.
+	BeginDriveConfigUpdate func(driveID string) (lease DriveConfigUpdateLease, busyReason string)
+	// OnDriveRuntimeConfigChanged 只在新建网盘，或 kind/root/credentials 等
+	// Driver 构造参数发生变化时调用。名称、跳过目录等纯元数据保存不得触发重挂载。
+	OnDriveRuntimeConfigChanged func(driveID string) error
+	// OnPrepareDriveDelete cancels all work for the drive and returns only after
+	// every tracked task has exited. The destructive lease is already blocking
+	// new admissions when this hook runs.
+	OnPrepareDriveDelete           func(ctx context.Context, driveID string) error
+	OnDriveDeleteCleanup           func(ctx context.Context, driveID string) (int, error)
+	OnDriveRemoved                 func(driveID string)
+	OnScanRequested                func(driveID string) bool
+	OnCrawlerUploadRequested       func(driveID string) (bool, string)
+	OnStopDriveTasks               func(driveID string) bool
+	OnStopAllTasks                 func() int
+	OnRegenPreview                 func(videoID string)
+	OnRegenAllPreviews             func()
+	OnRegenFailedPreviews          func(driveID string)
+	OnRegenFailedThumbnails        func(driveID string)
+	OnRegenFailedFingerprints      func(driveID string)
 	OnDeleteVideo                  func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
 	OnStartBlacklistSourceDelete   func(BlacklistSourceDeleteRequest) bool
 	GetBlacklistSourceDeleteStatus func() BlacklistSourceDeleteStatus
@@ -142,7 +173,6 @@ type DriveGenerationStatuses struct {
 	Preview     GenerationStatus `json:"preview"`
 	Fingerprint GenerationStatus `json:"fingerprint"`
 	Upload      GenerationStatus `json:"upload"`
-	Transcode   GenerationStatus `json:"transcode"`
 }
 
 type NightlyJobStatus struct {
@@ -232,8 +262,6 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
 			r.Post("/drives/{id}/thumbnails/failed/regenerate", a.handleRegenFailedThumbnails)
 			r.Post("/drives/{id}/fingerprints/failed/regenerate", a.handleRegenFailedFingerprints)
-			r.Post("/drives/{id}/transcode/start", a.handleStartDriveTranscode)
-			r.Post("/drives/{id}/transcode/stop", a.handleStopDriveTranscode)
 
 			// 爬虫
 			r.Get("/crawlers", a.handleListCrawlers)

@@ -56,9 +56,8 @@ cmd/
     generation.go           封面 / 预览视频的重生入口
     blacklist.go            历史「隐藏」视频迁移为黑名单墓碑
     tag_maintenance.go      启动期标签迁移与清理
-    video_maintenance.go    本地上传文件名迁移 + 夜间全库去重（精确指纹、标题/封面近重复）
-    video_maintenance_content.go
-                            夜间内容级去重通道：时长相等的视频比较 teaser 对齐帧
+    video_maintenance.go    本地上传文件名迁移 + 夜间全库去重入口
+    video_dedupe_plan.go     精确指纹、标题/封面近重复和内容级去重计划
   dedupe-dryrun/            预演内容级去重会删哪些视频（默认只读；-apply 真正执行）
   diag-115/ list-115-yingshi/ list-yingshi-children/ trace-parents/
                             一次性诊断工具，读库里的 115 cookie 列目录 / 追父目录，不参与服务运行
@@ -98,7 +97,6 @@ internal/
   scanner/                  扫目录 → 落库；filename.go 从文件名解析标题和作者
   preview/                  ffmpeg 抽封面、生成多段预览视频，含 worker 队列与限流冷却
   fingerprint/              采样 SHA256 指纹 worker，用于跨盘的文件级去重
-  transcode/                探测是否需要转码 + 转码 worker
   proxy/                    /p/stream/*、/p/preview/* 代理与 302 直链策略
   streamhttp/               共享的重定向策略，跳转时不泄漏网盘凭据
   nightly/                  每日一条维护流水线：扫盘 → 爬虫 → 上传迁移 → 去重维护
@@ -160,7 +158,6 @@ flowchart TB
         THUMB["ThumbWorker 封面"]
         PREV["Worker 预览视频"]
         FP["fingerprint 采样哈希"]
-        TRANS["transcode 转码<br/>仅后台手动启动"]
     end
 
     DISK[("data/previews · data/uploads<br/>本地封面与预览")]
@@ -182,7 +179,6 @@ flowchart TB
     CRON --> DEDUP
     ADMIN --> SCAN
     ADMIN --> CRAWL
-    ADMIN --> TRANS
     USER --> UPLOAD
     USER --> LIST
 
@@ -198,7 +194,6 @@ flowchart TB
     THUMB --> DISK
     PREV --> DISK
     FP --> CAT
-    TRANS --> CAT
 
     CAT --> LIST
     LIST --> PROXY
@@ -294,7 +289,7 @@ sequenceDiagram
 - **Shorts 背景封面**：第一次请求 `/p/thumb/{videoID}?variant=shorts-bg` 时，从普通封面按需生成最长边 96px、预先模糊的 JPEG，后续直接复用；普通封面更新后会自动刷新。它计入封面存储占用，并随视频或网盘删除一起清理。
 - **预览视频**：30 秒以下最多 3 段、30 秒及以上固定 4 段，每段 3 秒。取点区间按时长分档：10 分钟以上在 20%–80% 之间均匀取，30 秒到 10 分钟避开片头片尾（5% 或 3 秒起、85% 前结束），30 秒以下从 10% 起。拼接后校验确有视频流；段数不足时只有在明确的降级路径下才接受 2 段，并留日志。⚠️ **选段起点只由时长决定**——这是内容级去重（[docs/DEDUP.md](docs/DEDUP.md)）帧对齐的正确性依赖，改选段算法必须同步评估那边。
 - **指纹**：读少量 Range 片段算 `sampled_sha256`，用于跨盘去重。除入库即时入队外，还有每分钟一次的补扫协程捞 `pending`。
-- **转码**：不自动跑，由后台按盘手动启动。候选按扩展名圈定：webm（规范上只装浏览器必播编码）和 strm（远程引用）除外都算候选——mp4/m4v 容器兼容但可能装着 MPEG-4 Part 2 / HEVC 等浏览器解不了的视频轨（表现为黑屏有声音）。云盘候选先用 `ffprobe` 远程探测直链（Range 只读容器元数据，MB 级流量），编码兼容的直接标 `skipped` 零下载跳过，需要转码的才整文件下载；mp4/m4v 远程探测失败标 `failed` 等重试，不做整文件下载兜底，避免系统性探测失败时把全库 mp4 拉一遍。单条视频可用 `go run ./cmd/transcode-one <videoID>` 立即处理（走同一流程，目前仅支持 p115）。
+- **转码**：上游已移除旧版后台转码 worker 和手动 `cmd/transcode-one` 入口；启动迁移会清理旧数据库中的转码状态字段，现有视频源和预览生成流程不受影响。
 
 **限流冷却**是这一层的横切设计：上游返回 429 / 403 / `activityLimitReached` 这类信号时，整盘进入冷却期，任务保留 `pending` 等下轮，而不是标记失败。联通和光鸭默认冷却 10 分钟。115 的签名链接被提前拒绝时会刷新一次直链重试。
 

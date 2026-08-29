@@ -6,18 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/video-site/backend/internal/api"
 	"github.com/video-site/backend/internal/crawlerupload"
-	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/localupload"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/preview"
-	"github.com/video-site/backend/internal/transcode"
 )
 
 // teaserEnabledForDrive 查询某个 drive 当前的 per-drive 预览视频开关。
@@ -31,7 +27,7 @@ import (
 // 其它 drive 读 catalog 失败时退化成 false（不生成）：比 "默认开" 更安全 —— 读不到
 // 状态时倾向不消耗 ffmpeg；调用方会记日志，运维能立刻看到问题。
 func (a *App) teaserEnabledForDrive(ctx context.Context, driveID string) bool {
-	d, err := a.cat.GetDrive(ctx, driveID)
+	d, err := a.activeDriveConfig(ctx, driveID)
 	if err != nil {
 		if driveID == localupload.DriveID && errors.Is(err, sql.ErrNoRows) {
 			return true
@@ -121,6 +117,13 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 	}
 	a.uploadProgressMu.Unlock()
 
+	a.crawlerUploadMu.Lock()
+	crawlerUploads := make(map[string]bool, len(a.crawlerUploadRunning))
+	for id, running := range a.crawlerUploadRunning {
+		crawlerUploads[id] = running
+	}
+	a.crawlerUploadMu.Unlock()
+
 	a.mu.Lock()
 	previewWorkers := make(map[string]*preview.Worker, len(a.workers))
 	for id, worker := range a.workers {
@@ -136,14 +139,7 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 	}
 	a.mu.Unlock()
 
-	a.transcodeMu.Lock()
-	transcodeWorkers := make(map[string]*transcode.Worker, len(a.transcodeWorkers))
-	for id, worker := range a.transcodeWorkers {
-		transcodeWorkers[id] = worker
-	}
-	a.transcodeMu.Unlock()
-
-	out := make(map[string]api.DriveGenerationStatuses, len(scanningDrives)+len(previewWorkers)+len(thumbWorkers)+len(fingerprintWorkers)+len(uploadProgresses)+len(transcodeWorkers))
+	out := make(map[string]api.DriveGenerationStatuses, len(scanningDrives)+len(previewWorkers)+len(thumbWorkers)+len(fingerprintWorkers)+len(uploadProgresses))
 	now := time.Now()
 	for id, running := range scanningDrives {
 		if !running {
@@ -195,10 +191,15 @@ func (a *App) driveGenerationStatuses() map[string]api.DriveGenerationStatuses {
 		}
 		out[id] = status
 	}
-	for id, worker := range transcodeWorkers {
+	for id, running := range crawlerUploads {
+		if !running {
+			continue
+		}
 		status := out[id]
-		status.Transcode = generationStatusFromTranscode(worker.Status())
-		out[id] = status
+		if status.Upload.State == "" || status.Upload.State == "idle" {
+			status.Upload.State = "queued"
+			out[id] = status
+		}
 	}
 	return out
 }
@@ -260,17 +261,6 @@ func (a *App) clearCrawlerUploadProgress(driveID string) bool {
 	return ok
 }
 
-func (a *App) clearAllCrawlerUploadProgress() []string {
-	a.uploadProgressMu.Lock()
-	ids := make([]string, 0, len(a.uploadProgress))
-	for id := range a.uploadProgress {
-		ids = append(ids, id)
-	}
-	a.uploadProgress = nil
-	a.uploadProgressMu.Unlock()
-	return ids
-}
-
 func generationStatusFromPreview(status preview.TaskStatus) api.GenerationStatus {
 	state := status.State
 	if state == "" {
@@ -301,123 +291,4 @@ func generationStatusFromFingerprint(status fingerprint.TaskStatus) api.Generati
 		out.CooldownUntil = status.CooldownUntil.Format(time.RFC3339)
 	}
 	return out
-}
-
-func generationStatusFromTranscode(status transcode.TaskStatus) api.GenerationStatus {
-	state := status.State
-	if state == "" {
-		state = "idle"
-	}
-	return api.GenerationStatus{
-		State:        state,
-		CurrentTitle: status.CurrentTitle,
-		QueueLength:  status.QueueLength,
-		DoneCount:    status.DoneCount,
-		TotalCount:   status.TotalCount,
-	}
-}
-
-// transcodeWorkDir 返回转码用的本地临时目录（下载原片 / 写产物），与
-// localUploadDir 一样挂在数据目录下，避免 /tmp 空间不足。
-func (a *App) transcodeWorkDir() string {
-	return filepath.Join(filepath.Dir(a.cfg.Storage.LocalPreviewDir), "transcode-tmp")
-}
-
-// startDriveTranscode 手动开启某盘的浏览器兼容性转码。
-// 转码从不自动运行：扫盘、夜间流水线都不会触发，这里是唯一入口。
-// 任务跑完候选列表后自然结束；中途可用 stopDriveTranscode / 停止所有任务中断。
-func (a *App) startDriveTranscode(ctx context.Context, driveID string) (bool, string) {
-	driveID = strings.TrimSpace(driveID)
-	if driveID == "" {
-		return false, "缺少存储 ID"
-	}
-	drv, ok := a.registry.Get(driveID)
-	if !ok {
-		return false, "存储未挂载或不可用"
-	}
-	if _, ok := drv.(drives.Uploader); !ok {
-		return false, "该存储不支持上传转码产物"
-	}
-	workDir := a.transcodeWorkDir()
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		return false, "创建转码临时目录失败: " + err.Error()
-	}
-
-	a.transcodeMu.Lock()
-	if a.transcodeWorkers == nil {
-		a.transcodeWorkers = make(map[string]*transcode.Worker)
-		a.transcodeCancels = make(map[string]context.CancelFunc)
-	}
-	if existing := a.transcodeWorkers[driveID]; existing != nil {
-		a.transcodeMu.Unlock()
-		return false, "该存储的转码任务已在运行"
-	}
-	worker := transcode.NewWorker(transcode.Config{
-		FFmpegPath:  a.cfg.Preview.FFmpegPath,
-		FFprobePath: a.cfg.Preview.FFprobePath,
-		WorkDir:     workDir,
-	}, a.cat, drv)
-	taskCtx, done := a.registerDriveTaskContext(ctx, driveID)
-	runCtx, cancel := context.WithCancel(taskCtx)
-	a.transcodeWorkers[driveID] = worker
-	a.transcodeCancels[driveID] = cancel
-	a.transcodeMu.Unlock()
-
-	go func() {
-		defer func() {
-			cancel()
-			done()
-			a.transcodeMu.Lock()
-			if a.transcodeWorkers[driveID] == worker {
-				delete(a.transcodeWorkers, driveID)
-				delete(a.transcodeCancels, driveID)
-			}
-			a.transcodeMu.Unlock()
-		}()
-		candidates, err := a.cat.ListTranscodeCandidates(runCtx, driveID, 0)
-		if err != nil {
-			log.Printf("[transcode] list candidates drive=%s: %v", driveID, err)
-			return
-		}
-		if len(candidates) == 0 {
-			log.Printf("[transcode] drive=%s no candidates", driveID)
-			return
-		}
-		log.Printf("[transcode] drive=%s start, %d candidates", driveID, len(candidates))
-		worker.Run(runCtx, candidates)
-	}()
-	return true, ""
-}
-
-// stopAllDriveTranscodes 停掉所有盘的转码任务，返回被停的 driveID 列表。
-func (a *App) stopAllDriveTranscodes() []string {
-	a.transcodeMu.Lock()
-	cancels := a.transcodeCancels
-	a.transcodeCancels = nil
-	a.transcodeWorkers = nil
-	a.transcodeMu.Unlock()
-	ids := make([]string, 0, len(cancels))
-	for id, cancel := range cancels {
-		if cancel != nil {
-			cancel()
-		}
-		ids = append(ids, id)
-	}
-	return ids
-}
-
-// stopDriveTranscode 手动停止某盘的转码任务。返回是否有任务被停。
-func (a *App) stopDriveTranscode(driveID string) bool {
-	driveID = strings.TrimSpace(driveID)
-	a.transcodeMu.Lock()
-	cancel := a.transcodeCancels[driveID]
-	delete(a.transcodeCancels, driveID)
-	delete(a.transcodeWorkers, driveID)
-	a.transcodeMu.Unlock()
-	if cancel == nil {
-		return false
-	}
-	cancel()
-	log.Printf("[transcode] stop drive=%s", driveID)
-	return true
 }

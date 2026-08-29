@@ -13,7 +13,6 @@ import (
 	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
-	"github.com/video-site/backend/internal/transcode"
 )
 
 type App struct {
@@ -26,6 +25,10 @@ type App struct {
 	workers            map[string]*preview.Worker
 	thumbWorkers       map[string]*preview.ThumbWorker
 	fingerprintWorkers map[string]*fingerprint.Worker
+	// previewConcurrency is the per-drive preview worker limit copied from the
+	// single live preview.concurrency setting. It is guarded by mu so worker
+	// registration and live updates cannot miss each other.
+	previewConcurrency int
 	cancels            map[string]context.CancelFunc
 	// scriptCrawlers 按 driveID 索引，每个脚本爬虫 drive 独立一个 Crawler。
 	scriptCrawlers map[string]*scriptcrawler.Crawler
@@ -33,6 +36,17 @@ type App struct {
 	// driveAttachMu 串行化云盘挂载/重挂载。挂载会访问上游服务，可能较慢；
 	// 串行化可以避免启动后台挂载和手动扫盘按需挂载同一个 drive 时重复创建 worker。
 	driveAttachMu sync.Mutex
+
+	// driveOperationGates coordinate task generations with configuration writes.
+	// Desired settings are saved immediately; active tasks keep an immutable old
+	// snapshot and the latest pending settings are applied once that generation drains.
+	driveOperationGatesMu sync.Mutex
+	driveOperationGates   map[string]*driveOperationGate
+
+	// driveCredentialStates 给每次挂载签发一代凭证写入租约。旧 driver 的请求可能
+	// 在重挂载甚至删除后才完成；租约让这些迟到回调不能覆盖新实例刚轮换的 token。
+	driveCredentialStatesMu sync.Mutex
+	driveCredentialStates   map[string]*driveCredentialState
 
 	// 全站主题（"dark" | "pink" | "sky"），从 DB 读
 	theme string
@@ -48,7 +62,7 @@ type App struct {
 	crawlerUploader crawlerUploadRunner
 
 	// nightlyRunner 协调两种互斥任务：定时完整流水线，以及 admin 手动触发的
-	// “扫所有真实网盘 → 等新视频资产 → 去重”精简流水线。
+	// “扫所有真实网盘 → 等新视频资产 → 对账本地资产 → 去重”精简流水线。
 	nightlyRunner *nightly.Runner
 
 	// scanQueueMu 保护 scanQueued 和 scanProgress。
@@ -77,13 +91,6 @@ type App struct {
 	// uploadProgress 跟踪脚本爬虫迁移到云盘时的实时上传状态。
 	uploadProgressMu sync.Mutex
 	uploadProgress   map[string]driveUploadProgress
-
-	// transcodeMu 保护 transcodeWorkers / transcodeCancels。
-	// 浏览器兼容性转码每盘最多一个任务，且只能由管理员手动开启
-	// （不随扫盘/夜间流水线自动运行），手动停止或处理完即从 map 清除。
-	transcodeMu      sync.Mutex
-	transcodeWorkers map[string]*transcode.Worker
-	transcodeCancels map[string]context.CancelFunc
 
 	// blacklistSourceDeleteMu protects the one-at-a-time background job that
 	// removes source files for tombstoned videos. The job reads tombstones from
@@ -153,5 +160,6 @@ type driveUploadProgress struct {
 
 type crawlerUploadRunner interface {
 	RunOnce(ctx context.Context) error
+	RunDrives(ctx context.Context, driveIDs []string) error
 	StartDrive(ctx context.Context, driveID string) (<-chan error, bool)
 }

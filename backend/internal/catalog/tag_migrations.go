@@ -78,19 +78,9 @@ UPDATE videos
 	if err := c.addColumnIfMissing(ctx, "videos", "last_liked_at", "INTEGER DEFAULT 0"); err != nil {
 		return err
 	}
-	// videos.transcode_*：浏览器兼容性转码状态。
-	// status：''=未检测 / pending=已入队 / ready=已转码 / skipped=检测后无需转码 / failed=失败。
-	// transcoded_file_id 指向转码产物在同一 drive 上的 fileID，播放源优先使用它。
-	if err := c.addColumnIfMissing(ctx, "videos", "transcode_status", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := c.addColumnIfMissing(ctx, "videos", "transcode_error", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := c.addColumnIfMissing(ctx, "videos", "transcoded_file_id", "TEXT DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := c.addColumnIfMissing(ctx, "videos", "transcoded_size", "INTEGER DEFAULT 0"); err != nil {
+	// 目录身份用于同目录合集。非常早期的库可能还没有 parent_id；先补身份列，
+	// 再补仅用于展示和标签匹配的目录名。
+	if err := c.addColumnIfMissing(ctx, "videos", "parent_id", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
 	// videos.dir_name：视频所在目录名，扫盘时落库；标签全库重算需要用它做匹配材料。
@@ -118,6 +108,16 @@ UPDATE videos
 	}
 	if err := c.dropColumnIfExists(ctx, "videos", "llm_tagged_at"); err != nil {
 		return err
+	}
+	// quality 曾被扫盘统一写成 HD，并不代表真实分辨率；完整退役该无效元数据。
+	if err := c.dropColumnIfExists(ctx, "videos", "quality"); err != nil {
+		return err
+	}
+	// 浏览器兼容性转码已整体退役；老库不再保留任务状态和产物引用。
+	for _, column := range []string{"transcode_status", "transcode_error", "transcoded_file_id", "transcoded_size"} {
+		if err := c.dropColumnIfExists(ctx, "videos", column); err != nil {
+			return err
+		}
 	}
 	if err := c.ensureBaseVideoIndexes(ctx); err != nil {
 		return err
@@ -192,6 +192,9 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 	if err := c.reconcileThumbnailStatusOnce(ctx); err != nil {
 		return err
 	}
+	if err := c.requeueFailedThumbnailsWithReadyPreviewOnce(ctx); err != nil {
+		return err
+	}
 	if err := c.requeueSkippedPreviews(ctx); err != nil {
 		return err
 	}
@@ -220,6 +223,9 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_file_name_size_created ON videos(file_name, size_bytes, created_at, id)`); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_videos_directory ON videos(drive_id, parent_id)`); err != nil {
 		return err
 	}
 	if err := c.ensureCanonicalVideoMaterialization(ctx); err != nil {
@@ -292,6 +298,12 @@ CREATE TABLE IF NOT EXISTS deleted_videos (
 // generated labels, and re-matches videos. The only generated labels it may
 // add are AV series labels while the built-in AV mechanism is enabled.
 func (c *Catalog) RunPostStartupTagMaintenance(ctx context.Context) error {
+	c.tagMaintenanceMu.Lock()
+	defer c.tagMaintenanceMu.Unlock()
+	return c.runPostStartupTagMaintenance(ctx)
+}
+
+func (c *Catalog) runPostStartupTagMaintenance(ctx context.Context) error {
 	if err := c.removeRetiredTagRuleFields(ctx); err != nil {
 		return err
 	}
@@ -631,11 +643,28 @@ func (c *Catalog) dropColumnIfExists(ctx context.Context, table, column string) 
 	if _, err = c.db.ExecContext(ctx, `ALTER TABLE `+table+` DROP COLUMN `+column); err == nil {
 		return nil
 	}
-	if table == "videos" && (strings.EqualFold(column, "category") || strings.EqualFold(column, "llm_tagged_at")) {
+	if table == "videos" && isRetiredVideoColumn(column) {
 		log.Printf("[catalog] native drop column videos.%s failed, rebuilding videos table with current columns: %v", column, err)
-		return c.rebuildVideosTableWithoutCategory(ctx)
+		return c.rebuildVideosTableWithCurrentColumns(ctx)
 	}
 	return err
+}
+
+func isRetiredVideoColumn(column string) bool {
+	for _, retired := range []string{
+		"category",
+		"llm_tagged_at",
+		"quality",
+		"transcode_status",
+		"transcode_error",
+		"transcoded_file_id",
+		"transcoded_size",
+	} {
+		if strings.EqualFold(column, retired) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Catalog) ensureBaseVideoIndexes(ctx context.Context) error {
@@ -1040,7 +1069,6 @@ var currentVideoColumnNames = []string{
 	"duration_seconds",
 	"size_bytes",
 	"ext",
-	"quality",
 	"thumbnail_url",
 	"thumbnail_updated_at",
 	"thumbnail_status",
@@ -1049,10 +1077,6 @@ var currentVideoColumnNames = []string{
 	"preview_local",
 	"preview_updated_at",
 	"preview_status",
-	"transcode_status",
-	"transcode_error",
-	"transcoded_file_id",
-	"transcoded_size",
 	"views",
 	"last_viewed_at",
 	"favorites",
@@ -1070,8 +1094,8 @@ var currentVideoColumnNames = []string{
 	"updated_at",
 }
 
-const createVideosWithoutCategorySQL = `
-CREATE TABLE videos_category_drop_new (
+const createCurrentVideosTableSQL = `
+CREATE TABLE videos_schema_rebuild_new (
     id                 TEXT PRIMARY KEY,
     drive_id           TEXT NOT NULL,
     file_id            TEXT NOT NULL,
@@ -1088,7 +1112,6 @@ CREATE TABLE videos_category_drop_new (
     duration_seconds   INTEGER DEFAULT 0,
     size_bytes         INTEGER DEFAULT 0,
     ext                TEXT,
-    quality            TEXT,
     thumbnail_url      TEXT,
 	thumbnail_updated_at INTEGER DEFAULT 0,
     thumbnail_status   TEXT DEFAULT 'pending',
@@ -1097,10 +1120,6 @@ CREATE TABLE videos_category_drop_new (
     preview_local      TEXT,
     preview_updated_at INTEGER DEFAULT 0,
     preview_status     TEXT DEFAULT 'pending',
-    transcode_status   TEXT DEFAULT '',
-    transcode_error    TEXT DEFAULT '',
-    transcoded_file_id TEXT DEFAULT '',
-    transcoded_size    INTEGER DEFAULT 0,
     views              INTEGER DEFAULT 0,
     last_viewed_at     INTEGER DEFAULT 0,
     favorites          INTEGER DEFAULT 0,
@@ -1118,28 +1137,28 @@ CREATE TABLE videos_category_drop_new (
     updated_at         INTEGER NOT NULL
 )`
 
-func (c *Catalog) rebuildVideosTableWithoutCategory(ctx context.Context) error {
+func (c *Catalog) rebuildVideosTableWithCurrentColumns(ctx context.Context) error {
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS videos_category_drop_new`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS videos_schema_rebuild_new`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, createVideosWithoutCategorySQL); err != nil {
+	if _, err := tx.ExecContext(ctx, createCurrentVideosTableSQL); err != nil {
 		return err
 	}
 	cols := strings.Join(currentVideoColumnNames, ", ")
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO videos_category_drop_new (`+cols+`) SELECT `+cols+` FROM videos`); err != nil {
+		`INSERT INTO videos_schema_rebuild_new (`+cols+`) SELECT `+cols+` FROM videos`); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DROP TABLE videos`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `ALTER TABLE videos_category_drop_new RENAME TO videos`); err != nil {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE videos_schema_rebuild_new RENAME TO videos`); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1239,6 +1258,41 @@ UPDATE videos
 	}
 	if affected, err := res.RowsAffected(); err == nil && affected > 0 {
 		log.Printf("[catalog] reconciled %d video(s) thumbnail_status pending→ready (url already written)", affected)
+	}
+	if err := c.SetSetting(ctx, markerKey, "1"); err != nil {
+		return fmt.Errorf("write %s marker: %w", markerKey, err)
+	}
+	return nil
+}
+
+// requeueFailedThumbnailsWithReadyPreviewOnce repairs rows created before
+// preview completion became a thumbnail retry signal. Future rows are handled
+// transactionally by UpdatePreview; the marker prevents a permanently bad
+// source video from being retried on every process restart.
+func (c *Catalog) requeueFailedThumbnailsWithReadyPreviewOnce(ctx context.Context) error {
+	const markerKey = "videos.failed_thumbnail.ready_preview_requeued_v2"
+	marker, err := c.GetSetting(ctx, markerKey, "")
+	if err != nil {
+		return fmt.Errorf("read %s marker: %w", markerKey, err)
+	}
+	if strings.TrimSpace(marker) == "1" {
+		return nil
+	}
+	result, err := c.db.ExecContext(ctx, `
+UPDATE videos
+   SET thumbnail_status = 'pending',
+       thumbnail_failures = 0,
+       updated_at = ?
+ WHERE COALESCE(thumbnail_url, '') = ''
+   AND COALESCE(thumbnail_status, 'pending') = 'failed'
+   AND COALESCE(preview_status, 'pending') = 'ready'
+   AND TRIM(COALESCE(preview_local, '')) != ''
+`, time.Now().UnixMilli())
+	if err != nil {
+		return fmt.Errorf("requeue failed thumbnails with ready preview: %w", err)
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr == nil && affected > 0 {
+		log.Printf("[catalog] requeued %d failed thumbnail(s) with a ready local preview", affected)
 	}
 	if err := c.SetSetting(ctx, markerKey, "1"); err != nil {
 		return fmt.Errorf("write %s marker: %w", markerKey, err)

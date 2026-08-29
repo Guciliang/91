@@ -97,21 +97,27 @@ test("mobile shorts scrubbing time is shown at the top", () => {
 test("mobile shorts title stays plain text without creating a gesture dead zone", () => {
   assert.match(
     shortsPageSource,
+    /<h2 className="shorts-slide__title">\{item\.title\}<\/h2>/
+  );
+  assert.match(shortsPageSource, /<div className="shorts-slide__overlay">/);
+  assert.doesNotMatch(shortsPageSource, /shorts-slide__title-link/);
+  assert.doesNotMatch(shortsCssSource, /\.shorts-slide__overlay \* \{/);
+});
+
+test("the shorts drive badge is the only video detail link", () => {
+  assert.match(
+    shortsPageSource,
     /const detailPath = `\/video\/\$\{encodeURIComponent\(item\.id\)\}`;/
   );
   assert.match(
     shortsPageSource,
-    /<h2 className="shorts-slide__title">\{item\.title\}<\/h2>/
+    /<Link\s+to=\{detailPath\}\s+className="shorts-drive-badge"[\s\S]*?aria-label=\{`查看视频详情，来源：\$\{item\.sourceLabel \|\| "本地"\}`\}[\s\S]*?onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
   );
-  assert.doesNotMatch(shortsPageSource, /shorts-slide__title-link/);
+  assert.doesNotMatch(shortsPageSource, /shorts-slide__detail|<Info\b|>查看详情</);
+  assert.doesNotMatch(shortsCssSource, /\.shorts-slide__detail/);
   assert.match(
     shortsCssSource,
-    /\.shorts-slide__detail \{\s*pointer-events: auto;/
-  );
-  assert.doesNotMatch(shortsCssSource, /\.shorts-slide__overlay \* \{/);
-  assert.match(
-    shortsCssSource,
-    /@media \(max-width: 768px\) \{\s*\.shorts-slide__detail \{\s*display: none !important;/
+    /\.shorts-drive-badge\s*\{[^}]*cursor:\s*pointer;[^}]*-webkit-tap-highlight-color:\s*transparent;/s
   );
 });
 
@@ -122,7 +128,11 @@ test("low-height landscape shorts keep actions below the header", () => {
   );
   assert.match(
     shortsCssSource,
-    /@media \(orientation: landscape\) and \(max-height: 520px\) \{[\s\S]*?\.shorts-slide__actions \{\s*top: calc\(env\(safe-area-inset-top\) \+ 68px\);\s*bottom: auto;\s*gap: 12px;\s*\}[\s\S]*?\.shorts-drive-badge \{\s*display: none;/
+    /@media \(orientation: landscape\) and \(max-height: 520px\) \{\s*\.shorts-slide__actions \{\s*top: calc\(env\(safe-area-inset-top\) \+ 68px\);\s*bottom: auto;\s*gap: 12px;\s*\}\s*\}/
+  );
+  assert.doesNotMatch(
+    shortsCssSource,
+    /\.shorts-drive-badge\s*\{[^}]*display:\s*none;/s
   );
   assert.match(
     shortsCssSource,
@@ -465,6 +475,13 @@ test("shorts play pause does not render transient center hud", () => {
   assert.doesNotMatch(shortsPageSource, />\s*▶\s*</);
 });
 
+test("shorts screen taps do not show the browser tap highlight", () => {
+  assert.match(
+    shortsCssSource,
+    /\.shorts-slide\s*\{[^}]*-webkit-tap-highlight-color:\s*transparent;/s
+  );
+});
+
 test("shorts hud toast keeps icon and text close together", () => {
   assert.match(
     shortsCssSource,
@@ -501,10 +518,18 @@ test("shorts loading spinner covers video buffering and initial feed loading", (
     /@keyframes shorts-spinner-rotate\s*\{[\s\S]*to\s*\{\s*transform:\s*rotate\(360deg\);/
   );
   assert.match(shortsCssSource, /\.shorts-loading \.shorts-slide__loading-spinner\s*\{/);
-  assert.match(
-    shortsCssSource,
-    /@media \(max-width:\s*640px\)\s*\{[\s\S]*\.shorts-slide__buffering\s*\{[\s\S]*--shorts-spinner-size:\s*24px;[\s\S]*width:\s*56px;[\s\S]*height:\s*56px;/
+  const bufferingRule =
+    shortsCssSource.match(/\.shorts-slide__buffering\s*\{[^}]*\}/s)?.[0] ?? "";
+  assert.doesNotMatch(
+    bufferingRule,
+    /background:|backdrop-filter:|box-shadow:|border:|border-radius:|width:|height:/
   );
+  const mobileBufferingRule =
+    shortsCssSource.match(
+      /@media \(max-width:\s*640px\)\s*\{[\s\S]*?\.shorts-slide__buffering\s*\{[^}]*\}/
+    )?.[0] ?? "";
+  assert.match(mobileBufferingRule, /--shorts-spinner-size:\s*24px;/);
+  assert.doesNotMatch(mobileBufferingRule, /width:\s*56px|height:\s*56px/);
 });
 
 test("shorts preloads the next two original videos only after the active video has comfortable buffer", () => {
@@ -1369,7 +1394,7 @@ test("shorts links exit document fullscreen before leaving the immersive page", 
   assert.doesNotMatch(shortsPageSource, /shorts-slide__title-link/);
   assert.match(
     shortsPageSource,
-    /className="shorts-slide__detail"\s*onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
+    /className="shorts-drive-badge"[\s\S]*?onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
   );
 });
 

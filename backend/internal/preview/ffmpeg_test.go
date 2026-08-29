@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/streamhttp"
@@ -130,7 +131,7 @@ func TestTinyVideoPreviewPlanUsesWholeVideoAsSingleSegment(t *testing.T) {
 func TestProbeIgnoresStderrWarnings(t *testing.T) {
 	dir := t.TempDir()
 	ffprobePath := filepath.Join(dir, "ffprobe")
-	script := "#!/bin/sh\nprintf '%s\\n' 'h264 warning' >&2\nprintf '%s\\n' '364.800000'\n"
+	script := "#!/bin/sh\nprintf '%s\\n' 'h264 warning' >&2\nprintf '%s' '{\"streams\":[{\"codec_type\":\"video\",\"duration\":\"364.800000\"}],\"format\":{\"duration\":\"364.800000\"}}'\n"
 	if err := os.WriteFile(ffprobePath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write ffprobe stub: %v", err)
 	}
@@ -142,6 +143,49 @@ func TestProbeIgnoresStderrWarnings(t *testing.T) {
 	}
 	if got != 364.8 {
 		t.Fatalf("duration = %v, want 364.8", got)
+	}
+}
+
+func TestProbePrefersMainVideoDurationOverCorruptContainerTimeline(t *testing.T) {
+	dir := t.TempDir()
+	ffprobePath := filepath.Join(dir, "ffprobe")
+	// This mirrors the observed 115 file: a one-frame auxiliary video stream
+	// starts around 2.48 million seconds and stretches format.duration, while
+	// the actual video stream remains 13.733 seconds long.
+	script := `#!/bin/sh
+printf '%s' '{"streams":[{"codec_type":"video","duration":"13.733333","nb_frames":"824"},{"codec_type":"audio","duration":"13.722993"},{"codec_type":"video","duration":"0.000011","nb_frames":"1"}],"format":{"duration":"2481536.659011"}}'
+`
+	if err := os.WriteFile(ffprobePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+
+	gen := New(Config{FFprobePath: ffprobePath})
+	got, err := gen.Probe(context.Background(), &drives.StreamLink{URL: filepath.Join(dir, "video.mp4")})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if math.Abs(got-13.733333) > 0.000001 {
+		t.Fatalf("duration = %.6f, want main video duration 13.733333", got)
+	}
+}
+
+func TestProbeFallsBackToFormatDurationWithoutUsableVideoDuration(t *testing.T) {
+	dir := t.TempDir()
+	ffprobePath := filepath.Join(dir, "ffprobe")
+	script := `#!/bin/sh
+printf '%s' '{"streams":[{"codec_type":"video","duration":"N/A"}],"format":{"duration":"42.500000"}}'
+`
+	if err := os.WriteFile(ffprobePath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+
+	gen := New(Config{FFprobePath: ffprobePath})
+	got, err := gen.Probe(context.Background(), &drives.StreamLink{URL: filepath.Join(dir, "video.mp4")})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if got != 42.5 {
+		t.Fatalf("duration = %v, want format fallback 42.5", got)
 	}
 }
 
@@ -237,6 +281,34 @@ func TestThumbnailVideoFilterUsesFullRangeJPEGPixelFormat(t *testing.T) {
 	}
 	if !strings.Contains(got, "format=yuvj420p") {
 		t.Fatalf("thumbnail filter = %q, want JPEG-friendly pixel format", got)
+	}
+}
+
+func TestTeaserSegmentVideoFilterResetsTimestampsBeforeConcat(t *testing.T) {
+	got := teaserSegmentVideoFilter(480, true, 3)
+	if !strings.Contains(got, "setpts=PTS-STARTPTS") {
+		t.Fatalf("teaser filter = %q, want timestamp reset", got)
+	}
+	if !strings.Contains(got, "fade=t=in") || !strings.Contains(got, "fade=t=out:st=2.80") {
+		t.Fatalf("teaser filter = %q, want segment fades", got)
+	}
+}
+
+func TestValidateGeneratedTeaserRejectsNonZeroStartTime(t *testing.T) {
+	dir := t.TempDir()
+	ffprobe := filepath.Join(dir, "ffprobe")
+	probeScript := "#!/bin/sh\n" +
+		`printf '%s' '{"streams":[{"codec_type":"video","duration":"3.0"}],"format":{"start_time":"5.366016","duration":"8.366016"}}'` + "\n"
+	if err := os.WriteFile(ffprobe, []byte(probeScript), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	path := filepath.Join(dir, "teaser.mp4")
+	if err := os.WriteFile(path, []byte("not-empty"), 0o644); err != nil {
+		t.Fatalf("write teaser: %v", err)
+	}
+	gen := New(Config{FFprobePath: ffprobe})
+	if err := gen.validateGeneratedTeaser(context.Background(), path); err == nil || !strings.Contains(err.Error(), "starts too late") {
+		t.Fatalf("validate error = %v, want late-start rejection", err)
 	}
 }
 
@@ -428,9 +500,11 @@ case " $* " in
     exit 0
     ;;
 esac
+while ! mkdir %[1]q.lock 2>/dev/null; do sleep 0.01; done
 count=$(cat %[1]q 2>/dev/null || echo 0)
 count=$((count + 1))
 printf '%%s' "$count" > %[1]q
+rmdir %[1]q.lock
 if [ "$count" -le %[2]d ]; then
   printf 'segment-output' > "$out"
 fi
@@ -455,7 +529,7 @@ exit 0
 	})
 }
 
-func TestGenerateSequentialAcceptsDegradedTeaserAndLogsIt(t *testing.T) {
+func TestGenerateAcceptsDegradedTeaserAndLogsIt(t *testing.T) {
 	gen := newTeaserStubGenerator(t, 2)
 	link := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
 
@@ -463,9 +537,7 @@ func TestGenerateSequentialAcceptsDegradedTeaserAndLogsIt(t *testing.T) {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
-	path, err := gen.generateSequential(context.Background(), 204, func(int) (*drives.StreamLink, error) {
-		return link, nil
-	})
+	path, err := gen.Generate(context.Background(), link, 204)
 	if err != nil {
 		t.Fatalf("generate sequential: %v", err)
 	}
@@ -478,13 +550,11 @@ func TestGenerateSequentialAcceptsDegradedTeaserAndLogsIt(t *testing.T) {
 	}
 }
 
-func TestGenerateSequentialRejectsTeaserBelowDegradedFloor(t *testing.T) {
+func TestGenerateRejectsTeaserBelowDegradedFloor(t *testing.T) {
 	gen := newTeaserStubGenerator(t, 1)
 	link := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
 
-	_, err := gen.generateSequential(context.Background(), 204, func(int) (*drives.StreamLink, error) {
-		return link, nil
-	})
+	_, err := gen.Generate(context.Background(), link, 204)
 	if err == nil {
 		t.Fatal("expected an error: one usable segment is below the degraded floor")
 	}
@@ -493,7 +563,7 @@ func TestGenerateSequentialRejectsTeaserBelowDegradedFloor(t *testing.T) {
 	}
 }
 
-func TestGenerateSequentialKeepsFullPlanWhenEverySegmentWorks(t *testing.T) {
+func TestGenerateKeepsFullPlanWhenEverySegmentWorks(t *testing.T) {
 	gen := newTeaserStubGenerator(t, 4)
 	link := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
 
@@ -501,14 +571,315 @@ func TestGenerateSequentialKeepsFullPlanWhenEverySegmentWorks(t *testing.T) {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 
-	path, err := gen.generateSequential(context.Background(), 204, func(int) (*drives.StreamLink, error) {
-		return link, nil
-	})
+	path, err := gen.Generate(context.Background(), link, 204)
 	if err != nil {
 		t.Fatalf("generate sequential: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
 	if strings.Contains(logs.String(), "degraded teaser") {
 		t.Fatalf("logs = %q, want no degradation for a healthy source", logs.String())
+	}
+}
+
+func TestGenerateWithLinkRefreshDoesNotRefreshHealthyTask(t *testing.T) {
+	gen := newTeaserStubGenerator(t, 4)
+	first := &drives.StreamLink{URL: filepath.Join(t.TempDir(), "video.mp4")}
+	refreshes := 0
+
+	path, err := gen.GenerateWithLinkRefresh(context.Background(), first, 204, func(context.Context) (*drives.StreamLink, error) {
+		refreshes++
+		return &drives.StreamLink{URL: filepath.Join(t.TempDir(), "refreshed.mp4")}, nil
+	})
+	if err != nil {
+		t.Fatalf("generate with link provider: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if refreshes != 0 {
+		t.Fatalf("refreshes = %d, want zero for a healthy task", refreshes)
+	}
+}
+
+func TestGenerateRunsFourPlannedSegmentsSerially(t *testing.T) {
+	dir := t.TempDir()
+	markers := filepath.Join(dir, "markers")
+	if err := os.MkdirAll(markers, 0o755); err != nil {
+		t.Fatalf("create marker directory: %v", err)
+	}
+	gate := filepath.Join(dir, "release")
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	script := fmt.Sprintf(`#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+case " $* " in
+  *" -f concat "*) printf 'concat-output' > "$out"; exit 0 ;;
+esac
+case "$out" in
+  *teaser-seg-0-*) marker=0 ;;
+  *teaser-seg-1-*) marker=1 ;;
+  *teaser-seg-2-*) marker=2 ;;
+  *teaser-seg-3-*) marker=3 ;;
+  *) printf 'unexpected segment path: %%s' "$out" >&2; exit 1 ;;
+esac
+: > %[1]q/"$marker"
+if [ "$marker" = 0 ]; then
+  while [ ! -f %[2]q ]; do sleep 0.01; done
+fi
+printf 'segment-output' > "$out"
+`, markers, gate)
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+	ffprobe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"video\",\"duration\":\"3.0\"}],\"format\":{\"duration\":\"3.0\"}}'\n"), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	gen := New(Config{FFmpegPath: ffmpeg, FFprobePath: ffprobe, LocalDir: filepath.Join(dir, "preview")})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		path string
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		path, err := gen.Generate(
+			ctx,
+			&drives.StreamLink{URL: filepath.Join(dir, "initial.mp4")},
+			204,
+		)
+		resultCh <- result{path: path, err: err}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(filepath.Join(markers, "0")); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat first segment marker: %v", err)
+		}
+		select {
+		case got := <-resultCh:
+			t.Fatalf("generation ended before first segment blocked: path=%q err=%v", got.path, got.err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(filepath.Join(markers, "0")); err != nil {
+		t.Fatalf("first segment did not start before timeout: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	entries, err := os.ReadDir(markers)
+	if err != nil {
+		t.Fatalf("read segment markers: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("segment processes entered while the first was blocked: markers=%d, want 1", len(entries))
+	}
+	if err := os.WriteFile(gate, []byte("release"), 0o644); err != nil {
+		t.Fatalf("release segment processes: %v", err)
+	}
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("generate serial teaser: %v", got.err)
+		}
+		t.Cleanup(func() { _ = os.Remove(got.path) })
+	case <-time.After(5 * time.Second):
+		t.Fatal("serial teaser generation did not finish")
+	}
+	entries, err = os.ReadDir(markers)
+	if err != nil {
+		t.Fatalf("read completed segment markers: %v", err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("completed segment markers = %d, want 4", len(entries))
+	}
+}
+
+func TestGenerateConcatenatesFallbackSegmentsByTimeline(t *testing.T) {
+	dir := t.TempDir()
+	capturedList := filepath.Join(dir, "concat-list")
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	script := fmt.Sprintf(`#!/bin/sh
+out=""
+input=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-i" ]; then input="$arg"; fi
+  previous="$arg"
+  out="$arg"
+done
+case " $* " in
+  *" -f concat "*) cp "$input" %[1]q; printf 'concat-output' > "$out"; exit 0 ;;
+esac
+case "$out" in
+  *teaser-seg-0-*) exit 0 ;;
+esac
+printf 'segment-output' > "$out"
+`, capturedList)
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+	ffprobe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"video\",\"duration\":\"3.0\"}],\"format\":{\"duration\":\"3.0\"}}'\n"), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	gen := New(Config{FFmpegPath: ffmpeg, FFprobePath: ffprobe, LocalDir: filepath.Join(dir, "preview")})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	path, err := gen.Generate(
+		ctx,
+		&drives.StreamLink{URL: filepath.Join(dir, "initial.mp4")},
+		204,
+	)
+	if err != nil {
+		t.Fatalf("generate teaser with fallback segment: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	list, err := os.ReadFile(capturedList)
+	if err != nil {
+		t.Fatalf("read captured concat list: %v", err)
+	}
+	lastPosition := -1
+	for _, i := range []int{4, 1, 2, 3} {
+		position := strings.Index(string(list), fmt.Sprintf("teaser-seg-%d-", i))
+		if position <= lastPosition {
+			t.Fatalf("concat list is not in timeline order: %s", list)
+		}
+		lastPosition = position
+	}
+	if strings.Contains(string(list), "teaser-seg-0-") {
+		t.Fatalf("concat list contains failed primary segment: %s", list)
+	}
+}
+
+func TestGenerateWithLinkRefreshRefreshesFailureAndReusesReplacement(t *testing.T) {
+	dir := t.TempDir()
+	initialDir := filepath.Join(dir, "initial-attempts")
+	refreshedDir := filepath.Join(dir, "refreshed-attempts")
+	for _, path := range []string{initialDir, refreshedDir} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("create attempt marker directory: %v", err)
+		}
+	}
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	script := fmt.Sprintf(`#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+case " $* " in
+  *" -f concat "*) printf 'concat-output' > "$out"; exit 0 ;;
+esac
+name=${out##*/}
+case " $* " in
+  *initial.mp4*)
+    : > %[1]q/"$name"
+    case "$out" in
+      *teaser-seg-2-*)
+        printf 'Server returned 403 Forbidden' >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *refreshed.mp4*)
+    : > %[2]q/"$name"
+    ;;
+esac
+printf 'segment-output' > "$out"
+`, initialDir, refreshedDir)
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+	ffprobe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"video\",\"duration\":\"3.0\"}],\"format\":{\"duration\":\"3.0\"}}'\n"), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	gen := New(Config{FFmpegPath: ffmpeg, FFprobePath: ffprobe, LocalDir: filepath.Join(dir, "preview")})
+	refreshes := 0
+	path, err := gen.GenerateWithLinkRefresh(
+		context.Background(),
+		&drives.StreamLink{URL: filepath.Join(dir, "initial.mp4")},
+		204,
+		func(context.Context) (*drives.StreamLink, error) {
+			refreshes++
+			return &drives.StreamLink{URL: filepath.Join(dir, "refreshed.mp4")}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("generate with failure-driven refresh: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if refreshes != 1 {
+		t.Fatalf("refreshes = %d, want one refresh for the failed segment", refreshes)
+	}
+	initialEntries, err := os.ReadDir(initialDir)
+	if err != nil {
+		t.Fatalf("read initial attempt markers: %v", err)
+	}
+	if len(initialEntries) != 3 {
+		t.Fatalf("segments attempted with initial link = %d, want segments 0, 1, and failed 2", len(initialEntries))
+	}
+	for _, index := range []string{"teaser-seg-0-", "teaser-seg-1-", "teaser-seg-2-"} {
+		found := false
+		for _, entry := range initialEntries {
+			if strings.Contains(entry.Name(), index) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("initial attempt markers = %#v, missing %s", initialEntries, index)
+		}
+	}
+	refreshedEntries, err := os.ReadDir(refreshedDir)
+	if err != nil {
+		t.Fatalf("read refreshed attempt markers: %v", err)
+	}
+	if len(refreshedEntries) != 2 {
+		t.Fatalf("segments attempted with refreshed link = %d, want retried 2 and later 3", len(refreshedEntries))
+	}
+	for _, index := range []string{"teaser-seg-2-", "teaser-seg-3-"} {
+		found := false
+		for _, entry := range refreshedEntries {
+			if strings.Contains(entry.Name(), index) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("refreshed attempt markers = %#v, missing %s", refreshedEntries, index)
+		}
+	}
+}
+
+func TestDirectMediaLinkRefreshClassification(t *testing.T) {
+	for _, err := range []error{
+		errors.New("ffmpeg segment: Server returned 403 Forbidden"),
+		errors.New("ffmpeg segment: partial file after EOF"),
+		errors.New("ffmpeg segment: signal: killed"),
+	} {
+		if !directMediaLinkRefreshAllowed(err) {
+			t.Fatalf("error %q should allow a signed-link refresh", err)
+		}
+	}
+	for _, err := range []error{
+		errors.New("Invalid data found when processing input"),
+		errors.New("unsupported codec"),
+	} {
+		if directMediaLinkRefreshAllowed(err) {
+			t.Fatalf("deterministic error %q should not refresh a signed link", err)
+		}
+	}
+}
+
+func TestDeterministicMediaInputErrorStopsTimestampFallback(t *testing.T) {
+	err := errors.New("ffmpeg segment: Invalid data found when processing input")
+	if teaserSegmentFallbackAllowed(err) {
+		t.Fatal("invalid container should not be retried at every candidate timestamp")
+	}
+	if thumbnailOffsetFallbackAllowed(err) {
+		t.Fatal("invalid container should not be retried at every thumbnail offset")
 	}
 }

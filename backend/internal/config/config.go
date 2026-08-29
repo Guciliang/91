@@ -18,9 +18,12 @@ import (
 const (
 	DefaultAdminUsername      = "admin"
 	DefaultAdminPassword      = "admin123"
+	DefaultNightlyDisabled    = false
 	DefaultNightlyStartTime   = "01:00"
 	DefaultNightlyTimezone    = schedule.DefaultTimezone
 	DefaultBuiltinTagsEnabled = true
+	DefaultPreviewConcurrency = 1
+	MaxPreviewConcurrency     = 5
 )
 
 var ErrInvalidNightlyStartTime = errors.New("nightly start time must use HH:mm")
@@ -256,7 +259,8 @@ func ResolveLoggingPaths(logging Logging, baseDir string) (Logging, error) {
 type Scanner struct {
 	// IntervalSeconds 已废弃。旧版每天 02:00–07:00 窗口内按这个间隔重复扫盘；
 	// 新版统一由 nightly 调度器调度，此字段被忽略，保留仅为兼容旧 yaml。
-	IntervalSeconds int      `yaml:"interval_seconds"`
+	IntervalSeconds int `yaml:"interval_seconds"`
+	// MaxDepth 已废弃。扫描会递归到叶子目录；字段仅用于兼容旧 yaml。
 	MaxDepth        int      `yaml:"max_depth"`
 	VideoExtensions []string `yaml:"video_extensions"`
 }
@@ -268,6 +272,10 @@ type Preview struct {
 	DurationSeconds int    `yaml:"duration_seconds"`
 	Width           int    `yaml:"width"`
 	Segments        int    `yaml:"segments"`
+	// Concurrency is the number of video-level preview tasks admitted by each
+	// attached drive's worker. Segments inside one video task run serially. It is
+	// not a process-wide shared task budget.
+	Concurrency int `yaml:"concurrency"`
 }
 
 type Proxy struct {
@@ -286,6 +294,9 @@ func (p Proxy) AllowsForcedRelay() bool {
 // 一个进程只跑一条 nightly 流水线；该 cron 时间到达且当天还没跑过时触发。
 // 管理后台「扫描所有网盘」与它共享任务协调器，但只运行扫盘和去重阶段。
 type Nightly struct {
+	// Disabled 阻止每日自然调度触发新的流水线。它不影响管理员手动触发的
+	// 扫描任务，也不会取消已经开始执行的流水线。
+	Disabled bool `yaml:"disabled,omitempty"`
 	// StartTime 是每日触发时间，采用严格的 24 小时 HH:mm 格式。该字段可在
 	// 管理后台热更新；配置面板与源码编辑器都直接读写 config.yaml。
 	StartTime string `yaml:"start_time,omitempty"`
@@ -415,6 +426,15 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Preview.Segments == 0 {
 		c.Preview.Segments = 3
+	}
+	if c.Preview.Concurrency == 0 {
+		c.Preview.Concurrency = DefaultPreviewConcurrency
+	}
+	if c.Preview.Concurrency < 1 || c.Preview.Concurrency > MaxPreviewConcurrency {
+		return fmt.Errorf(
+			"preview.concurrency must be between 1 and %d",
+			MaxPreviewConcurrency,
+		)
 	}
 	if c.Nightly.CronHour <= 0 || c.Nightly.CronHour > 23 {
 		c.Nightly.CronHour = 1

@@ -1,4 +1,6 @@
 import {
+  Suspense,
+  lazy,
   useEffect,
   useMemo,
   useRef,
@@ -8,6 +10,7 @@ import {
 import {
   Check,
   Clock3,
+  Film,
   Loader2,
   RefreshCw,
   SlidersHorizontal,
@@ -17,7 +20,6 @@ import {
 import { invalidateTagsCache } from "@/data/videos";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
-import { ConfigDiffModal } from "./settings/ConfigDiffModal";
 import {
   ConfigSourceWorkspace,
   preloadConfigSourceEditor,
@@ -27,6 +29,8 @@ import { useAdminRouteRevalidation } from "./AdminRouteCache";
 import { SettingsRow, SettingsSection } from "./settings/SettingsSection";
 import {
   DEFAULT_DRAFT,
+  MAX_PREVIEW_CONCURRENCY,
+  MIN_PREVIEW_CONCURRENCY,
   applyVisualFields,
   changedVisualFields,
   isValidStartTime,
@@ -35,6 +39,24 @@ import {
   type SettingsDraft,
   type VisualField,
 } from "./settings/configYaml";
+
+type ConfigDiffModalModule = {
+  default: typeof import("./settings/ConfigDiffModal").ConfigDiffModal;
+};
+
+let configDiffModalRequest: Promise<ConfigDiffModalModule> | undefined;
+
+function loadConfigDiffModal(): Promise<ConfigDiffModalModule> {
+  configDiffModalRequest ??= import("./settings/ConfigDiffModal")
+    .then((module) => ({ default: module.ConfigDiffModal }))
+    .catch((error: unknown) => {
+      configDiffModalRequest = undefined;
+      throw error;
+    });
+  return configDiffModalRequest;
+}
+
+const LazyConfigDiffModal = lazy(loadConfigDiffModal);
 
 type LoadedConfig = {
   content: string;
@@ -49,7 +71,7 @@ type PendingSave = {
 };
 
 type EditorTab = "visual" | "source";
-type SectionID = "config-automation" | "config-tags";
+type SectionID = "config-automation" | "config-preview" | "config-tags";
 
 const NIGHTLY_TIMEZONE_OPTIONS = [
   "Asia/Shanghai",
@@ -61,25 +83,50 @@ const NIGHTLY_TIMEZONE_OPTIONS = [
   "America/Los_Angeles",
 ] as const;
 
+const PREVIEW_CONCURRENCY_OPTIONS = Array.from(
+  { length: MAX_PREVIEW_CONCURRENCY - MIN_PREVIEW_CONCURRENCY + 1 },
+  (_, index) => MIN_PREVIEW_CONCURRENCY + index
+);
+const CONFIG_FIELD_COUNT = Object.keys(DEFAULT_DRAFT).length;
+
 const SECTION_META: Array<{
   id: SectionID;
-  index: string;
   title: string;
   icon: LucideIcon;
 }> = [
   {
     id: "config-automation",
-    index: "01",
     title: "定时任务",
     icon: Clock3,
   },
   {
+    id: "config-preview",
+    title: "预览视频",
+    icon: Film,
+  },
+  {
     id: "config-tags",
-    index: "02",
     title: "内置标签",
     icon: Tags,
   },
 ];
+
+type ConfigPageMetaProps = {
+  statusClass: string;
+  statusText: string;
+};
+
+function ConfigPageMeta({ statusClass, statusText }: ConfigPageMetaProps) {
+  return (
+    <p className="admin-config-meta">
+      <span>{CONFIG_FIELD_COUNT} 项常用配置</span>
+      <span className="admin-config-meta__separator" aria-hidden="true">
+        ·
+      </span>
+      <span className={`admin-config-meta__status ${statusClass}`}>{statusText}</span>
+    </p>
+  );
+}
 
 export function SettingsPage() {
   const floatingActionPageRef = useAdminFloatingActionSpace<HTMLFormElement>();
@@ -107,26 +154,33 @@ export function SettingsPage() {
   dirtyRef.current = dirty;
   const timeValid = isValidStartTime(draft.nightlyStartTime);
   const timezoneValid = isValidTimezone(draft.nightlyTimezone);
+  const previewConcurrencyValid =
+    Number.isInteger(draft.previewConcurrency) &&
+    draft.previewConcurrency >= MIN_PREVIEW_CONCURRENCY &&
+    draft.previewConcurrency <= MAX_PREVIEW_CONCURRENCY;
   const timezoneIsBuiltIn = NIGHTLY_TIMEZONE_OPTIONS.some(
     (timezone) => timezone === draft.nightlyTimezone
   );
   const controlsDisabled = loading || saving || loaded === null;
-  const statusClass = loading
-    ? ""
-    : sourceError
+  const scheduleControlsDisabled = controlsDisabled || draft.nightlyDisabled;
+  const hasConfigError =
+    Boolean(sourceError) || !timeValid || !timezoneValid || !previewConcurrencyValid;
+  const statusClass = loading || saving
+    ? "is-busy"
+    : hasConfigError
       ? "is-error"
       : dirty
         ? "is-dirty"
         : "is-saved";
   const statusText = loading
-    ? "加载配置中"
-    : sourceError
+    ? "正在同步"
+    : hasConfigError
       ? "配置有误"
       : saving
-        ? "处理中"
+        ? "正在保存"
         : dirty
           ? "有未保存更改"
-          : "配置已加载";
+          : "已同步";
 
   async function load(silent = false) {
     if (!silent) {
@@ -212,7 +266,16 @@ export function SettingsPage() {
 
   async function prepareSave(event: FormEvent) {
     event.preventDefault();
-    if (!loaded || !dirty || !timeValid || !timezoneValid || sourceError || saving) return;
+    if (
+      !loaded ||
+      !dirty ||
+      !timeValid ||
+      !timezoneValid ||
+      !previewConcurrencyValid ||
+      sourceError ||
+      saving
+    )
+      return;
     try {
       parseConfig(workingYAML);
     } catch (error) {
@@ -224,7 +287,10 @@ export function SettingsPage() {
 
     setSaving(true);
     try {
-      const latest = await api.getConfigYAML();
+      const [latest] = await Promise.all([
+        api.getConfigYAML(),
+        loadConfigDiffModal(),
+      ]);
       const candidate = candidateForLatest(latest);
       parseConfig(candidate);
       if (candidate === latest.content) {
@@ -363,14 +429,19 @@ export function SettingsPage() {
 
   if (!loading && (loadError || !loaded)) {
     return (
-      <div className="admin-page admin-config-page admin-config-page--error">
-        <SlidersHorizontal size={26} aria-hidden="true" />
-        <strong>配置加载失败</strong>
-        <span>{loadError || "暂时无法读取 config.yaml"}</span>
-        <button type="button" className="admin-btn is-primary" onClick={() => void load()}>
-          重新加载
-        </button>
-      </div>
+      <>
+        <header className="admin-config-header admin-config-header--standalone">
+          <ConfigPageMeta statusClass="is-error" statusText="同步失败" />
+        </header>
+        <div className="admin-page admin-config-page admin-config-page--error">
+          <SlidersHorizontal size={26} aria-hidden="true" />
+          <strong>配置加载失败</strong>
+          <span>{loadError || "暂时无法读取 config.yaml"}</span>
+          <button type="button" className="admin-btn is-primary" onClick={() => void load()}>
+            重新加载
+          </button>
+        </div>
+      </>
     );
   }
 
@@ -383,11 +454,15 @@ export function SettingsPage() {
         onSubmit={prepareSave}
       >
         <header className="admin-config-header">
-          <div className="admin-config-tabs" role="tablist" aria-label="配置编辑模式">
+          <ConfigPageMeta statusClass={statusClass} statusText={statusText} />
+          <div
+            className="admin-config-mode-switch"
+            role="group"
+            aria-label="配置编辑模式"
+          >
             <button
               type="button"
-              role="tab"
-              aria-selected={activeTab === "visual"}
+              aria-pressed={activeTab === "visual"}
               className={activeTab === "visual" ? "is-active" : ""}
               disabled={loading || saving}
               onClick={() => handleTabChange("visual")}
@@ -396,8 +471,7 @@ export function SettingsPage() {
             </button>
             <button
               type="button"
-              role="tab"
-              aria-selected={activeTab === "source"}
+              aria-pressed={activeTab === "source"}
               className={activeTab === "source" ? "is-active" : ""}
               disabled={loading || saving}
               onClick={() => handleTabChange("source")}
@@ -408,7 +482,7 @@ export function SettingsPage() {
         </header>
 
         {activeTab === "visual" ? (
-          <div className="admin-config-visual" role="tabpanel">
+          <div className="admin-config-visual">
             <nav
               className="admin-config-section-nav"
               role="tablist"
@@ -427,11 +501,10 @@ export function SettingsPage() {
                     className={activeSection === section.id ? "is-active" : ""}
                     onClick={() => setActiveSection(section.id)}
                   >
-                    <span className="admin-config-section-nav__index">{section.index}</span>
                     <span className="admin-config-section-nav__icon" aria-hidden="true">
-                      <Icon size={16} />
+                      <Icon size={15} />
                     </span>
-                    <span>{section.title}</span>
+                    <span className="admin-config-section-nav__label">{section.title}</span>
                   </button>
                 );
               })}
@@ -444,7 +517,7 @@ export function SettingsPage() {
                   index="01"
                   icon={<Clock3 size={16} />}
                   title="定时任务"
-                  description="按指定时区控制每日扫盘和库内视频维护时间"
+                  description="控制每日扫盘和库内视频维护"
                 >
                   <SettingsRow
                     label="启动时间"
@@ -455,7 +528,7 @@ export function SettingsPage() {
                       <div
                         className={`admin-config-picker-field admin-config-picker-field--time${
                           !timeValid ? " is-invalid" : ""
-                        }${controlsDisabled ? " is-disabled" : ""}`}
+                        }${scheduleControlsDisabled ? " is-disabled" : ""}`}
                       >
                         <span
                           className="admin-config-picker-field__value admin-config-picker-field__value--time"
@@ -468,7 +541,7 @@ export function SettingsPage() {
                           type="time"
                           step={60}
                           value={draft.nightlyStartTime}
-                          disabled={controlsDisabled}
+                          disabled={scheduleControlsDisabled}
                           aria-invalid={!timeValid}
                           aria-describedby={!timeValid ? "nightly-start-time-hint" : undefined}
                           onClick={(event) => {
@@ -491,7 +564,7 @@ export function SettingsPage() {
                     </div>
                   </SettingsRow>
                   <SettingsRow
-                    label="任务时区"
+                    label="时区配置"
                     htmlFor="nightly-timezone"
                     layout="inline"
                   >
@@ -499,7 +572,7 @@ export function SettingsPage() {
                       <div
                         className={`admin-config-picker-field admin-config-picker-field--timezone${
                           !timezoneValid ? " is-invalid" : ""
-                        }${controlsDisabled ? " is-disabled" : ""}`}
+                        }${scheduleControlsDisabled ? " is-disabled" : ""}`}
                       >
                         <span className="admin-config-picker-field__value" aria-hidden="true">
                           {draft.nightlyTimezone || "--"}
@@ -507,7 +580,7 @@ export function SettingsPage() {
                         <select
                           id="nightly-timezone"
                           value={draft.nightlyTimezone}
-                          disabled={controlsDisabled}
+                          disabled={scheduleControlsDisabled}
                           aria-invalid={!timezoneValid}
                           aria-describedby={!timezoneValid ? "nightly-timezone-hint" : undefined}
                           onChange={(event) =>
@@ -533,12 +606,82 @@ export function SettingsPage() {
                       )}
                     </div>
                   </SettingsRow>
+                  <SettingsRow
+                    label="停止定时任务"
+                    labelID="nightly-disabled-label"
+                    layout="inline"
+                  >
+                    <div className="admin-config-control admin-config-control--switch">
+                      <button
+                        id="nightly-disabled-toggle"
+                        type="button"
+                        className={`toggle-switch ${draft.nightlyDisabled ? "is-on" : ""}`}
+                        role="switch"
+                        aria-checked={draft.nightlyDisabled}
+                        aria-labelledby="nightly-disabled-label"
+                        disabled={controlsDisabled}
+                        onClick={() =>
+                          updateVisualField("nightlyDisabled", !draft.nightlyDisabled)
+                        }
+                      >
+                        <span className="toggle-switch__dot" />
+                      </button>
+                    </div>
+                  </SettingsRow>
+                </SettingsSection>
+              )}
+              {activeSection === "config-preview" && (
+                <SettingsSection
+                  id="config-preview"
+                  index="02"
+                  icon={<Film size={16} />}
+                  title="预览视频"
+                  description="控制每个存储生成预览视频的并发数"
+                >
+                  <SettingsRow
+                    label="并发数"
+                    description="请根据服务器性能和网盘API并发风控适当调整，建议最高不超过3"
+                    descriptionID="preview-concurrency-description"
+                    htmlFor="preview-concurrency"
+                    layout="inline"
+                  >
+                    <div className="admin-config-control admin-config-control--picker">
+                      <div
+                        className={`admin-config-picker-field admin-config-picker-field--concurrency${
+                          !previewConcurrencyValid ? " is-invalid" : ""
+                        }${controlsDisabled ? " is-disabled" : ""}`}
+                      >
+                        <span className="admin-config-picker-field__value" aria-hidden="true">
+                          {draft.previewConcurrency}
+                        </span>
+                        <select
+                          id="preview-concurrency"
+                          value={draft.previewConcurrency}
+                          disabled={controlsDisabled}
+                          aria-invalid={!previewConcurrencyValid}
+                          aria-describedby="preview-concurrency-description"
+                          onChange={(event) =>
+                            updateVisualField(
+                              "previewConcurrency",
+                              Number(event.target.value)
+                            )
+                          }
+                        >
+                          {PREVIEW_CONCURRENCY_OPTIONS.map((concurrency) => (
+                            <option key={concurrency} value={concurrency}>
+                              {concurrency}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </SettingsRow>
                 </SettingsSection>
               )}
               {activeSection === "config-tags" && (
                 <SettingsSection
                   id="config-tags"
-                  index="02"
+                  index="03"
                   icon={<Tags size={16} />}
                   title="内置标签"
                   description="管理系统内置标签"
@@ -579,7 +722,7 @@ export function SettingsPage() {
             </div>
           </div>
         ) : (
-          <div role="tabpanel">
+          <div>
             <ConfigSourceWorkspace
               value={workingYAML}
               error={sourceError}
@@ -614,6 +757,7 @@ export function SettingsPage() {
               !dirty ||
               !timeValid ||
               !timezoneValid ||
+              !previewConcurrencyValid ||
               Boolean(sourceError)
             }
             title="预览并保存配置"
@@ -629,14 +773,18 @@ export function SettingsPage() {
         </div>
       </form>
 
-      <ConfigDiffModal
-        open={pendingSave !== null}
-        before={pendingSave?.before ?? ""}
-        after={pendingSave?.after ?? ""}
-        saving={saving}
-        onClose={() => setPendingSave(null)}
-        onConfirm={() => void confirmSave()}
-      />
+      {pendingSave && (
+        <Suspense fallback={null}>
+          <LazyConfigDiffModal
+            open
+            before={pendingSave.before}
+            after={pendingSave.after}
+            saving={saving}
+            onClose={() => setPendingSave(null)}
+            onConfirm={() => void confirmSave()}
+          />
+        </Suspense>
+      )}
     </>
   );
 }

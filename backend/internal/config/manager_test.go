@@ -26,8 +26,6 @@ func TestManagerMigratesLegacyValuesIntoYAMLWithoutDiscardingUnknownNodes(t *tes
 nightly:
   # legacy schedule comment
   cron_hour: 3
-dedupe:
-  duplicate_review_enabled: false
 # obsolete template placeholder
 drives: []
 future_section:
@@ -61,23 +59,20 @@ future_section:
 	if !strings.Contains(text, "timezone: Asia/Shanghai") {
 		t.Fatalf("nightly timezone was not made explicit:\n%s", text)
 	}
-	if strings.Contains(text, "duplicate_review_enabled") || strings.Contains(text, "dedupe:") {
-		t.Fatalf("retired duplicate-review setting remains:\n%s", text)
-	}
 	if strings.Contains(text, "drives:") || strings.Contains(text, "obsolete template placeholder") {
 		t.Fatalf("retired empty drive placeholder remains:\n%s", text)
 	}
 	if !strings.Contains(text, "builtin_pack_enabled: false") {
 		t.Fatalf("built-in tag setting was not migrated:\n%s", text)
 	}
-	want := LiveSettings{NightlyStartTime: "04:25", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: false}
+	want := LiveSettings{NightlyStartTime: "04:25", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: false, PreviewConcurrency: DefaultPreviewConcurrency}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want %#v", got, want)
 	}
 }
 
 func TestManagerYAMLValuesWinOverLegacySQLiteValues(t *testing.T) {
-	manager, path := newManagerForTest(t, "nightly:\n  start_time: \"02:10\"\n  cron_hour: 7\ntags:\n  builtin_pack_enabled: true\ndedupe:\n  duplicate_review_enabled: true\n")
+	manager, path := newManagerForTest(t, "nightly:\n  start_time: \"02:10\"\n  cron_hour: 7\ntags:\n  builtin_pack_enabled: true\n")
 	start := "22:45"
 	builtinTagsEnabled := false
 	_, err := manager.MigrateLegacyRuntimeSettings(LegacyRuntimeSettings{
@@ -87,12 +82,12 @@ func TestManagerYAMLValuesWinOverLegacySQLiteValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := LiveSettings{NightlyStartTime: "02:10", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true}
+	want := LiveSettings{NightlyStartTime: "02:10", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultPreviewConcurrency}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("live settings = %#v, want YAML %#v", got, want)
 	}
 	data, _ := os.ReadFile(path)
-	if strings.Contains(string(data), "cron_hour:") || strings.Contains(string(data), "duplicate_review_enabled") {
+	if strings.Contains(string(data), "cron_hour:") {
 		t.Fatalf("retired fields remain:\n%s", data)
 	}
 }
@@ -151,14 +146,14 @@ func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("nightly:\n  start_time: \"06:30\"\n"), 0o640); err != nil {
+	if err := os.WriteFile(path, []byte("nightly:\n  disabled: true\n  start_time: \"06:30\"\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
 	changed, err := manager.Reload()
 	if err != nil || !changed {
 		t.Fatalf("reload changed=%v err=%v", changed, err)
 	}
-	want := LiveSettings{NightlyStartTime: "06:30", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true}
+	want := LiveSettings{NightlyDisabled: true, NightlyStartTime: "06:30", NightlyTimezone: "Asia/Shanghai", BuiltinTagsEnabled: true, PreviewConcurrency: DefaultPreviewConcurrency}
 	if got := manager.LiveSettings(); got != want {
 		t.Fatalf("settings = %#v, want %#v", got, want)
 	}
@@ -178,7 +173,7 @@ func TestManagerReloadPublishesExternalValidChangeAndKeepsLastGoodOnError(t *tes
 
 func TestRestartRequiredComparisonIgnoresOnlyLivePaths(t *testing.T) {
 	before := []byte("nightly:\n  start_time: \"01:00\"\nfuture:\n  value: one\n")
-	liveOnly := []byte("nightly:\n  start_time: \"03:15\"\n  timezone: Asia/Shanghai\ntags:\n  builtin_pack_enabled: false\nfuture:\n  value: one\n")
+	liveOnly := []byte("nightly:\n  disabled: true\n  start_time: \"03:15\"\n  timezone: Asia/Shanghai\ntags:\n  builtin_pack_enabled: false\npreview:\n  concurrency: 4\nfuture:\n  value: one\n")
 	if hasRestartRequiredChange(before, liveOnly) {
 		t.Fatal("live-only values were reported as restart-required")
 	}

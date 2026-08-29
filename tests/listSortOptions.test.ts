@@ -18,8 +18,8 @@ const searchPanelSource = readFileSync(
   new URL("../src/components/SearchPanel.tsx", import.meta.url),
   "utf8"
 );
-const listingQuerySource = readFileSync(
-  new URL("../src/lib/useListingQuery.ts", import.meta.url),
+const homePageSource = readFileSync(
+  new URL("../src/pages/HomePage.tsx", import.meta.url),
   "utf8"
 );
 const responsiveSource = readFileSync(
@@ -69,11 +69,16 @@ test("listing page keeps the public discovery layout and empty semantics", () =>
 
 test("public listing query control state is restored from the URL", () => {
   assert.match(listingPageSource, /const sort = readListingSort\(params\)/);
-  assert.match(listingPageSource, /const page = readListingPage\(params\)/);
   assert.match(listingPageSource, /const view = readListingView\(params\)/);
-  assert.match(listingPageSource, /withListingNavigation\(params, \{ sort: nextSort, page: 1 \}\)/);
-  assert.match(listingPageSource, /withListingPage\(params, nextPage\)/);
-  assert.match(listingPageSource, /withListingView\(params, nextView\)/);
+  assert.match(listingPageSource, /withListingNavigation\(current, \{ sort: nextSort, page: 1 \}\)/);
+  assert.match(listingPageSource, /withListingView\(current, nextView\)/);
+  // 列表页改为无限滚动后没有页码，旧链接里的 page 参数会被清掉。
+  assert.match(listingPageSource, /if \(!params\.has\("page"\)\) return;/);
+  assert.match(
+    listingPageSource,
+    /withListingPage\(current, 1\), \{ replace: true \}/
+  );
+  assert.doesNotMatch(listingPageSource, /<Pagination/);
   assert.doesNotMatch(listingPageSource, /sessionStorage|localStorage/);
 });
 
@@ -106,26 +111,24 @@ test("list search updates the shared listing query instead of rebuilding it", ()
   assert.doesNotMatch(searchPanelSource, /const sp = new URLSearchParams\(\)/);
 });
 
-test("public video lists use fourteen mobile and twenty desktop items per page", () => {
+test("public video lists use fourteen mobile and twenty desktop items per batch", () => {
   assert.match(responsiveSource, /export const MOBILE_VIDEO_PAGE_SIZE = 14;/);
   assert.match(listingPageSource, /const DESKTOP_PAGE_SIZE = 20;/);
   assert.match(listingPageSource, /const pageSize = isMobile \? MOBILE_VIDEO_PAGE_SIZE : DESKTOP_PAGE_SIZE;/);
-  assert.match(listingPageSource, /useListingQuery\(\{[\s\S]*?page,[\s\S]*?pageSize/);
+  assert.match(
+    listingPageSource,
+    /listingFeedSource\(\{ q: keyword, tag, sort, pageSize \}\)/
+  );
   assert.match(listingPageSource, /skeletonCount=\{pageSize\}/);
 });
 
-test("listing page uses one shared stale-while-revalidate query contract", () => {
-  assert.match(listingPageSource, /import \{ useListingQuery \} from "@\/lib\/useListingQuery"/);
-  assert.match(listingPageSource, /refreshMode=\{[\s\S]*?result\.transitioning[\s\S]*?"blocking"[\s\S]*?result\.revalidating[\s\S]*?"background"/);
-  assert.match(listingPageSource, /disabled=\{result\.transitioning\}/);
-  assert.match(listingPageSource, /<ListingLoadError[\s\S]*?displayedPage=\{displayedPage\}/);
-  assert.match(listingPageSource, /snapshot\?\.query\.page \?\? page/);
-  assert.match(listingQuerySource, /const LISTING_CACHE_TTL_MS = 60_000/);
-  assert.match(listingQuerySource, /const LISTING_CACHE_MAX_ENTRIES = 20/);
-  assert.match(listingQuerySource, /function peekListingCache/);
-  assert.match(listingQuerySource, /transitioning: refreshing && !snapshotMatchesRequest/);
-  assert.match(listingQuerySource, /revalidating: refreshing && snapshotMatchesRequest/);
-  assert.match(listingQuerySource, /return \(\) => controller\.abort\(\)/);
+test("home filters use the shared snapshot-based infinite listing contract", () => {
+  assert.match(homePageSource, /listingFeedSource\(\{[\s\S]*?q: activeSearchQuery,[\s\S]*?tag: activeTag,[\s\S]*?sort: searchSort/);
+  assert.match(homePageSource, /useInfiniteListing\(activeFeedSource, \{/);
+  assert.match(homePageSource, /useListingScrollRestore\(\{[\s\S]*?queryKey: activeFeedSource\.key/);
+  assert.match(homePageSource, /<VirtualVideoGrid[\s\S]*?hasMore=\{homeFeed\.hasMore\}[\s\S]*?onLoadMore=\{homeFeed\.loadMore\}/);
+  assert.match(homePageSource, /sortDisabled=\{homeFeed\.initialLoading\}/);
+  assert.doesNotMatch(homePageSource, /useListingQuery|<Pagination|displayedSearchPage/);
 });
 
 test("sort toolbar has no outer frame around its controls", () => {

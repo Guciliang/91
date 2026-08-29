@@ -491,7 +491,7 @@ export type AdminDrive = {
   status: string;
   lastError?: string;
   hasCredential: boolean;
-  /** 后端能力表声明该挂载可写入文件；爬虫目标与转码入口据此展示。 */
+  /** 后端能力表声明该挂载可写入文件；爬虫上传目标据此展示。 */
   canUpload: boolean;
   /** 当前是否给该盘生成预览视频（per-drive 开关，替代旧的全局 preview.enabled；封面不受影响）。 */
   teaserEnabled: boolean;
@@ -517,12 +517,6 @@ export type AdminDrive = {
   fingerprintReadyCount: number;
   fingerprintPendingCount: number;
   fingerprintFailedCount: number;
-  // 浏览器兼容性转码：候选(待处理)/已转码/失败/检测后无需转码 计数与任务状态。
-  transcodeGenerationStatus?: DriveGenerationStatus;
-  transcodePendingCount: number;
-  transcodeReadyCount: number;
-  transcodeFailedCount: number;
-  transcodeSkippedCount: number;
 };
 
 export type DriveGenerationStatus = {
@@ -576,8 +570,15 @@ export type UpsertDriveInput = {
   skipDirIds?: string[];
 };
 
+export type DriveConfigSaveResult = {
+  ok: boolean;
+  deferred?: boolean;
+  message?: string;
+  warning?: string;
+};
+
 export function upsertDrive(body: UpsertDriveInput) {
-  return request<{ ok: boolean; warning?: string }>("/drives", {
+  return request<DriveConfigSaveResult>("/drives", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -691,7 +692,7 @@ export function listCrawlers() {
 }
 
 export function upsertCrawler(body: UpsertCrawlerInput) {
-  return request<{ ok: boolean; id: string; warning?: string }>("/crawlers", {
+  return request<DriveConfigSaveResult & { id: string }>("/crawlers", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -891,11 +892,11 @@ export function getGuangYaPanQRStatus(deviceCode: string) {
 /**
  * 切换某个云盘的预览视频生成开关。点击网盘列表里行内的 toggle 按钮时调用。
  *
- * 后端会写 catalog.drives.teaser_enabled，并在从关到开时立刻补扫该盘 pending 预览视频；
- * 关闭分支不补做任何事，新的入队判断会自动停。
+ * 后端会写 catalog.drives.teaser_enabled；空闲时立即生效，有任务时返回
+ * deferred=true 并在当前任务结束后切换。
  */
 export function setDriveTeaserEnabled(id: string, enabled: boolean) {
-  return request<{ ok: boolean; teaserEnabled: boolean }>(
+  return request<DriveConfigSaveResult & { teaserEnabled: boolean }>(
     `/drives/${encodeURIComponent(id)}/teaser-enabled`,
     {
       method: "POST",
@@ -932,7 +933,7 @@ export function listDriveDirChildren(id: string, parentId?: string) {
  * 传空数组 = 清空跳过列表。下次扫描时生效，不会立刻重扫。
  */
 export function setDriveSkipDirIds(id: string, dirIds: string[]) {
-  return request<{ ok: boolean; skipDirIds: string[] }>(
+  return request<DriveConfigSaveResult & { skipDirIds: string[] }>(
     `/drives/${encodeURIComponent(id)}/skip-dirs`,
     {
       method: "POST",
@@ -969,26 +970,6 @@ export function regenFailedFingerprints(id: string) {
   );
 }
 
-/**
- * 手动开启某存储的浏览器兼容性转码（AVI/WMV 等浏览器播不动的视频转 H.264 MP4，
- * 产物上传回同一存储）。转码默认关闭、从不自动运行，这是唯一入口；
- * 任务处理完候选列表后自然结束。
- */
-export function startDriveTranscode(id: string) {
-  return request<{ ok: boolean; accepted: boolean; message?: string }>(
-    `/drives/${encodeURIComponent(id)}/transcode/start`,
-    { method: "POST" }
-  );
-}
-
-/** 手动停止某存储正在进行的转码任务。 */
-export function stopDriveTranscode(id: string) {
-  return request<{ ok: boolean; stopped: boolean }>(
-    `/drives/${encodeURIComponent(id)}/transcode/stop`,
-    { method: "POST" }
-  );
-}
-
 // ---------- Videos ----------
 
 export type AdminVideo = {
@@ -1003,7 +984,6 @@ export type AdminVideo = {
   durationSeconds: number;
   size: number;
   ext: string;
-  quality: string;
   thumbnailUrl: string;
   previewStatus: string;
   views: number;
@@ -1145,7 +1125,6 @@ export type UpdateVideoInput = Partial<{
   badges: string[];
   description: string;
   thumbnail: string;
-  quality: string;
   durationSeconds: number;
 }>;
 
@@ -1257,9 +1236,11 @@ export type ConfigSaveResult = {
   version: string;
   restartRequired: boolean;
   settings: {
+    nightlyDisabled: boolean;
     nightlyStartTime: string;
     nightlyTimezone: string;
     builtinTagsEnabled: boolean;
+    previewConcurrency: number;
   };
 };
 

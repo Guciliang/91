@@ -13,6 +13,7 @@ import (
 
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
+	"github.com/video-site/backend/internal/dedupe"
 	"github.com/video-site/backend/internal/mediasim"
 )
 
@@ -27,6 +28,25 @@ func syntheticFrames(seed int64) [][]byte {
 		frames[i] = frame
 	}
 	return frames
+}
+
+func applyContentMaintenanceForTest(ctx context.Context, app *App, localDir string, videos []*catalog.Video) (dedupe.Plan, error) {
+	current := make([]*catalog.Video, 0, len(videos))
+	for _, video := range videos {
+		stored, err := app.cat.GetVideo(ctx, video.ID)
+		if err != nil {
+			return dedupe.Plan{}, err
+		}
+		current = append(current, stored)
+	}
+	plan, err := app.buildDuplicateMaintenancePlan(ctx, localDir, current, dedupe.ChannelContent)
+	if err != nil {
+		return dedupe.Plan{}, err
+	}
+	if err := app.applyDuplicateMaintenancePlan(ctx, localDir, plan); err != nil {
+		return dedupe.Plan{}, err
+	}
+	return plan, nil
 }
 
 func TestCleanupContentDuplicateVideos(t *testing.T) {
@@ -118,19 +138,19 @@ func TestCleanupContentDuplicateVideos(t *testing.T) {
 		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
 		cat: cat,
 	}
-	deleted := map[string]struct{}{}
-	stats, err := app.cleanupContentDuplicateVideos(ctx, localDir, videos, deleted)
+	plan, err := applyContentMaintenanceForTest(ctx, app, localDir, videos)
 	if err != nil {
 		t.Fatalf("cleanup content duplicates: %v", err)
 	}
+	stats := plan.Stats.Content
 	if stats.Candidates != 3 {
 		t.Fatalf("candidates = %d, want 3 (short video must be excluded)", stats.Candidates)
 	}
 	if stats.Groups != 1 || stats.Deleted != 1 {
 		t.Fatalf("stats = %+v, want 1 group / 1 deleted", stats)
 	}
-	if _, ok := deleted["video-compressed"]; !ok {
-		t.Fatalf("compressed duplicate not deleted, deleted=%v", deleted)
+	if canonicalID := plan.Redirects["video-compressed"]; canonicalID != "video-original" {
+		t.Fatalf("compressed duplicate canonical = %q, want video-original", canonicalID)
 	}
 
 	if _, err := cat.GetVideo(ctx, "video-compressed"); err != sql.ErrNoRows {
@@ -225,11 +245,11 @@ func TestCleanupContentDuplicateVideosFormerReviewBandDeletes(t *testing.T) {
 		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
 		cat: cat,
 	}
-	deleted := map[string]struct{}{}
-	stats, err := app.cleanupContentDuplicateVideos(ctx, localDir, videos, deleted)
+	plan, err := applyContentMaintenanceForTest(ctx, app, localDir, videos)
 	if err != nil {
 		t.Fatalf("cleanup: %v", err)
 	}
+	stats := plan.Stats.Content
 	if stats.Deleted != 1 || stats.Groups != 1 {
 		t.Fatalf("stats = %+v, want former review-band pair auto-deduplicated", stats)
 	}
@@ -298,11 +318,11 @@ func TestCleanupContentDuplicateVideosNearMissDoesNotDelete(t *testing.T) {
 		cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}},
 		cat: cat,
 	}
-	deleted := map[string]struct{}{}
-	stats, err := app.cleanupContentDuplicateVideos(ctx, localDir, videos, deleted)
+	plan, err := applyContentMaintenanceForTest(ctx, app, localDir, videos)
 	if err != nil {
 		t.Fatalf("cleanup content duplicates: %v", err)
 	}
+	stats := plan.Stats.Content
 	if stats.Deleted != 0 || stats.Groups != 0 {
 		t.Fatalf("stats = %+v, want no deletions", stats)
 	}
@@ -310,5 +330,79 @@ func TestCleanupContentDuplicateVideosNearMissDoesNotDelete(t *testing.T) {
 		if _, err := cat.GetVideo(ctx, id); err != nil {
 			t.Fatalf("%s should survive: %v", id, err)
 		}
+	}
+}
+
+func TestCleanupDuplicateVideoAssetsResolvesCanonicalAcrossChannels(t *testing.T) {
+	ctx := context.Background()
+	localDir := t.TempDir()
+	cat, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	signatures := make(map[string]*mediasim.FrameSignature)
+	videos := []*catalog.Video{
+		{ID: "exact-loser", DriveID: "drive-a", FileID: "a", Title: "A", Size: 100, DurationSeconds: 300, PublishedAt: now, CreatedAt: now},
+		{ID: "exact-winner", DriveID: "drive-b", FileID: "b", Title: "B", Size: 100, DurationSeconds: 300, PublishedAt: now, CreatedAt: now.Add(time.Second)},
+		{ID: "final-content-winner", DriveID: "drive-c", FileID: "c", Title: "C", Size: 300, DurationSeconds: 300, PublishedAt: now, CreatedAt: now.Add(2 * time.Second)},
+	}
+	for i, video := range videos {
+		video.PreviewLocal = filepath.Join(localDir, video.ID+".mp4")
+		video.PreviewStatus = "ready"
+		if err := os.WriteFile(video.PreviewLocal, []byte("teaser"), 0o644); err != nil {
+			t.Fatalf("write teaser: %v", err)
+		}
+		signatures[video.PreviewLocal] = &mediasim.FrameSignature{Frames: syntheticFrames(91)}
+		if err := cat.UpsertVideo(ctx, video); err != nil {
+			t.Fatalf("seed %s: %v", video.ID, err)
+		}
+		fingerprint := "different"
+		if i < 2 {
+			fingerprint = "same-exact-fingerprint"
+		}
+		if err := cat.UpdateVideoFingerprint(ctx, video.ID, fingerprint, "ready", ""); err != nil {
+			t.Fatalf("fingerprint %s: %v", video.ID, err)
+		}
+	}
+
+	restore := contentSignatureExtractor
+	contentSignatureExtractor = func(_ context.Context, _, teaserPath string) (*mediasim.FrameSignature, error) {
+		return signatures[teaserPath], nil
+	}
+	t.Cleanup(func() { contentSignatureExtractor = restore })
+
+	app := &App{cfg: &config.Config{Storage: config.Storage{LocalPreviewDir: localDir}}, cat: cat}
+	if err := app.cleanupDuplicateVideoAssets(ctx); err != nil {
+		t.Fatalf("cleanup duplicate assets: %v", err)
+	}
+	if _, err := cat.GetVideo(ctx, "final-content-winner"); err != nil {
+		t.Fatalf("final canonical missing: %v", err)
+	}
+	for _, id := range []string{"exact-loser", "exact-winner"} {
+		if _, err := cat.GetVideo(ctx, id); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("deleted video %s lookup = %v", id, err)
+		}
+		if _, err := os.Stat(filepath.Join(localDir, id+".mp4")); !os.IsNotExist(err) {
+			t.Fatalf("deleted video %s teaser remains: %v", id, err)
+		}
+	}
+	deletedItems, _, err := cat.ListDeletedVideos(ctx, catalog.ListParams{Page: 1, PageSize: 10})
+	if err != nil {
+		t.Fatalf("list deleted videos: %v", err)
+	}
+	if len(deletedItems) != 2 {
+		t.Fatalf("deleted items = %#v", deletedItems)
+	}
+	for _, item := range deletedItems {
+		if item.CanonicalVideoID != "final-content-winner" {
+			t.Fatalf("tombstone %s canonical = %q", item.ID, item.CanonicalVideoID)
+		}
+	}
+	jobs, err := cat.ListDuplicateAssetCleanupJobs(ctx, 10)
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("asset cleanup jobs = %#v, err=%v", jobs, err)
 	}
 }
