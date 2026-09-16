@@ -3,9 +3,6 @@ package catalog
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"strings"
-	"time"
 )
 
 type User struct {
@@ -18,21 +15,16 @@ type User struct {
 }
 
 func (c *Catalog) CreateUser(ctx context.Context, username, hashedPassword, role string) (int64, error) {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return 0, fmt.Errorf("username is required")
-	}
-	if role == "" {
-		role = "user"
-	}
-	now := time.Now().UnixMilli()
-	res, err := c.db.ExecContext(ctx,
-		`INSERT INTO users (username, password, role, banned, created_at) VALUES (?, ?, ?, 0, ?)`,
-		username, hashedPassword, role, now)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	defer tx.Rollback()
+	id, err := createUser(ctx, tx, username, hashedPassword, role)
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
 }
 
 func (c *Catalog) GetUserByUsername(ctx context.Context, username string) (*User, error) {
@@ -151,15 +143,39 @@ func (c *Catalog) DeleteUser(ctx context.Context, id int64) error {
 }
 
 func (c *Catalog) UpdateUserPassword(ctx context.Context, id int64, hashedPassword string) error {
-	res, err := c.db.ExecContext(ctx,
+	return c.UpdateUserPasswordWithCheck(ctx, id, hashedPassword, nil)
+}
+
+// UpdateUserPasswordWithCheck changes the password and revokes sessions in one
+// transaction. Maintenance callers can check filesystem state while the SQLite
+// writer reservation prevents a restore from capturing an older password.
+func (c *Catalog) UpdateUserPasswordWithCheck(ctx context.Context, id int64, hashedPassword string, check func() error) error {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	res, err := tx.ExecContext(ctx,
 		`UPDATE users SET password = ? WHERE id = ?`, hashedPassword, id)
 	if err != nil {
 		return err
 	}
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
 		return sql.ErrNoRows
 	}
-	return err
+	if _, err := tx.ExecContext(ctx, `DELETE FROM admin_sessions WHERE user_id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 type BannedIP struct {
@@ -187,12 +203,20 @@ func (c *Catalog) ListBannedLoginIPs(ctx context.Context) ([]BannedIP, error) {
 }
 
 func (c *Catalog) UnbanLoginIP(ctx context.Context, ip string) error {
-	res, err := c.db.ExecContext(ctx, `DELETE FROM banned_login_ips WHERE ip = ?`, ip)
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `DELETE FROM banned_login_ips WHERE ip = ?`, ip)
 	if err != nil {
 		return err
 	}
 	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	if _, err := tx.ExecContext(ctx, `DELETE FROM login_failures WHERE ip = ?`, ip); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

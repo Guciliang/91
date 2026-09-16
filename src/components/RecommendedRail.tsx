@@ -24,9 +24,13 @@ import {
   TOUCH_PREVIEW_DELAY_MS,
 } from "@/lib/previewIntent";
 import { useInViewport } from "@/lib/useInViewport";
-import { useIsActivePreview } from "@/lib/useIsActivePreview";
+import { useIsActivePreview, usePreviewEnabled } from "@/lib/useIsActivePreview";
 import { useLazyVideoCollection } from "@/lib/useLazyVideoCollection";
 import { resolveVideoReturnPath, routeToPath } from "@/lib/videoReturnPath";
+import {
+  continueVideoDetailNavigationState,
+  type VideoDetailNavigationState,
+} from "@/lib/videoListingBackground";
 import { PreviewVideo } from "./PreviewVideo";
 import { VideoRailMobileHeading } from "./VideoRailMobileHeading";
 import { VideoRailRowsSkeleton } from "./VideoRailSkeleton";
@@ -142,6 +146,10 @@ export function RecommendedRail({
     typeof locationState?.from === "string"
       ? resolveVideoReturnPath(locationState.from)
       : resolveVideoReturnPath(routeToPath(location));
+  const detailNavigationState = useMemo(
+    () => continueVideoDetailNavigationState(returnPath, location.state),
+    [location.state, returnPath]
+  );
   const recommendedTabId = `${tabGroupId}-recommended-tab`;
   const collectionTabId = `${tabGroupId}-collection-tab`;
   const recommendedPanelId = `${tabGroupId}-recommended-panel`;
@@ -240,10 +248,10 @@ export function RecommendedRail({
         <RecommendedItem
           key={video.id}
           video={video}
-          returnPath={returnPath}
+          navigationState={detailNavigationState}
         />
       )),
-    [returnPath, videos]
+    [detailNavigationState, videos]
   );
   const collectionItems = useMemo(
     () =>
@@ -255,12 +263,12 @@ export function RecommendedRail({
             ref={current ? currentCollectionItemRef : undefined}
             video={video}
             current={current}
-            returnPath={returnPath}
+            navigationState={detailNavigationState}
             variant="collection"
           />
         );
       }),
-    [data, returnPath, videoId]
+    [data, detailNavigationState, videoId]
   );
 
   if (!recommendationPanelAvailable && !hasCollection) return null;
@@ -372,7 +380,7 @@ export function RecommendedRail({
 
 type RailItemProps = {
   video: VideoItem | VideoCollectionItem;
-  returnPath: string;
+  navigationState: VideoDetailNavigationState;
   current?: boolean;
   variant?: "recommended" | "collection";
 };
@@ -385,7 +393,7 @@ RecommendedItem.displayName = "RecommendedItem";
 function RecommendedItemContent(
   {
     video,
-    returnPath,
+    navigationState,
     current = false,
     variant = "recommended",
   }: RailItemProps,
@@ -405,6 +413,11 @@ function RecommendedItemContent(
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   const previewIsActive = useIsActivePreview(video.id);
+  const previewEnabled = usePreviewEnabled();
+
+  useEffect(() => {
+    if (!previewEnabled) cleanup();
+  }, [previewEnabled, video.id]);
   const inView = useInViewport(rootRef);
   const setRootRef = useCallback(
     (node: HTMLLIElement | null) => {
@@ -476,7 +489,8 @@ function RecommendedItemContent(
   }
 
   function startPreviewIntent() {
-    if (!video.previewSrc || !inView) return;
+    if (!previewController.isEnabled() || !video.previewSrc) return;
+    if (!inView) return;
     if (previewIntentTimerRef.current) return;
     setPreviewState("intent");
     previewIntentTimerRef.current = window.setTimeout(() => {
@@ -486,7 +500,7 @@ function RecommendedItemContent(
   }
 
   function startTouchPreviewIntent() {
-    if (!video.previewSrc) return;
+    if (!previewController.isEnabled() || !video.previewSrc) return;
     clearPreviewIntentTimer();
     touchPreviewArmedRef.current = true;
     previewController.setActiveId(video.id);
@@ -494,6 +508,7 @@ function RecommendedItemContent(
     previewIntentTimerRef.current = window.setTimeout(() => {
       previewIntentTimerRef.current = null;
       if (
+        !previewController.isEnabled() ||
         !touchPreviewArmedRef.current ||
         previewController.getActiveId() !== video.id
       ) {
@@ -510,7 +525,7 @@ function RecommendedItemContent(
   }
 
   function startPreviewNow(options: { requireInView: boolean }) {
-    if (!video.previewSrc) return;
+    if (!previewController.isEnabled() || !video.previewSrc) return;
     if (options.requireInView && !inView) return;
     clearPreviewIntentTimer();
     previewController.setActiveId(video.id);
@@ -543,6 +558,7 @@ function RecommendedItemContent(
       (touchPreviewArmedRef.current || shouldRenderPreview);
     if (
       !shouldInterceptPreviewTap({
+        previewEnabled: previewController.isEnabled() && Boolean(video.previewSrc),
         pointerType: lastPointerTypeRef.current,
         canHover: window.matchMedia(HOVER_POINTER_QUERY).matches,
         previewActive,
@@ -561,6 +577,7 @@ function RecommendedItemContent(
   return (
     <li
       ref={setRootRef}
+      data-preview-enabled={previewEnabled}
       className={`vd-rail__item${
         variant === "collection" ? " vd-rail__collection-item" : ""
       }`}
@@ -572,7 +589,7 @@ function RecommendedItemContent(
     >
       <Link
         to={video.href}
-        state={{ from: returnPath }}
+        state={navigationState}
         className="vd-rail__link"
         aria-current={current ? "page" : undefined}
         onClickCapture={handleClickCapture}
@@ -583,7 +600,7 @@ function RecommendedItemContent(
             src={video.thumbnail}
             enabled={thumbnailActivated}
           />
-          {shouldRenderPreview && video.previewSrc && (
+          {previewEnabled && shouldRenderPreview && video.previewSrc && (
             <PreviewVideo
               ref={videoRef}
               src={video.previewSrc}
@@ -593,13 +610,13 @@ function RecommendedItemContent(
               onTimeUpdate={(p) => setProgress(p)}
             />
           )}
-          {previewState === "loading" && (
+          {previewEnabled && previewState === "loading" && (
             <span className="preview-loader" />
           )}
-          {previewState === "error" && (
+          {previewEnabled && previewState === "error" && (
             <span className="preview-error">预览加载失败</span>
           )}
-          {previewState === "playing" && (
+          {previewEnabled && previewState === "playing" && (
             <div className="preview-progress" aria-hidden="true">
               <div
                 className="preview-progress__bar"
@@ -607,10 +624,10 @@ function RecommendedItemContent(
               />
             </div>
           )}
-          {video.duration && previewState !== "playing" && (
+          {video.duration && (!previewEnabled || previewState !== "playing") && (
             <span className="vd-rail__duration">{video.duration}</span>
           )}
-          {current && previewState !== "playing" && (
+          {current && (!previewEnabled || previewState !== "playing") && (
             <span className="vd-rail__current">当前视频</span>
           )}
         </div>

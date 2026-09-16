@@ -85,6 +85,44 @@ func TestServeStreamTripleScreenRelayBypassesRedirectMode(t *testing.T) {
 	}
 }
 
+func TestServeStreamForcedRelayFollowsDriveClientRedirects(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			http.Redirect(w, r, "/video.mp4", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("video-bytes"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	noRedirect := &http.Client{
+		Transport: http.DefaultTransport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	reg := NewRegistry()
+	reg.Set("webdav", &proxyFakeSimpleDrive{
+		kind: "webdav", url: upstream.URL + "/redirect", passThroughRedirects: true, httpClient: noRedirect,
+	})
+	p := New(reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/webdav/file-1?tripleScreenRelay=1", nil)
+	rr := httptest.NewRecorder()
+	p.ServeStream(rr, req, "webdav", "file-1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if got := rr.Header().Get("Location"); got != "" {
+		t.Fatalf("Location = %q, want no redirect", got)
+	}
+	if got := rr.Body.String(); got != "video-bytes" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
 func TestServeStreamCanDisableClientRequestedRelay(t *testing.T) {
 	reg := NewRegistry()
 	reg.Set("115", &proxyFakeSimpleDrive{kind: "p115", url: "https://cdn.example/video.mp4"})
@@ -1112,6 +1150,7 @@ type proxyFakeSimpleDrive struct {
 	url                  string
 	headers              http.Header
 	passThroughRedirects bool
+	httpClient           *http.Client
 	calls                int
 }
 
@@ -1134,6 +1173,7 @@ func (d *proxyFakeSimpleDrive) StreamURL(context.Context, string) (*drives.Strea
 		Expires:              time.Now().Add(10 * time.Minute),
 		PassThroughRedirects: d.passThroughRedirects,
 		ClientRedirectSafe:   redirectKindForTest(d.kind),
+		HTTPClient:           d.httpClient,
 	}, nil
 }
 

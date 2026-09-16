@@ -2,8 +2,7 @@
 server:
   # 本地开发默认配合 vite.config.ts 的代理端口。
   listen: "127.0.0.1:9192"
-  # 管理后台用户。保留默认值时，首次访问登录页会要求设置新用户名和密码，
-  # 并写回 backend/config.yaml。
+  # 管理员账号在首次访问时创建，仅存储在数据库中，不在此文件配置。
   # CORS 白名单：允许跨源访问的前端 Origin 列表。默认空 = 不允许任何跨源请求。
   # 同源部署（前后端在同一域名 + 端口下，由 nginx 反代）不需要配此项。
   # 仅在前后端分别部署在不同域名/端口、且需要前端 fetch 后端时填写。
@@ -26,9 +25,9 @@ logging:
   # 放在 data 下可随 Docker 数据卷持久化，但不会进入业务备份包。
   directory: "./data/logs"
   # 单个日志文件达到此大小后轮转。
-  max_file_size_mb: 10
+  max_file_size_mb: 5
   # 超过总量后从最旧的轮转文件开始清理。
-  max_total_size_mb: 50
+  max_total_size_mb: 30
 
 scanner:
   # 已废弃：旧版的"每天 02:00-07:00 按 IntervalSeconds 间隔重复扫盘"已被移除。
@@ -54,20 +53,27 @@ tags:
   # 是否启用系统内置标签包；后台保存后会热更新。
   builtin_pack_enabled: true
 
+# 全局媒体生成额度，所有网盘（含本地上传与爬虫）共享，范围 1-5，支持热更新。
+# 默认最多同时生成 1 个封面、1 个预览、1 个指纹，三类任务独立；扫盘仍按网盘并行。
+generation:
+  thumbnail_concurrency: 1
+  preview_concurrency: 1
+  fingerprint_concurrency: 1
+
 preview:
-  # 是否启用 ffmpeg 抽帧生成预览视频
+  # 全局预览视频开关，控制生成与卡片预览，默认开启，可热更新；封面不受影响
   enabled: true
   # ffmpeg / ffprobe 可执行文件名或绝对路径
   ffmpeg_path: "ffmpeg"
   ffprobe_path: "ffprobe"
+  # 每个封面/预览 ffmpeg 的解码、编码和滤镜线程数，范围 1-16，修改后重启生效。
+  ffmpeg_threads: 1
   # 预览视频每段时长（秒），实际生成时每段最多 3 秒
   duration_seconds: 3
   # 兼容旧配置；当前 30 秒以下最多 3 段，30 秒及以上固定 4 段
   segments: 3
   # 预览视频宽度
   width: 480
-  # 每个存储同时处理的预览视频任务数，范围 1-5；单条视频内的片段串行生成。
-  concurrency: 1
 
 proxy:
   # 是否允许播放器为“三屏画面”请求服务端全量中转视频流。

@@ -2,11 +2,13 @@ package nightly
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/video-site/backend/internal/scanjob"
 	"github.com/video-site/backend/internal/schedule"
 )
 
@@ -94,9 +96,9 @@ func TestNaturalRunMatchesHourAndMinute(t *testing.T) {
 		StartTime: "00:15",
 		Timezone:  "Etc/UTC",
 		Now:       func() time.Time { return now },
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			runs.Add(1)
-			return nil
+			return nil, nil
 		},
 	})
 
@@ -120,9 +122,9 @@ func TestUpdateStartTimeChangesNaturalSchedule(t *testing.T) {
 		StartTime: "01:00",
 		Timezone:  "Etc/UTC",
 		Now:       func() time.Time { return now },
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			runs.Add(1)
-			return nil
+			return nil, nil
 		},
 	})
 
@@ -154,9 +156,9 @@ func TestNaturalRunUsesConfiguredTimezoneAndPersistsItsCalendarDate(t *testing.T
 		StartTime: "02:15",
 		Timezone:  "Asia/Shanghai",
 		Now:       func() time.Time { return now },
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			runs.Add(1)
-			return nil
+			return nil, nil
 		},
 	})
 
@@ -206,9 +208,9 @@ func TestDisabledScheduleSkipsNaturalRunAndResumesAfterUpdate(t *testing.T) {
 		StartTime: "02:30",
 		Timezone:  "Etc/UTC",
 		Now:       func() time.Time { return now },
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			runs.Add(1)
-			return nil
+			return nil, nil
 		},
 	})
 
@@ -234,9 +236,9 @@ func TestDisabledScheduleStillAcceptsManualScanAll(t *testing.T) {
 	r := New(Config{
 		Settings: newStubSettings(),
 		Disabled: true,
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			scans.Add(1)
-			return nil
+			return nil, nil
 		},
 	})
 
@@ -276,12 +278,14 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 
 	r := New(Config{
 		Settings: settings,
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			rec.push("list-scan")
-			return []string{"drive-a", "drive-b"}
+			return []string{"drive-a", "drive-b"}, nil
 		},
-		RunScan: func(_ context.Context, id string) {
+		RunScan: func(_ context.Context, id string) scanjob.Result {
 			rec.push("scan:" + id)
+
+			return scanjob.Result{State: scanjob.Succeeded}
 		},
 		ListCrawlerDrives: func(context.Context) []string {
 			rec.push("list-crawler")
@@ -337,6 +341,8 @@ func TestRunPipelineHonoursPhaseOrder(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("call sequence len = %d, want %d; got=%v", len(got), len(want), got)
 	}
+	// Drive scans may finish in either order, but both must precede queue waits.
+	slices.Sort(got[1:3])
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("call[%d] = %q, want %q (full=%v)", i, got[i], want[i], got)
@@ -348,7 +354,7 @@ func TestRunPipelineReconcilesLocalAssetsWithoutScanTargets(t *testing.T) {
 	rec := &recorder{}
 	r := New(Config{
 		Settings:        newStubSettings(),
-		ListScanTargets: func(context.Context) []string { return nil },
+		ListScanTargets: func(context.Context) ([]string, error) { return nil, nil },
 		WaitPreviewQueuesIdle: func(context.Context) error {
 			rec.push("wait-idle")
 			return nil
@@ -386,12 +392,14 @@ func TestRunScanAllOnlyScansConfiguredDrivesAndDedupes(t *testing.T) {
 	r := New(Config{
 		Settings: settings,
 		Now:      func() time.Time { return now },
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			rec.push("list-scan")
-			return []string{"drive-a", "drive-b"}
+			return []string{"drive-a", "drive-b"}, nil
 		},
-		RunScan: func(_ context.Context, id string) {
+		RunScan: func(_ context.Context, id string) scanjob.Result {
 			rec.push("scan:" + id)
+
+			return scanjob.Result{State: scanjob.Succeeded}
 		},
 		WaitPreviewQueuesIdle: func(context.Context) error {
 			rec.push("wait-idle")
@@ -448,6 +456,7 @@ func TestRunScanAllOnlyScansConfiguredDrivesAndDedupes(t *testing.T) {
 	if len(got) != len(want) {
 		t.Fatalf("call sequence len = %d, want %d; got=%v", len(got), len(want), got)
 	}
+	slices.Sort(got[1:3])
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("call[%d] = %q, want %q (full=%v)", i, got[i], want[i], got)
@@ -462,9 +471,12 @@ func TestRunPipelineSkipsMigrationWhenNoCrawler(t *testing.T) {
 	rec := &recorder{}
 
 	r := New(Config{
-		Settings:          newStubSettings(),
-		ListScanTargets:   func(context.Context) []string { return []string{"drive-a"} },
-		RunScan:           func(_ context.Context, id string) { rec.push("scan:" + id) },
+		Settings:        newStubSettings(),
+		ListScanTargets: func(context.Context) ([]string, error) { return []string{"drive-a"}, nil },
+		RunScan: func(_ context.Context, id string) scanjob.Result {
+			rec.push("scan:" + id)
+			return scanjob.Result{State: scanjob.Succeeded}
+		},
 		ListCrawlerDrives: func(context.Context) []string { return nil },
 		RunCrawlerCrawl:   func(_ context.Context, id string) { rec.push("crawl:" + id) },
 		WaitPreviewQueuesIdle: func(context.Context) error {
@@ -524,17 +536,20 @@ func TestRunPipelineSkipsMigrationWhenNoCrawler(t *testing.T) {
 func TestRunPipelineExitsWhenContextCancelledMidPhase(t *testing.T) {
 	rec := &recorder{}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	r := New(Config{
 		Settings: newStubSettings(),
-		ListScanTargets: func(context.Context) []string {
-			return []string{"drive-a", "drive-b", "drive-c"}
+		ListScanTargets: func(context.Context) ([]string, error) {
+			return []string{"drive-a", "drive-b", "drive-c"}, nil
 		},
-		RunScan: func(_ context.Context, id string) {
+		RunScan: func(_ context.Context, id string) scanjob.Result {
 			rec.push("scan:" + id)
 			if id == "drive-a" {
 				cancel()
 			}
+
+			return scanjob.Result{State: scanjob.Succeeded}
 		},
 		ListCrawlerDrives:     func(context.Context) []string { return []string{"x"} },
 		RunCrawlerCrawl:       func(context.Context, string) { rec.push("crawl") },
@@ -552,12 +567,7 @@ func TestRunPipelineExitsWhenContextCancelledMidPhase(t *testing.T) {
 
 	got := rec.snapshot()
 	for _, c := range got {
-		if c == "scan:drive-c" || c == "scan:drive-b" {
-			t.Fatalf("scan should bail out after cancel, got call %q (full=%v)", c, got)
-		}
-	}
-	for _, c := range got {
-		if c == "crawl" || c == "migrate" || c == "asset-reconciliation" {
+		if c == "crawl" || c == "migrate" || c == "asset-reconciliation" || c == "wait-idle" {
 			t.Fatalf("subsequent phase should not run after cancel, got call %q", c)
 		}
 		if c == "dedupe-cleanup" {
@@ -575,7 +585,7 @@ func TestRunPipelineRecordsLastRunDateAfterCompletion(t *testing.T) {
 	r := New(Config{
 		Settings:              settings,
 		Now:                   func() time.Time { return now },
-		ListScanTargets:       func(context.Context) []string { return nil },
+		ListScanTargets:       func(context.Context) ([]string, error) { return nil, nil },
 		WaitPreviewQueuesIdle: func(context.Context) error { return nil },
 	})
 
@@ -594,10 +604,10 @@ func TestRunModeLockedDropsOverlappingRuns(t *testing.T) {
 	)
 	r := New(Config{
 		Settings: newStubSettings(),
-		ListScanTargets: func(context.Context) []string {
+		ListScanTargets: func(context.Context) ([]string, error) {
 			started.Add(1)
 			<-releaseFirst
-			return nil
+			return nil, nil
 		},
 		WaitPreviewQueuesIdle: func(context.Context) error { return nil },
 	})
@@ -624,7 +634,7 @@ func TestCtxCancelPreventsLaterPhases(t *testing.T) {
 
 	r := New(Config{
 		Settings:        settings,
-		ListScanTargets: func(context.Context) []string { return nil },
+		ListScanTargets: func(context.Context) ([]string, error) { return nil, nil },
 		WaitPreviewQueuesIdle: func(ctx context.Context) error {
 			return ctx.Err()
 		},
@@ -677,12 +687,14 @@ func TestStatusTracksQueuedRunningAndFinished(t *testing.T) {
 	var startedOnce sync.Once
 	r := New(Config{
 		Settings: newStubSettings(),
-		ListScanTargets: func(context.Context) []string {
-			return []string{"drive"}
+		ListScanTargets: func(context.Context) ([]string, error) {
+			return []string{"drive"}, nil
 		},
-		RunScan: func(context.Context, string) {
+		RunScan: func(context.Context, string) scanjob.Result {
 			startedOnce.Do(func() { close(scanStarted) })
 			<-blockScan
+
+			return scanjob.Result{State: scanjob.Succeeded}
 		},
 	})
 
@@ -740,13 +752,15 @@ func TestStopCurrentCancelsRunningPipeline(t *testing.T) {
 	var startedOnce sync.Once
 	r := New(Config{
 		Settings: newStubSettings(),
-		ListScanTargets: func(context.Context) []string {
-			return []string{"drive"}
+		ListScanTargets: func(context.Context) ([]string, error) {
+			return []string{"drive"}, nil
 		},
-		RunScan: func(ctx context.Context, _ string) {
+		RunScan: func(ctx context.Context, _ string) scanjob.Result {
 			startedOnce.Do(func() { close(scanStarted) })
 			<-ctx.Done()
 			close(scanCanceled)
+
+			return scanjob.Result{State: scanjob.Succeeded}
 		},
 	})
 

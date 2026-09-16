@@ -53,16 +53,42 @@ git clone https://github.com/Guciliang/91.git video-site-91
 cd video-site-91
 ```
 
-**2. 构建并启动**
+### 方式一：一键安装脚本（推荐）
 
+```bash
+sudo apt update && sudo apt install -y curl ca-certificates
+curl -fsSL https://raw.githubusercontent.com/nianzhibai/91/main/install.sh -o install.sh
+sudo bash install.sh
+```
+部署完成后访问：`http://服务器IP:9191/`
+
+安装后自动注册 `91` 管理命令：
+```bash
+91                  # 打开管理菜单
+91 stop             # 停止服务
+91 restart          # 重启服务
+91 update           # 更新到最新版本
+91 status           # 查看运行状态
+91 reset-password   # 重置密码
+```
+### 方式二：Docker Compose 部署
+
+**从源码构建时**，先执行：
 ```bash
 docker compose up -d --build
 ```
+
+**使用内置 compose 文件时**，可执行：
+```bash
+mkdir -p video-site-91 && cd video-site-91
+curl -fsSL https://raw.githubusercontent.com/nianzhibai/91/main/docker-compose.yml -o docker-compose.yml
+docker compose up -d
+```
 **常用命令：**
 ```bash
-docker compose logs -f             # 查看日志
-docker compose up -d --build       # 重新构建并启动
-docker compose build --no-cache    # 完全重新构建
+docker compose pull && docker compose up -d             # 更新并重启
+docker exec -it video-site-91 ./server reset-password   # 重置密码
+docker compose logs -f                                  # 查看日志
 ```
 
 部署完成后访问：`http://服务器IP:9191/`
@@ -72,11 +98,19 @@ docker compose build --no-cache    # 完全重新构建
 
 ## 数据存放位置
 
-| 路径 | 内容 |
-|------|------|
-| `./data/config.yaml` | 配置文件、管理员账号、网盘凭证 |
-| `./data/video-site.db` | SQLite 数据库 |
-| `./data/previews/` | 封面图和预览片段 |
+以下路径均相对于部署目录：
+
+- 一键脚本部署目录：默认 `/opt/video-site-91/`
+- Docker Compose 部署目录：默认 `docker-compose.yml` 所在目录
+
+| 内容 | 一键脚本部署 | Docker Compose 部署 |
+|------|------------|---------------------|
+| 运行配置 | `config.yaml` | `data/config.yaml` |
+| 数据库（视频信息、用户账号、密码哈希、网盘凭证等） | `data/video-site.db` | `data/video-site.db` |
+| 封面图和预览片段 | `data/previews/` | `data/previews/` |
+| 站内上传的视频 | `data/uploads/` | `data/uploads/` |
+| 爬虫下载的视频 | `data/scriptcrawlers/` | `data/scriptcrawlers/` |
+| 导入的爬虫脚本 | `data/crawler-scripts/` | `data/crawler-scripts/` |
 
 ## 其他说明
 
@@ -117,7 +151,7 @@ docker compose build --no-cache    # 完全重新构建
 
 ## 捐赠
 
-如果这个项目对你有帮助，欢迎请我喝杯咖啡。
+如果这个项目对你有帮助，欢迎请我喝杯咖啡
 
 <table>
   <tr>

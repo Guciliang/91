@@ -129,8 +129,6 @@ export function DriveGenerationPanel({
   regenFailedId,
   regenFailedThumbId,
   regenFailedFingerprintId,
-  togglingTeaserId,
-  onToggleTeaser,
   onRegenFailed,
   onRegenFailedThumbnails,
   onRegenFailedFingerprints,
@@ -139,8 +137,6 @@ export function DriveGenerationPanel({
   regenFailedId: string;
   regenFailedThumbId: string;
   regenFailedFingerprintId: string;
-  togglingTeaserId: string;
-  onToggleTeaser: () => void;
   onRegenFailed: () => void;
   onRegenFailedThumbnails: () => void;
   onRegenFailedFingerprints: () => void;
@@ -159,27 +155,6 @@ export function DriveGenerationPanel({
         <div className="admin-detail-card__title-left">
           <Activity size={16} />
           <span>生成状态</span>
-        </div>
-        <div className="admin-detail-actions-inline">
-          <span className="admin-drive-preview-toggle__label">预览视频</span>
-          <button
-            type="button"
-            className={`toggle-switch ${d.teaserEnabled ? "is-on" : ""} ${
-              togglingTeaserId === d.id ? "is-saving" : ""
-            }`}
-            onClick={onToggleTeaser}
-            disabled={togglingTeaserId === d.id}
-            role="switch"
-            aria-checked={d.teaserEnabled}
-            aria-label="生成预览视频"
-            title={
-              d.teaserEnabled
-                ? "关闭预览视频生成"
-                : "开启预览视频生成"
-            }
-          >
-            <span className="toggle-switch__dot" />
-          </button>
         </div>
       </header>
 
@@ -261,7 +236,7 @@ function DriveGenCol({
   const detail = generationDetail(status);
   const title = generationTitle(status, detail);
   const stateLabel = label === "抓取" && state === "scanning" ? "抓取中" : generationStateLabel(state);
-  const showScanProgress = !showCounts && (state === "scanning" || (status?.scannedCount ?? 0) > 0 || (status?.addedCount ?? 0) > 0);
+  const showScanProgress = !showCounts && (Boolean(status?.result) || state === "scanning" || (status?.scannedCount ?? 0) > 0 || (status?.addedCount ?? 0) > 0);
   const scannedLabel = label === "抓取" ? "已抓取" : "已扫描";
   return (
     <div className="admin-gen-col">
@@ -278,7 +253,7 @@ function DriveGenCol({
       {showScanProgress && (
         <div className="admin-gen-col__counts admin-gen-col__counts--scan">
           <div className="admin-gen-col__count"><span>{scannedLabel}</span><strong>{status?.scannedCount ?? 0}</strong></div>
-          <div className="admin-gen-col__count"><span>预计新增</span><strong>{status?.addedCount ?? 0}</strong></div>
+          <div className="admin-gen-col__count"><span>{status?.result ? "已新增" : "预计新增"}</span><strong>{status?.addedCount ?? 0}</strong></div>
         </div>
       )}
       {showCounts && (

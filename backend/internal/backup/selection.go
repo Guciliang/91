@@ -205,6 +205,13 @@ func filterSnapshotDatabase(
 	}
 
 	if !allResourcesSelected {
+		// A decision can contain snapshots from several resource types. Export
+		// this history only with all resources, so a partial backup cannot carry
+		// file metadata from an unselected storage through comparison evidence.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM duplicate_records`); err != nil {
+			rollback()
+			return snapshotSelectionState{}, err
+		}
 		if _, err := tx.ExecContext(ctx, `
 DELETE FROM video_reaction_visits
  WHERE video_id NOT IN (SELECT id FROM videos WHERE drive_id IN (SELECT id FROM backup_selected_drives))`); err != nil {
@@ -241,10 +248,11 @@ DELETE FROM videos
 			}
 		}
 	}
-	// Transient sessions, settings, and login bans are not part of the current
-	// backup protocol. They remain owned by the target environment on restore.
+	// Transient sessions, settings, and login protection are not part of the
+	// backup protocol. The optional failure table is recreated when SQLite opens.
 	for _, statement := range []string{
 		`DELETE FROM banned_login_ips`,
+		`DROP TABLE IF EXISTS login_failures`,
 		`DELETE FROM settings`,
 		`DELETE FROM admin_sessions`,
 		`DELETE FROM video_shares`,

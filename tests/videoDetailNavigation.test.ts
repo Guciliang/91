@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   consumePrefetchedVideoDetail,
   consumePrefetchedVideoRecommendations,
+  fetchVideoDetail,
   prefetchVideoDetail,
   prefetchVideoRecommendations,
 } from "../src/data/videos.ts";
@@ -36,7 +37,11 @@ test("video detail route preloads once and always has a visible route fallback",
   assert.match(appSource, /const VideoDetailPage = lazy\(loadVideoDetailPage\)/);
   assert.match(
     appSource,
-    /path="\/video\/:id"[\s\S]*?<PageSuspense fallback=\{<VideoDetailRouteFallback \/>\}>[\s\S]*?<VideoDetailPage \/>/
+    /function VideoDetailRouteElement\(\)[\s\S]*?<PageSuspense fallback=\{<VideoDetailRouteFallback \/>\}>[\s\S]*?<VideoDetailPage \/>/
+  );
+  assert.match(
+    appSource,
+    /path="\/video\/:id"[\s\S]*?element=\{<VideoDetailRouteElement \/>\}/
   );
   assert.match(
     appSource,
@@ -64,7 +69,7 @@ test("video cards start independent detail and recommendation requests for confi
   );
   assert.match(
     detailPageSource,
-    /const prefetchedDetail = consumePrefetchedVideoDetail\(id\)[\s\S]*?detailRequest\.then\(\(d\) =>[\s\S]*?setDetail\(stableDetail\);[\s\S]*?setLoading\(false\)/
+    /const prefetchedDetail =[\s\S]*?consumePrefetchedVideoDetail\(id\)[\s\S]*?const detailRequest = prefetchedDetail \?\? fetchVideoDetail\(id\);[\s\S]*?detailRequest[\s\S]*?\.then\(\(d\) =>[\s\S]*?setDetail\(stableDetail\);[\s\S]*?setLoading\(false\)/
   );
   assert.match(
     detailPageSource,
@@ -78,6 +83,21 @@ test("video cards start independent detail and recommendation requests for confi
   assert.match(
     detailPageSource,
     /if \(!isAdmin\) \{[\s\S]*?return;[\s\S]*?fetchTags\(\)/
+  );
+});
+
+test("same-video overlay history does not restart detail navigation effects", () => {
+  assert.match(
+    detailPageSource,
+    /const \[entryNavigationType\] = useState\(navigationType\)/
+  );
+  assert.match(
+    detailPageSource,
+    /\}, \[\s*detailLoadVersion,\s*entryNavigationType,\s*id,\s*initialSnapshot,\s*scrollRootRef,\s*\]\);/
+  );
+  assert.doesNotMatch(
+    detailPageSource,
+    /\[detailLoadVersion, id, initialSnapshot, navigationType\]/
   );
 });
 
@@ -143,6 +163,19 @@ test("detail-data prefetch is shared and consumed by one navigation", async () =
     assert.equal(consumePrefetchedVideoDetail(videoID), null);
     assert.equal((await first)?.id, videoID);
     assert.equal(requestCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("video detail distinguishes a missing resource from a service failure", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(null, { status: 404 });
+    assert.equal(await fetchVideoDetail("missing-video"), null);
+
+    globalThis.fetch = async () => new Response(null, { status: 503 });
+    await assert.rejects(fetchVideoDetail("temporarily-unavailable"), /HTTP 503/);
   } finally {
     globalThis.fetch = originalFetch;
   }

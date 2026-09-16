@@ -4,12 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"log"
 	"net/http"
-	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -30,19 +29,8 @@ var ErrLoginIPBanned = errors.New("login ip banned")
 var ErrUserBanned = errors.New("user is banned")
 
 type Authenticator struct {
-	Username string
-	Password string
-	Catalog  *catalog.Catalog
-	Now      func() time.Time
-
-	credMu   sync.RWMutex
-	mu       sync.Mutex
-	failures map[string]loginFailure
-}
-
-type loginFailure struct {
-	Count int
-	First time.Time
+	Catalog *catalog.Catalog
+	Now     func() time.Time
 }
 
 type sessionIdentityContextKey struct{}
@@ -55,59 +43,8 @@ func SessionIdentityFromContext(ctx context.Context) (string, bool) {
 	return identity, ok && identity != ""
 }
 
-func (a *Authenticator) Login(w http.ResponseWriter, r *http.Request, user, pass string) (bool, error) {
-	expectedUser, expectedPass := a.Credentials()
-	ip := requestmeta.ClientIP(r)
-	if ip != "" {
-		banned, err := a.Catalog.IsLoginIPBanned(r.Context(), ip)
-		if err != nil {
-			return false, err
-		}
-		if banned {
-			return false, ErrLoginIPBanned
-		}
-	}
-	if subtle.ConstantTimeCompare([]byte(user), []byte(expectedUser)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) != 1 {
-		if ip != "" {
-			if err := a.recordFailure(r, ip); err != nil {
-				return false, err
-			}
-		}
-		return false, nil
-	}
-	if ip != "" {
-		a.clearFailures(ip)
-	}
-	token, err := randomToken()
-	if err != nil {
-		return false, err
-	}
-	expiresAt := a.now().Add(sessionTTL)
-	if err := a.Catalog.CreateSessionUntil(r.Context(), token, expiresAt, 0); err != nil {
-		return false, err
-	}
-	setSessionCookie(w, token, expiresAt)
-	return true, nil
-}
-
-func (a *Authenticator) Credentials() (string, string) {
-	a.credMu.RLock()
-	defer a.credMu.RUnlock()
-	return a.Username, a.Password
-}
-
-func (a *Authenticator) SetCredentials(username, password string) {
-	a.credMu.Lock()
-	defer a.credMu.Unlock()
-	a.Username = username
-	a.Password = password
-}
-
 // CheckCurrentPassword re-authenticates the administrator represented by the
-// request's current session. Database-backed administrators are checked
-// against their bcrypt hash; a legacy user_id=0 session is checked against the
-// configured administrator password.
+// request's current session against the stored bcrypt hash.
 func (a *Authenticator) CheckCurrentPassword(r *http.Request, password string) (bool, error) {
 	if a == nil || a.Catalog == nil || r == nil {
 		return false, nil
@@ -126,9 +63,8 @@ func (a *Authenticator) CheckCurrentPassword(r *http.Request, password string) (
 	if !a.now().Before(session.ExpiresAt) {
 		return false, nil
 	}
-	if session.UserID == 0 {
-		_, expected := a.Credentials()
-		return subtle.ConstantTimeCompare([]byte(password), []byte(expected)) == 1, nil
+	if session.UserID <= 0 {
+		return false, nil
 	}
 	user, err := a.Catalog.GetUserByID(r.Context(), session.UserID)
 	if err != nil {
@@ -143,34 +79,15 @@ func (a *Authenticator) CheckCurrentPassword(r *http.Request, password string) (
 	return checkPassword(password, user.Password), nil
 }
 
-func (a *Authenticator) recordFailure(r *http.Request, ip string) error {
-	now := a.now()
-	a.mu.Lock()
-	if a.failures == nil {
-		a.failures = make(map[string]loginFailure)
-	}
-	f := a.failures[ip]
-	if f.First.IsZero() || now.Sub(f.First) > loginFailWindow {
-		f = loginFailure{First: now}
-	}
-	f.Count++
-	a.failures[ip] = f
-	shouldBan := f.Count >= loginFailThreshold
-	a.mu.Unlock()
-
-	if !shouldBan {
-		return nil
-	}
-	if err := a.Catalog.BanLoginIP(r.Context(), ip, "too many failed login attempts"); err != nil {
+func (a *Authenticator) recordLoginAttempt(r *http.Request, ip string, successful bool) error {
+	banned, err := a.Catalog.RecordLoginAttempt(r.Context(), ip, successful, a.now(), loginFailWindow, loginFailThreshold)
+	if err != nil {
 		return err
 	}
-	return ErrLoginIPBanned
-}
-
-func (a *Authenticator) clearFailures(ip string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	delete(a.failures, ip)
+	if banned {
+		return ErrLoginIPBanned
+	}
+	return nil
 }
 
 func (a *Authenticator) now() time.Time {
@@ -205,6 +122,9 @@ func (a *Authenticator) validateSession(w http.ResponseWriter, r *http.Request, 
 	if err != nil || !found {
 		return false, 0, err
 	}
+	if session.UserID <= 0 {
+		return false, 0, nil
+	}
 	now := a.now()
 	if !now.Before(session.ExpiresAt) {
 		return false, 0, nil
@@ -220,29 +140,7 @@ func (a *Authenticator) validateSession(w http.ResponseWriter, r *http.Request, 
 }
 
 func (a *Authenticator) Required(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ok, userID, err := a.ValidateRequest(w, r)
-		if err != nil || !ok {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if userID > 0 {
-			u, err := a.Catalog.GetUserByID(r.Context(), userID)
-			if errors.Is(err, sql.ErrNoRows) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			if err != nil {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			if u.Banned {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-		}
-		next.ServeHTTP(w, withSessionIdentity(r))
-	})
+	return a.require(next, false)
 }
 
 func withSessionIdentity(r *http.Request) *http.Request {
@@ -264,7 +162,6 @@ func randomToken() (string, error) {
 }
 
 // UserLogin authenticates a user (admin or regular) from the users table.
-// Falls back to config-based credentials for backward compatibility.
 // Returns the role on success, empty string on failure.
 func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, pass string) (string, error) {
 	ip := requestmeta.ClientIP(r)
@@ -283,30 +180,8 @@ func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, 
 		if !errors.Is(err, sql.ErrNoRows) {
 			return "", err
 		}
-		expectedUser, expectedPass := a.Credentials()
-		userCount, countErr := a.Catalog.CountUsers(r.Context())
-		if countErr != nil {
-			return "", countErr
-		}
-		if userCount == 0 && expectedUser != "" && expectedPass != "" &&
-			subtle.ConstantTimeCompare([]byte(user), []byte(expectedUser)) == 1 &&
-			subtle.ConstantTimeCompare([]byte(pass), []byte(expectedPass)) == 1 {
-			if ip != "" {
-				a.clearFailures(ip)
-			}
-			token, err := randomToken()
-			if err != nil {
-				return "", err
-			}
-			expiresAt := a.now().Add(sessionTTL)
-			if err := a.Catalog.CreateSessionUntil(r.Context(), token, expiresAt, 0); err != nil {
-				return "", err
-			}
-			setSessionCookie(w, token, expiresAt)
-			return "admin", nil
-		}
 		if ip != "" {
-			if err := a.recordFailure(r, ip); err != nil {
+			if err := a.recordLoginAttempt(r, ip, false); err != nil {
 				return "", err
 			}
 		}
@@ -319,7 +194,7 @@ func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, 
 
 	if !checkPassword(pass, u.Password) {
 		if ip != "" {
-			if err := a.recordFailure(r, ip); err != nil {
+			if err := a.recordLoginAttempt(r, ip, false); err != nil {
 				return "", err
 			}
 		}
@@ -327,7 +202,9 @@ func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, 
 	}
 
 	if ip != "" {
-		a.clearFailures(ip)
+		if err := a.recordLoginAttempt(r, ip, true); err != nil {
+			return "", err
+		}
 	}
 
 	token, err := randomToken()
@@ -335,8 +212,12 @@ func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, 
 		return "", err
 	}
 	expiresAt := a.now().Add(sessionTTL)
-	if err := a.Catalog.CreateSessionUntil(r.Context(), token, expiresAt, u.ID); err != nil {
+	created, err := a.Catalog.CreateVerifiedUserSession(r.Context(), token, expiresAt, u.ID, u.Password)
+	if err != nil {
 		return "", err
+	}
+	if !created {
+		return "", nil
 	}
 
 	setSessionCookie(w, token, expiresAt)
@@ -346,29 +227,46 @@ func (a *Authenticator) UserLogin(w http.ResponseWriter, r *http.Request, user, 
 // AdminRequired is like Required but additionally checks that the session
 // belongs to a user with role="admin". Regular users get 403.
 func (a *Authenticator) AdminRequired(next http.Handler) http.Handler {
+	return a.require(next, true)
+}
+
+func (a *Authenticator) require(next http.Handler, adminOnly bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ok, userID, err := a.ValidateRequest(w, r)
-		if err != nil || !ok {
+		if err != nil {
+			writeAuthUnavailable(w, r, "validate session", err)
+			return
+		}
+		if !ok {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		if userID > 0 {
-			u, err := a.Catalog.GetUserByID(r.Context(), userID)
-			if errors.Is(err, sql.ErrNoRows) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			if err != nil {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			if u.Banned || u.Role != "admin" {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
+		u, err := a.Catalog.GetUserByID(r.Context(), userID)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if err != nil {
+			writeAuthUnavailable(w, r, "load session user", err)
+			return
+		}
+		if u.Banned || (adminOnly && u.Role != "admin") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
 		}
 		next.ServeHTTP(w, withSessionIdentity(r))
 	})
+}
+
+func writeAuthUnavailable(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	// A canceled client is no longer waiting for a response. More importantly,
+	// cancellation must not be translated into a misleading authentication
+	// failure that makes the browser discard otherwise valid session state.
+	if r.Context().Err() != nil {
+		return
+	}
+	log.Printf("[auth] %s method=%s path=%s: %v", operation, r.Method, r.URL.Path, err)
+	http.Error(w, "service temporarily unavailable", http.StatusServiceUnavailable)
 }
 
 func setSessionCookie(w http.ResponseWriter, token string, expiresAt time.Time) {

@@ -28,6 +28,7 @@ import {
   type HomeFeedKey,
 } from "@/lib/listingSearchParams";
 import { MOBILE_VIDEO_PAGE_SIZE, useIsMobile } from "@/lib/responsive";
+import { useRouteActivity } from "@/lib/routeActivity";
 import { useInfiniteListing } from "@/lib/useInfiniteListing";
 import {
   useListingRestoreTarget,
@@ -43,6 +44,7 @@ const PREFETCH_ROWS = 2;
 export default function HomePage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
+  const routeActive = useRouteActivity();
   const activeSearchQuery = searchParams.get("q")?.trim() ?? "";
   const activeTag = searchParams.get("tag")?.trim() ?? "";
   const hasActiveSearch = activeSearchQuery.length > 0;
@@ -83,11 +85,12 @@ export default function HomePage() {
     historyKey: location.key,
     queryKey: activeFeedSource.key,
     pageSize: activeFeedSource.batchSize,
-    // 随机快照只在当前 Document 内恢复：进详情再后退仍保持现场，浏览器
-    // 刷新生成新 Document 后则从空 token 开始重新随机。
-    feedSnapshotScope: isRandomRecommendationFeed ? "document" : "session",
+    // Each source owns its freshness policy. Latest and random feeds preserve
+    // same-Document back navigation but start fresh after a browser reload.
+    feedSnapshotScope: activeFeedSource.snapshotRestoreScope,
   });
   const homeFeed = useInfiniteListing(activeFeedSource, {
+    pausePagination: !routeActive,
     restoreCount: restoreTarget.count,
     restoreFeedToken: restoreTarget.feedToken,
   });
@@ -97,6 +100,7 @@ export default function HomePage() {
     requestedCount: homeFeed.requestedCount,
     feedToken: homeFeed.feedToken,
     itemCount: homeFeed.items.length,
+    active: routeActive,
   });
 
   const feedItems = homeFeed.items;
@@ -173,11 +177,7 @@ export default function HomePage() {
           placeholder=""
           className="search-panel--public search-panel--transparent"
         />
-        {feedHasContent || hasActiveFilter ? (
-          <TagCloud linkBasePath="/" />
-        ) : (
-          <div className="tag-cloud-container is-reserved" aria-hidden="true" />
-        )}
+        <TagCloud linkBasePath="/" />
       </div>
 
       <div className="container page-section home-primary-section">

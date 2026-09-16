@@ -3,31 +3,55 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
-type scanPresenceVideo struct {
-	fileID   string
-	parentID string
+// ScanPresenceScope is the discovery proof used to evaluate missing catalog
+// rows. The E/F/X maps are mutually exclusive directory classifications.
+// PresenceAuthoritative describes complete discovery of the configured scope.
+// ProtectUnlocated is a narrow policy-backfill guard for rows whose stored
+// ancestry cannot be mapped to E/F/X.
+type ScanPresenceScope struct {
+	EnumeratedDirIDs      map[string]struct{}
+	FailedDirIDs          map[string]struct{}
+	ExcludedDirIDs        map[string]struct{}
+	PresenceAuthoritative bool
+	ProtectUnlocated      bool
 }
 
-// ConfirmMissingDriveFiles advances the durable missing counter for files that
-// were eligible for this successful scan but were not observed. A live file
-// clears its counter immediately. Only file IDs reaching threshold in this
-// snapshot are returned to the caller for destructive cleanup. For a full-drive
-// scan every catalog row is eligible, including rows below directories that the
-// current scan policy excludes; excluding a directory therefore removes its old
-// rows from management after the normal confirmation threshold.
-func (c *Catalog) ConfirmMissingDriveFiles(
+// MissingFileCleanupMode controls how eligible missing files become safe to
+// remove. Presence-authoritative scans can use MissingFileCleanupImmediate;
+// incomplete discovery retains the two-scan confirmation guard.
+type MissingFileCleanupMode uint8
+
+const (
+	MissingFileCleanupConfirmTwice MissingFileCleanupMode = iota
+	MissingFileCleanupImmediate
+)
+
+const missingFileConfirmationThreshold = 2
+
+type scanPresenceVideo struct {
+	fileID         string
+	parentID       string
+	ancestorDirIDs []string
+}
+
+// EvaluateMissingDriveFiles applies the requested cleanup policy only when the
+// snapshot proves that a file or one of its ancestor directories disappeared.
+// Failed and policy-excluded subtrees remain protected. A live file clears its
+// durable missing mark in either mode. Immediate mode returns eligible files
+// without creating marks; guarded mode requires two eligible scans.
+func (c *Catalog) EvaluateMissingDriveFiles(
 	ctx context.Context,
 	driveID string,
 	liveFileIDs map[string]struct{},
-	visitedDirIDs map[string]struct{},
-	fullDriveScan bool,
-	threshold int,
+	scope ScanPresenceScope,
+	mode MissingFileCleanupMode,
 ) (map[string]struct{}, error) {
 	if c == nil || c.db == nil {
 		return nil, errors.New("catalog: database is not open")
@@ -36,8 +60,8 @@ func (c *Catalog) ConfirmMissingDriveFiles(
 	if driveID == "" {
 		return nil, errors.New("catalog: empty drive id")
 	}
-	if threshold < 2 {
-		return nil, fmt.Errorf("catalog: unsafe missing-file confirmation threshold %d", threshold)
+	if mode != MissingFileCleanupConfirmTwice && mode != MissingFileCleanupImmediate {
+		return nil, fmt.Errorf("catalog: invalid missing-file cleanup mode %d", mode)
 	}
 
 	tx, err := c.db.BeginTx(ctx, &sql.TxOptions{})
@@ -45,16 +69,29 @@ func (c *Catalog) ConfirmMissingDriveFiles(
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT file_id, COALESCE(parent_id, '') FROM videos WHERE drive_id = ?`, driveID)
+	rows, err := tx.QueryContext(ctx, `
+SELECT file_id, COALESCE(parent_id, ''), COALESCE(ancestor_dir_ids, '')
+  FROM videos
+ WHERE drive_id = ?`, driveID)
 	if err != nil {
 		return nil, err
 	}
 	var videos []scanPresenceVideo
 	for rows.Next() {
 		var video scanPresenceVideo
-		if err := rows.Scan(&video.fileID, &video.parentID); err != nil {
+		var ancestorDirIDsJSON string
+		if err := rows.Scan(&video.fileID, &video.parentID, &ancestorDirIDsJSON); err != nil {
 			rows.Close()
 			return nil, err
+		}
+		if ancestorDirIDsJSON != "" {
+			if err := json.Unmarshal([]byte(ancestorDirIDsJSON), &video.ancestorDirIDs); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("catalog: decode video %s ancestor directory IDs: %w", video.fileID, err)
+			}
+			if video.ancestorDirIDs == nil {
+				video.ancestorDirIDs = []string{}
+			}
 		}
 		videos = append(videos, video)
 	}
@@ -65,7 +102,7 @@ func (c *Catalog) ConfirmMissingDriveFiles(
 		return nil, err
 	}
 
-	confirmed := make(map[string]struct{})
+	fileIDsToRemove := make(map[string]struct{})
 	now := time.Now().UnixMilli()
 	for _, video := range videos {
 		fileID := strings.TrimSpace(video.fileID)
@@ -78,10 +115,15 @@ func (c *Catalog) ConfirmMissingDriveFiles(
 			}
 			continue
 		}
-		if !fullDriveScan {
-			if _, eligible := visitedDirIDs[video.parentID]; !eligible {
-				continue
+		if !missingFileEligible(video, scope) {
+			continue
+		}
+		if mode == MissingFileCleanupImmediate {
+			fileIDsToRemove[fileID] = struct{}{}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM drive_scan_misses WHERE drive_id = ? AND file_id = ?`, driveID, fileID); err != nil {
+				return nil, err
 			}
+			continue
 		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO drive_scan_misses (drive_id, file_id, consecutive_misses, last_missing_at)
@@ -97,13 +139,13 @@ ON CONFLICT(drive_id, file_id) DO UPDATE SET
 			driveID, fileID).Scan(&misses); err != nil {
 			return nil, err
 		}
-		if misses >= threshold {
-			confirmed[fileID] = struct{}{}
+		if misses >= missingFileConfirmationThreshold {
+			fileIDsToRemove[fileID] = struct{}{}
 		}
 	}
 
-	// Keep the auxiliary table bounded when videos are removed through another
-	// lifecycle (admin delete, dedupe, crawler migration, and so on).
+	// DeleteVideo removes the matching counter transactionally. Keep this repair
+	// path for orphan rows left by versions that predate that behavior.
 	if _, err := tx.ExecContext(ctx, `
 DELETE FROM drive_scan_misses
 WHERE drive_id = ?
@@ -117,5 +159,40 @@ WHERE drive_id = ?
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	return confirmed, nil
+	return fileIDsToRemove, nil
+}
+
+func missingFileEligible(video scanPresenceVideo, scope ScanPresenceScope) bool {
+	ancestorDirIDs := effectiveAncestorDirIDs(video.ancestorDirIDs, video.parentID)
+	if len(ancestorDirIDs) == 0 {
+		return unlocatedFileEligible(scope)
+	}
+
+	for index, dirID := range ancestorDirIDs {
+		if _, enumerated := scope.EnumeratedDirIDs[dirID]; enumerated {
+			continue
+		}
+		if _, failed := scope.FailedDirIDs[dirID]; failed {
+			return false
+		}
+		if _, excluded := scope.ExcludedDirIDs[dirID]; excluded {
+			return false
+		}
+		if index == 0 {
+			return unlocatedFileEligible(scope)
+		}
+		// The preceding ancestor was enumerated successfully but did not list
+		// this directory, proving that the subtree no longer exists.
+		return true
+	}
+
+	// Every ancestor was enumerated, so the direct parent exists and the file
+	// itself is the first missing element.
+	return true
+}
+
+func unlocatedFileEligible(scope ScanPresenceScope) bool {
+	// Keep the catalog boundary fail-safe if a caller ever constructs a
+	// contradictory scope.
+	return scope.PresenceAuthoritative && !scope.ProtectUnlocated && len(scope.FailedDirIDs) == 0
 }

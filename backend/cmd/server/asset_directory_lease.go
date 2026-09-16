@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/video-site/backend/internal/filelock"
 )
 
 // assetDirectoryLease gives one server process exclusive write ownership of a
@@ -43,11 +45,11 @@ func acquireAssetDirectoryLease(assetDir, databasePath string) (*assetDirectoryL
 	if err != nil {
 		return nil, fmt.Errorf("open asset directory lease %s: %w", lockPath, err)
 	}
-	if err := lockAssetFile(file); err != nil {
+	if err := filelock.TryLock(file); err != nil {
 		_, _ = file.Seek(0, 0)
 		owner, _ := io.ReadAll(io.LimitReader(file, 2048))
 		_ = file.Close()
-		if isAssetLockBusy(err) {
+		if errors.Is(err, filelock.ErrLocked) {
 			details := strings.TrimSpace(string(owner))
 			if details != "" {
 				details = "; current owner: " + strings.ReplaceAll(details, "\n", ", ")
@@ -94,7 +96,7 @@ func (lease *assetDirectoryLease) Close() error {
 	}
 	file := lease.file
 	lease.file = nil
-	unlockErr := unlockAssetFile(file)
+	unlockErr := filelock.Unlock(file)
 	closeErr := file.Close()
 	return errors.Join(unlockErr, closeErr)
 }

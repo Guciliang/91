@@ -23,10 +23,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/dedupe"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/mediaasset"
 	"github.com/video-site/backend/internal/persistence"
+	"github.com/video-site/backend/internal/tasklimit"
 	"golang.org/x/net/proxy"
 )
 
@@ -51,12 +54,10 @@ const (
 )
 
 type CrawlerConfig struct {
-	Driver  *Driver
-	Catalog *catalog.Catalog
-	// GetDriveConfig can supply the task-generation snapshot while a newer
-	// desired configuration is waiting for the current crawl to finish.
-	GetDriveConfig func(context.Context, string) (*catalog.Drive, error)
-	CrawlerName    string
+	FingerprintLimiter *tasklimit.Limiter
+	Driver             *Driver
+	Catalog            *catalog.Catalog
+	CrawlerName        string
 	// Protocol is the protocol to start from. Every run re-reads it from the
 	// script itself, so this is the value used before the first run and
 	// whenever SkipProtocolRefresh keeps the script from being consulted.
@@ -75,7 +76,6 @@ type CrawlerConfig struct {
 	LocalPreviewDir      string
 	ProxyURL             string
 	ConfigJSON           string
-	DisablePreview       bool
 	HTTPClient           *http.Client
 	DownloadTimeout      time.Duration
 	RunTimeout           time.Duration
@@ -328,13 +328,28 @@ func (item Item) hasPayload() bool {
 		strings.TrimSpace(item.Media.LocalFile) != ""
 }
 
-func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (*CrawlResult, error) {
+func (c *Crawler) RunOnce(ctx context.Context, targetNew int) (report *CrawlResult, runErr error) {
 	c.runMu.Lock()
 	defer c.runMu.Unlock()
 
 	if c.cfg.Driver == nil {
 		return nil, errors.New("scriptcrawler: driver not set")
 	}
+	ctx = applog.NewTask(ctx, "scriptcrawler", c.cfg.Driver.ID())
+	applog.Info(ctx, "Crawler run started", applog.Fields{})
+	defer func() {
+		if runErr != nil {
+			if errors.Is(runErr, context.Canceled) {
+				applog.Warn(ctx, "Crawler run canceled", runErr, applog.Fields{})
+				return
+			}
+			applog.Error(ctx, "Crawler run failed", runErr, applog.Fields{})
+		} else if report != nil && report.Failed > 0 {
+			applog.Warn(ctx, fmt.Sprintf("Crawler run finished with %d failed items", report.Failed), nil, applog.Fields{})
+		} else {
+			applog.Info(ctx, "Crawler run finished", applog.Fields{})
+		}
+	}()
 	if c.cfg.Catalog == nil {
 		return nil, errors.New("scriptcrawler: catalog not set")
 	}
@@ -573,17 +588,17 @@ func (c *Crawler) startScript(ctx context.Context, jobPath string, targetNew, ca
 		_ = stdout.Close()
 		return nil, nil, err
 	}
-	log.Printf("[scriptcrawler] drive=%s exec %s --job=%s unique_target=%d candidate_budget=%d", c.cfg.Driver.ID(), c.cfg.ScriptPath, jobPath, targetNew, candidateBudget)
+	applog.Info(ctx, fmt.Sprintf("Execute %s --job=%s unique_target=%d candidate_budget=%d", c.cfg.ScriptPath, jobPath, targetNew, candidateBudget), applog.Fields{Stage: "exec"})
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
 		_ = stderr.Close()
 		return nil, nil, err
 	}
-	go forwardScriptLog(c.cfg.Driver.ID(), stderr, c.cfg.MaxStderrBytes)
+	go forwardScriptLog(ctx, c.cfg.Driver.ID(), stderr, c.cfg.MaxStderrBytes)
 	return cmd, stdout, nil
 }
 
-func forwardScriptLog(driveID string, r io.Reader, maxBytes int64) {
+func forwardScriptLog(ctx context.Context, driveID string, r io.Reader, maxBytes int64) {
 	reader := bufio.NewReaderSize(r, maxStderrLineBytes)
 	line := make([]byte, 0, maxStderrLineBytes)
 	var consumed int64
@@ -595,7 +610,10 @@ func forwardScriptLog(driveID string, r io.Reader, maxBytes int64) {
 			if lineTruncated {
 				trimmed += "…"
 			}
-			log.Printf("[scriptcrawler:script] drive=%s %s", driveID, trimmed)
+			fields := applog.ContextFields(ctx)
+			fields.Component = "scriptcrawler:script"
+			fields.DriveID = driveID
+			applog.LogEntry(log.Default(), applog.Entry{Message: trimmed, Fields: fields})
 		}
 		line = line[:0]
 		lineTruncated = false
@@ -725,10 +743,6 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		}
 	}
 	crawlerTagLabel = c.crawlerTagName()
-	previewStatus := "pending"
-	if c.previewDisabled(ctx) {
-		previewStatus = "disabled"
-	}
 	v := &catalog.Video{
 		ID:              videoID,
 		DriveID:         c.cfg.Driver.ID(),
@@ -740,12 +754,12 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 		Size:            size,
 		Ext:             strings.TrimPrefix(videoExt, "."),
 		Description:     strings.TrimSpace(item.Description),
-		PreviewStatus:   previewStatus,
+		PreviewStatus:   "pending",
 		PublishedAt:     now,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	sampled, err := fingerprint.Compute(ctx, c.cfg.Driver, v, fingerprint.Config{}, c.cfg.HTTPClient)
+	sampled, err := fingerprint.Compute(ctx, c.cfg.Driver, v, fingerprint.Config{Limiter: c.cfg.FingerprintLimiter}, c.cfg.HTTPClient)
 	if err != nil {
 		_ = os.Remove(videoPath)
 		return false, fmt.Errorf("fingerprint: %w", err)
@@ -754,8 +768,9 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 	v.FingerprintStatus = "ready"
 	if duplicate, err := c.cfg.Catalog.FindVideoBySampledFingerprint(ctx, v); err == nil && duplicate != nil {
 		_ = os.Remove(videoPath)
-		if markErr := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "duplicate", duplicate.ID, sampled, size); markErr != nil {
-			log.Printf("[scriptcrawler] drive=%s source_id=%s mark duplicate seen: %v", c.cfg.Driver.ID(), sourceID, markErr)
+		evidence := dedupe.NewEvidence(dedupe.ReasonSampledSHA256, duplicate.ID, duplicate.ID, "existing_match")
+		if err := c.recordSkippedDuplicate(ctx, v, duplicate, sourceID, evidence); err != nil {
+			return false, fmt.Errorf("record fingerprint duplicate: %w", err)
 		}
 		log.Printf("[scriptcrawler] drive=%s source_id=%s duplicate_of=%s title=%q size=%d", c.cfg.Driver.ID(), sourceID, duplicate.ID, title, size)
 		return false, nil
@@ -813,6 +828,7 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 				NewVideo:                  v,
 				ReplacedVideoID:           duplicate.video.ID,
 				ExpectedReplacedUpdatedAt: duplicate.video.UpdatedAt.UnixMilli(),
+				Evidence:                  duplicate.evidence(v.ID, v.ID, "larger_file"),
 				CrawlerSource: &catalog.CrawlerSourceSeen{
 					Kind: Kind, DriveID: c.cfg.Driver.ID(), SourceID: sourceID,
 					Status: "imported", SampledSHA256: sampled, Size: size,
@@ -838,8 +854,9 @@ func (c *Crawler) processItem(ctx context.Context, item Item) (bool, error) {
 			if commonThumbPath != "" {
 				_ = os.Remove(commonThumbPath)
 			}
-			if markErr := c.cfg.Catalog.MarkCrawlerSourceSeen(ctx, Kind, c.cfg.Driver.ID(), sourceID, "duplicate", duplicate.video.ID, sampled, size); markErr != nil {
-				log.Printf("[scriptcrawler] drive=%s source_id=%s mark near duplicate seen: %v", c.cfg.Driver.ID(), sourceID, markErr)
+			evidence := duplicate.evidence(duplicate.video.ID, duplicate.video.ID, "existing_not_smaller")
+			if err := c.recordSkippedDuplicate(ctx, v, duplicate.video, sourceID, evidence); err != nil {
+				return false, fmt.Errorf("record near duplicate: %w", err)
 			}
 			log.Printf("[scriptcrawler] drive=%s source_id=%s near_duplicate_of=%s old_size=%d new_size=%d title_similarity=%.3f thumbnail_ssim=%.3f content_ssim=%.3f title=%q duration=%d", c.cfg.Driver.ID(), sourceID, duplicate.video.ID, duplicate.video.Size, v.Size, duplicate.titleSimilarity, duplicate.thumbnailSSIM, duplicate.contentSSIM, title, v.DurationSeconds)
 			return false, nil
@@ -974,9 +991,6 @@ func (c *Crawler) RestoreRequestedVideos(ctx context.Context) (int, error) {
 		video.PreviewFileID = ""
 		video.PreviewLocal = ""
 		video.PreviewStatus = "pending"
-		if c.previewDisabled(ctx) {
-			video.PreviewStatus = "disabled"
-		}
 		if video.CreatedAt.IsZero() {
 			video.CreatedAt = file.modTime
 		}
@@ -1032,24 +1046,6 @@ func (c *Crawler) restoreCrawlerThumbnail(video *catalog.Video, fileID string) b
 		return true
 	}
 	return false
-}
-
-func (c *Crawler) previewDisabled(ctx context.Context) bool {
-	if c == nil {
-		return false
-	}
-	if c.cfg.Driver != nil {
-		if c.cfg.GetDriveConfig != nil {
-			if d, err := c.cfg.GetDriveConfig(ctx, c.cfg.Driver.ID()); err == nil && d != nil {
-				return !d.TeaserEnabled
-			}
-		} else if c.cfg.Catalog != nil {
-			if d, err := c.cfg.Catalog.GetDrive(ctx, c.cfg.Driver.ID()); err == nil && d != nil {
-				return !d.TeaserEnabled
-			}
-		}
-	}
-	return c.cfg.DisablePreview
 }
 
 func (c *Crawler) materializeMedia(ctx context.Context, ref MediaRef, dst, referer string, required bool) (int64, error) {

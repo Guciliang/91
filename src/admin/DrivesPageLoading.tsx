@@ -2,12 +2,13 @@ import {
   Activity,
   ArrowLeft,
   FolderTree,
-  FolderX,
   HardDrive,
 } from "lucide-react";
 import { useSearchParams } from "react-router";
 import { StorageSummary } from "./drive/StorageSummary";
 import { SkipDirsLoadingIndicator } from "./drive/SkipDirsLoadingIndicator";
+import { ScanResultDetails } from "./drive/ScanResultDetails";
+import { SkipDirsIcon } from "./icons/SkipDirsIcon";
 
 const DRIVE_LIST_SKELETON_COUNT = 6;
 const DRIVE_GENERATION_SECTIONS = [
@@ -62,7 +63,7 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
         aria-busy="true"
       >
         <span className="sr-only">正在加载网盘详情</span>
-        <div aria-hidden="true">
+        <div className="admin-drive-detail-layout__info" aria-hidden="true">
           <div className="admin-detail-card">
             <header className="admin-detail-card__title">
               <div className="admin-detail-card__title-left">
@@ -107,38 +108,14 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
               </button>
             </div>
           </div>
-
-          <div className="admin-detail-card">
-            <header className="admin-detail-card__title">
-              <div className="admin-detail-card__title-left">
-                <FolderX size={16} />
-                <span>扫描跳过目录</span>
-              </div>
-            </header>
-            <div className="admin-detail-tree-container">
-              <SkipDirsLoadingIndicator />
-            </div>
-          </div>
         </div>
 
-        <div aria-hidden="true">
+        <div className="admin-drive-detail-layout__status" aria-hidden="true">
           <div className="admin-detail-card">
             <header className="admin-detail-card__title">
               <div className="admin-detail-card__title-left">
                 <Activity size={16} />
                 <span>生成状态</span>
-              </div>
-              <div className="admin-detail-actions-inline">
-                <span className="admin-drive-preview-toggle__label">预览视频</span>
-                <button
-                  type="button"
-                  className="toggle-switch is-on"
-                  disabled
-                  role="switch"
-                  aria-checked="true"
-                >
-                  <span className="toggle-switch__dot" />
-                </button>
               </div>
             </header>
 
@@ -173,6 +150,8 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
             </div>
           </div>
 
+          <ScanResultDetails loading />
+
           <div className="admin-detail-card">
             <header className="admin-detail-card__title">
               <div className="admin-detail-card__title-left">
@@ -187,6 +166,20 @@ export function DriveDetailLoading({ onBack }: { onBack: () => void }) {
                   <strong>{EMPTY_VALUE}</strong>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="admin-drive-detail-layout__skip-dirs" aria-hidden="true">
+          <div className="admin-detail-card">
+            <header className="admin-detail-card__title">
+              <div className="admin-detail-card__title-left">
+                <SkipDirsIcon />
+                <span>扫描跳过目录</span>
+              </div>
+            </header>
+            <div className="admin-detail-tree-container">
+              <SkipDirsLoadingIndicator />
             </div>
           </div>
         </div>

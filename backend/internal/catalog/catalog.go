@@ -54,7 +54,10 @@ type CrawlerAssetCounts struct {
 }
 
 func Open(path string) (*Catalog, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	// Reserve the writer before a read-modify-write transaction takes a snapshot.
+	// Deferred transactions can fail on promotion with SQLITE_BUSY even with a
+	// busy timeout. Read-only transactions and ordinary WAL reads stay concurrent.
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +69,10 @@ func Open(path string) (*Catalog, error) {
 	if err := c.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate catalog: %w", err)
+	}
+	if err := c.migrateAdminSetup(context.Background()); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate administrator setup: %w", err)
 	}
 	return c, nil
 }
@@ -142,6 +149,7 @@ type Video struct {
 	FingerprintStatus  string    `json:"fingerprintStatus"`
 	FingerprintError   string    `json:"fingerprintError"`
 	ParentID           string    `json:"parentId"`
+	AncestorDirIDs     []string  `json:"ancestorDirIds,omitempty"`
 	DirName            string    `json:"dirName"`
 	Title              string    `json:"title"`
 	Author             string    `json:"author"`
@@ -236,9 +244,8 @@ type videoRowExecer interface {
 }
 
 // upsertVideoRow owns the videos-table statement without opening a transaction.
-// Ordinary scans call it through UpsertVideo; tombstone restoration calls it
-// with an existing transaction so the row, tag assignments, and tombstone can
-// move to their new state atomically.
+// Scan admission and tombstone restoration call it with their existing write
+// transaction. General callers use UpsertVideo, which also initializes tags.
 func upsertVideoRow(ctx context.Context, exec videoRowExecer, v *Video) ([]string, error) {
 	v.ContentHash = normalizeContentHash(v.ContentHash)
 	v.SampledSHA256 = normalizeContentHash(v.SampledSHA256)
@@ -249,6 +256,11 @@ func upsertVideoRow(ctx context.Context, exec videoRowExecer, v *Video) ([]strin
 	storedTags := uniqueStrings(cleanLabels(v.Tags))
 	tagsJSON, _ := json.Marshal(storedTags)
 	badgesJSON, _ := json.Marshal(v.Badges)
+	ancestorDirIDsJSON := ""
+	if v.AncestorDirIDs != nil {
+		payload, _ := json.Marshal(v.AncestorDirIDs)
+		ancestorDirIDsJSON = string(payload)
+	}
 	now := time.Now().UnixMilli()
 	if v.CreatedAt.IsZero() {
 		v.CreatedAt = time.UnixMilli(now)
@@ -275,13 +287,13 @@ func upsertVideoRow(ctx context.Context, exec videoRowExecer, v *Video) ([]strin
 
 	_, err := exec.ExecContext(ctx, `
 INSERT INTO videos (
-  id, drive_id, file_id, file_name, content_hash, sampled_sha256, fingerprint_status, fingerprint_error, parent_id, dir_name, title, author, tags,
+  id, drive_id, file_id, file_name, content_hash, sampled_sha256, fingerprint_status, fingerprint_error, parent_id, ancestor_dir_ids, dir_name, title, author, tags,
 	  duration_seconds, size_bytes, ext, thumbnail_url, thumbnail_updated_at, thumbnail_status,
 	  preview_file_id, preview_local, preview_updated_at, preview_status,
 	  views, last_viewed_at, favorites, comments, likes, last_liked_at, dislikes,
 	  hidden, badges, description, published_at, created_at, updated_at
 	) VALUES (
-	  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+	  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 	  ?, ?, ?, ?, ?, CASE WHEN COALESCE(?, '') != '' THEN 'ready' ELSE 'pending' END,
 	  ?, ?, ?, ?,
 	  ?, ?, ?, ?, ?, ?, ?,
@@ -295,6 +307,10 @@ ON CONFLICT(id) DO UPDATE SET
   parent_id       = CASE
                       WHEN excluded.parent_id != '' THEN excluded.parent_id
                       ELSE videos.parent_id
+                    END,
+  ancestor_dir_ids = CASE
+                      WHEN excluded.ancestor_dir_ids != '' THEN excluded.ancestor_dir_ids
+                      ELSE videos.ancestor_dir_ids
                     END,
   dir_name        = CASE
                       WHEN excluded.dir_name != '' THEN excluded.dir_name
@@ -348,7 +364,7 @@ ON CONFLICT(id) DO UPDATE SET
 	  description     = excluded.description,
   updated_at      = excluded.updated_at
 `,
-		v.ID, v.DriveID, v.FileID, v.FileName, v.ContentHash, v.SampledSHA256, fingerprintStatus, v.FingerprintError, v.ParentID, v.DirName, v.Title, v.Author, string(tagsJSON),
+		v.ID, v.DriveID, v.FileID, v.FileName, v.ContentHash, v.SampledSHA256, fingerprintStatus, v.FingerprintError, v.ParentID, ancestorDirIDsJSON, v.DirName, v.Title, v.Author, string(tagsJSON),
 		v.DurationSeconds, v.Size, v.Ext, v.ThumbnailURL, thumbnailUpdatedAt, v.ThumbnailURL,
 		v.PreviewFileID, v.PreviewLocal, previewUpdatedAt, nullableStatus(v.PreviewStatus),
 		v.Views, unixMilliOrZero(v.LastViewedAt), v.Favorites, v.Comments, v.Likes, unixMilliOrZero(v.LastLikedAt), v.Dislikes,
@@ -639,6 +655,8 @@ type VideoMetaPatch struct {
 	ParentIDSet            bool
 	DirName                string
 	DirNameSet             bool
+	AncestorDirIDs         []string
+	AncestorDirIDsSet      bool
 	Title                  string
 	TitleSet               bool
 	Author                 string
@@ -703,6 +721,15 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 	if p.DirNameSet || p.DirName != "" {
 		parts = append(parts, "dir_name = ?")
 		args = append(args, p.DirName)
+	}
+	if p.AncestorDirIDsSet {
+		ancestorDirIDs := p.AncestorDirIDs
+		if ancestorDirIDs == nil {
+			ancestorDirIDs = []string{}
+		}
+		payload, _ := json.Marshal(ancestorDirIDs)
+		parts = append(parts, "ancestor_dir_ids = ?")
+		args = append(args, string(payload))
 	}
 	if p.TitleSet {
 		parts = append(parts, "title = ?")
@@ -1546,6 +1573,9 @@ ON CONFLICT(id) DO UPDATE SET
 	if _, err := tx.ExecContext(ctx, `DELETE FROM video_reaction_visits WHERE video_id = ?`, restoreVideo.ID); err != nil {
 		return err
 	}
+	if err := deleteDriveScanMissForVideoTx(ctx, tx, restoreVideo.ID); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, restoreVideo.ID)
 	if err != nil {
 		return err
@@ -1581,6 +1611,9 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM video_reaction_visits WHERE video_id = ?`, id); err != nil {
 		return err
 	}
+	if err := deleteDriveScanMissForVideoTx(ctx, tx, id); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM videos WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -1595,6 +1628,19 @@ func (c *Catalog) DeleteVideo(ctx context.Context, id string) error {
 	}
 
 	return tx.Commit()
+}
+
+func deleteDriveScanMissForVideoTx(ctx context.Context, tx *sql.Tx, videoID string) error {
+	_, err := tx.ExecContext(ctx, `
+DELETE FROM drive_scan_misses
+ WHERE EXISTS (
+       SELECT 1
+         FROM videos
+        WHERE videos.id = ?
+          AND videos.drive_id = drive_scan_misses.drive_id
+          AND videos.file_id = drive_scan_misses.file_id
+ )`, videoID)
+	return err
 }
 
 // DeletedVideo 是黑名单（墓碑）表里的一条记录。原始视频行已删除，
@@ -3475,12 +3521,9 @@ type Drive struct {
 	Credentials map[string]string `json:"credentials,omitempty"`
 	Status      string            `json:"status"`
 	LastError   string            `json:"lastError,omitempty"`
-	// TeaserEnabled 控制是否给本盘生成预览视频；封面生成不受影响。
-	// 替代早期的全局 preview.enabled 开关；新建 drive 时 UpsertDrive 默认置 true。
-	TeaserEnabled bool `json:"teaserEnabled"`
 	// SkipDirIDs 是用户在管理后台为该盘选定的"扫描跳过目录"集合（网盘侧的目录 fileID）。
-	// scanner 发现阶段命中后不递归、不收集文件，也不参与 presence 统计。完整根
-	// 扫描时，该目录的历史记录会按连续缺失确认策略退出媒体库管理范围。
+	// scanner 发现阶段命中后不递归、不收集文件，也不参与缺失确认。名单变化后，
+	// 下一次扫盘会先执行策略清理，让这些目录的历史记录直接退出媒体库管理范围。
 	// 含义按"目录 ID 自身"匹配，所以同名目录在不同父级下需要分别选定。
 	SkipDirIDs []string  `json:"skipDirIds,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
@@ -3488,9 +3531,8 @@ type Drive struct {
 }
 
 type DriveUpsertOptions struct {
-	ReplaceSkipDirIDs    bool
-	ReplaceTeaserEnabled bool
-	PatchCredentials     bool
+	ReplaceSkipDirIDs bool
+	PatchCredentials  bool
 }
 
 // UpsertDrive persists a complete configuration. On an existing row it
@@ -3498,8 +3540,7 @@ type DriveUpsertOptions struct {
 // mounted runtime and must be changed through SetDriveRuntimeStatus.
 func (c *Catalog) UpsertDrive(ctx context.Context, d *Drive) error {
 	return c.upsertDrive(ctx, d, DriveUpsertOptions{
-		ReplaceSkipDirIDs:    true,
-		ReplaceTeaserEnabled: true,
+		ReplaceSkipDirIDs: true,
 	})
 }
 
@@ -3515,7 +3556,7 @@ func (c *Catalog) UpsertDriveWithOptions(ctx context.Context, d *Drive, options 
 // value in SQL avoids a read-then-write race with the dedicated skip-dir API.
 // New rows still receive the normalized value from d (normally an empty list).
 func (c *Catalog) UpsertDrivePreservingSkipDirIDs(ctx context.Context, d *Drive) error {
-	return c.upsertDrive(ctx, d, DriveUpsertOptions{ReplaceTeaserEnabled: true})
+	return c.upsertDrive(ctx, d, DriveUpsertOptions{})
 }
 
 // UpsertDrivePatchingCredentials updates drive metadata while atomically
@@ -3524,9 +3565,8 @@ func (c *Catalog) UpsertDrivePreservingSkipDirIDs(ctx context.Context, d *Drive)
 // after the edit form was opened.
 func (c *Catalog) UpsertDrivePatchingCredentials(ctx context.Context, d *Drive) error {
 	return c.upsertDrive(ctx, d, DriveUpsertOptions{
-		ReplaceSkipDirIDs:    true,
-		ReplaceTeaserEnabled: true,
-		PatchCredentials:     true,
+		ReplaceSkipDirIDs: true,
+		PatchCredentials:  true,
 	})
 }
 
@@ -3534,8 +3574,7 @@ func (c *Catalog) UpsertDrivePatchingCredentials(ctx context.Context, d *Drive) 
 // semantics with the omitted-skipDirIds behavior used by the admin form.
 func (c *Catalog) UpsertDrivePatchingCredentialsPreservingSkipDirIDs(ctx context.Context, d *Drive) error {
 	return c.upsertDrive(ctx, d, DriveUpsertOptions{
-		ReplaceTeaserEnabled: true,
-		PatchCredentials:     true,
+		PatchCredentials: true,
 	})
 }
 
@@ -3553,8 +3592,8 @@ func (c *Catalog) upsertDrive(ctx context.Context, d *Drive, options DriveUpsert
 	}
 	d.UpdatedAt = time.UnixMilli(now)
 	_, err := c.db.ExecContext(ctx, `
-INSERT INTO drives (id, kind, name, root_id, scan_root_id, credentials, status, last_error, teaser_enabled, skip_dir_ids, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO drives (id, kind, name, root_id, scan_root_id, credentials, status, last_error, skip_dir_ids, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   kind           = excluded.kind,
   name           = excluded.name,
@@ -3576,12 +3615,11 @@ ON CONFLICT(id) DO UPDATE SET
                    END,
   status         = drives.status,
   last_error     = drives.last_error,
-  teaser_enabled = CASE WHEN ? != 0 THEN excluded.teaser_enabled ELSE drives.teaser_enabled END,
   skip_dir_ids   = CASE WHEN ? != 0 THEN excluded.skip_dir_ids ELSE drives.skip_dir_ids END,
   updated_at     = excluded.updated_at
-`, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, boolToInt(d.TeaserEnabled), string(skipDirsJSON),
+`, d.ID, d.Kind, d.Name, d.RootID, d.ScanRootID, string(cred), d.Status, d.LastError, string(skipDirsJSON),
 		d.CreatedAt.UnixMilli(), d.UpdatedAt.UnixMilli(), boolToInt(options.PatchCredentials), boolToInt(options.PatchCredentials),
-		boolToInt(options.ReplaceTeaserEnabled), boolToInt(options.ReplaceSkipDirIDs))
+		boolToInt(options.ReplaceSkipDirIDs))
 	return err
 }
 
@@ -3634,7 +3672,7 @@ UPDATE drives
 }
 
 func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), created_at, updated_at FROM drives ORDER BY created_at ASC`)
+	rows, err := c.db.QueryContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(skip_dir_ids, '[]'), created_at, updated_at FROM drives ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -3643,15 +3681,13 @@ func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
 	for rows.Next() {
 		d := &Drive{}
 		var credsStr, skipDirsStr string
-		var teaserEnabled int
 		var createdAt, updatedAt int64
-		if err := rows.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &skipDirsStr, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(credsStr), &d.Credentials)
 		_ = json.Unmarshal([]byte(skipDirsStr), &d.SkipDirIDs)
 		normalizeDriveRootFields(d)
-		d.TeaserEnabled = teaserEnabled != 0
 		d.CreatedAt = time.UnixMilli(createdAt)
 		d.UpdatedAt = time.UnixMilli(updatedAt)
 		out = append(out, d)
@@ -3660,18 +3696,16 @@ func (c *Catalog) ListDrives(ctx context.Context) ([]*Drive, error) {
 }
 
 func (c *Catalog) GetDrive(ctx context.Context, id string) (*Drive, error) {
-	row := c.db.QueryRowContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(teaser_enabled, 1), COALESCE(skip_dir_ids, '[]'), created_at, updated_at FROM drives WHERE id = ?`, id)
+	row := c.db.QueryRowContext(ctx, `SELECT id, kind, name, root_id, COALESCE(scan_root_id, ''), COALESCE(credentials, '{}'), status, COALESCE(last_error, ''), COALESCE(skip_dir_ids, '[]'), created_at, updated_at FROM drives WHERE id = ?`, id)
 	d := &Drive{}
 	var credsStr, skipDirsStr string
-	var teaserEnabled int
 	var createdAt, updatedAt int64
-	if err := row.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &teaserEnabled, &skipDirsStr, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&d.ID, &d.Kind, &d.Name, &d.RootID, &d.ScanRootID, &credsStr, &d.Status, &d.LastError, &skipDirsStr, &createdAt, &updatedAt); err != nil {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(credsStr), &d.Credentials)
 	_ = json.Unmarshal([]byte(skipDirsStr), &d.SkipDirIDs)
 	normalizeDriveRootFields(d)
-	d.TeaserEnabled = teaserEnabled != 0
 	d.CreatedAt = time.UnixMilli(createdAt)
 	d.UpdatedAt = time.UnixMilli(updatedAt)
 	return d, nil
@@ -3692,6 +3726,7 @@ func (c *Catalog) DeleteDrive(ctx context.Context, id string) error {
 	// survive removal of the crawler that originally discovered them.
 	for _, query := range []string{
 		`DELETE FROM drive_scan_misses WHERE drive_id = ?`,
+		`DELETE FROM drive_skip_cleanup_legacy_dirs WHERE drive_id = ?`,
 		`DELETE FROM scans WHERE drive_id = ?`,
 		`DELETE FROM crawler_seen_sources WHERE drive_id = ?`,
 	} {
@@ -3879,28 +3914,6 @@ UPDATE drives
 	return err
 }
 
-// SetDriveTeaserEnabled 切换某盘的预览视频生成开关。
-//
-// 与 UpsertDrive 的区别：只动 teaser_enabled + updated_at 一列，不要求调用方
-// 重传 kind / name / credentials 等容易踩坑的字段。
-//
-// drive 不存在时返回 sql.ErrNoRows，调用方可以照此返回 404。
-func (c *Catalog) SetDriveTeaserEnabled(ctx context.Context, id string, enabled bool) error {
-	if id == "" {
-		return fmt.Errorf("catalog: set drive teaser_enabled: empty id")
-	}
-	res, err := c.db.ExecContext(ctx,
-		`UPDATE drives SET teaser_enabled = ?, updated_at = ? WHERE id = ?`,
-		boolToInt(enabled), time.Now().UnixMilli(), id)
-	if err != nil {
-		return err
-	}
-	if rows, err := res.RowsAffected(); err == nil && rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 // SetDriveSkipDirIDs 重写某盘的"扫描跳过目录"集合（直接覆盖，不做增量合并）。
 //
 // 与 UpsertDrive 的区别：只动 skip_dir_ids + updated_at，不要求调用方重传
@@ -3951,6 +3964,20 @@ func (c *Catalog) CreateSessionUntil(ctx context.Context, token string, expiresA
 		`INSERT INTO admin_sessions (token, created_at, expires_at, user_id) VALUES (?, ?, ?, ?)`,
 		token, now.UnixMilli(), expiresAt.UnixMilli(), userID)
 	return err
+}
+
+// CreateVerifiedUserSession prevents a login verified before a password reset
+// from creating a fresh session after that reset revoked the old sessions.
+func (c *Catalog) CreateVerifiedUserSession(ctx context.Context, token string, expiresAt time.Time, userID int64, passwordHash string) (bool, error) {
+	result, err := c.db.ExecContext(ctx, `
+INSERT INTO admin_sessions (token, created_at, expires_at, user_id)
+SELECT ?, ?, ?, id FROM users WHERE id = ? AND password = ? AND banned = 0`,
+		token, time.Now().UnixMilli(), expiresAt.UnixMilli(), userID, passwordHash)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
 }
 
 func (c *Catalog) GetSession(ctx context.Context, token string) (SessionInfo, bool, error) {
@@ -4073,7 +4100,7 @@ func (c *Catalog) DeleteSettings(ctx context.Context, keys ...string) error {
 const allVideoCols = `
 id, drive_id, file_id, COALESCE(file_name, ''), COALESCE(content_hash, ''),
 COALESCE(sampled_sha256, ''), COALESCE(fingerprint_status, 'pending'), COALESCE(fingerprint_error, ''),
-COALESCE(parent_id, ''), COALESCE(dir_name, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
+COALESCE(parent_id, ''), COALESCE(ancestor_dir_ids, ''), COALESCE(dir_name, ''), title, COALESCE(author, ''), COALESCE(tags, '[]'),
 duration_seconds, size_bytes, COALESCE(ext, ''), COALESCE(thumbnail_url, ''), COALESCE(thumbnail_updated_at, 0),
 COALESCE(preview_file_id, ''), COALESCE(preview_local, ''), COALESCE(preview_updated_at, 0), COALESCE(preview_status, 'pending'),
 	views, COALESCE(last_viewed_at, 0), favorites, comments, likes, COALESCE(last_liked_at, 0), dislikes,
@@ -4176,13 +4203,13 @@ func scanVideoSummary(row rowScanner) (*VideoSummary, error) {
 
 func scanVideo(row rowScanner) (*Video, error) {
 	v := &Video{}
-	var tagsJSON, badgesJSON string
+	var ancestorDirIDsJSON, tagsJSON, badgesJSON string
 	var publishedAt, createdAt, updatedAt, thumbnailUpdatedAt, previewUpdatedAt, lastViewedAt, lastLikedAt int64
 	var hidden int
 	err := row.Scan(
 		&v.ID, &v.DriveID, &v.FileID, &v.FileName, &v.ContentHash,
 		&v.SampledSHA256, &v.FingerprintStatus, &v.FingerprintError,
-		&v.ParentID, &v.DirName, &v.Title, &v.Author, &tagsJSON,
+		&v.ParentID, &ancestorDirIDsJSON, &v.DirName, &v.Title, &v.Author, &tagsJSON,
 		&v.DurationSeconds, &v.Size, &v.Ext, &v.ThumbnailURL, &thumbnailUpdatedAt,
 		&v.PreviewFileID, &v.PreviewLocal, &previewUpdatedAt, &v.PreviewStatus,
 		&v.Views, &lastViewedAt, &v.Favorites, &v.Comments, &v.Likes, &lastLikedAt, &v.Dislikes,
@@ -4191,6 +4218,9 @@ func scanVideo(row rowScanner) (*Video, error) {
 	)
 	if err != nil {
 		return nil, err
+	}
+	if ancestorDirIDsJSON != "" {
+		_ = json.Unmarshal([]byte(ancestorDirIDsJSON), &v.AncestorDirIDs)
 	}
 	_ = json.Unmarshal([]byte(tagsJSON), &v.Tags)
 	_ = json.Unmarshal([]byte(badgesJSON), &v.Badges)

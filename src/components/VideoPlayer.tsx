@@ -13,6 +13,13 @@ import {
 } from "@/lib/fullscreenSubtitleLayout";
 import { diagnosePlaybackSource } from "@/lib/playbackError";
 import {
+  getPlayerGesturePoint,
+  setPlayerGestureVolume,
+  type PlayerGestureFrame,
+  type PlayerGesturePoint,
+} from "@/lib/playerGestures";
+import { disablePlayerVolumePersistence } from "@/lib/playerVolume";
+import {
   escapeHtml,
   formatSubtitleLabel,
   formatSubtitleOptionLabel,
@@ -76,8 +83,8 @@ type MobileGestureSide = "left" | "right";
 type PlayerGestureHudKind = "volume" | "brightness";
 type KeyboardSeekKey = "ArrowLeft" | "ArrowRight";
 type MobileGestureState = {
-  startX: number;
-  startY: number;
+  frame: PlayerGestureFrame;
+  startPoint: PlayerGesturePoint;
   startTime: number;
   startVolume: number;
   startBrightness: number;
@@ -148,6 +155,7 @@ const COMPACT_SETTING_LAYOUT = {
   itemHeight: 30,
 };
 const ORIENTATION_CONTROL_NAME = "orientationToggle";
+const PLAYER_SURFACE_CLASS = "video-player__art";
 const TRIPLE_SCREEN_CONTROL_NAME = "tripleScreen";
 const TRIPLE_SCREEN_RELAY_QUERY = "tripleScreenRelay";
 const MANUAL_ORIENTATION_CLASS = "art-manual-orientation";
@@ -189,6 +197,7 @@ const GESTURE_ACTIVATION_PX = 12;
 const GESTURE_DIRECTION_LOCK_RATIO = 1.2;
 const GESTURE_VERTICAL_SCALE = 1.15;
 const playerGestureHudTimers = new WeakMap<HTMLElement, number>();
+const playerBrightness = new WeakMap<Artplayer, number>();
 const tripleScreenBindings = new WeakMap<
   Artplayer,
   { toggle: () => void; destroy: () => void }
@@ -514,8 +523,13 @@ function mountArtPlayer({
 
   const art = new Artplayer(option);
   artRef.current = art;
+  art.template.$player.classList.add(PLAYER_SURFACE_CLASS);
 
   const video = art.video as VideoElementWithHls;
+  disablePlayerVolumePersistence(art.storage);
+  // ArtPlayer may have restored a cached volume during its constructor.
+  video.volume = DEFAULT_SETTINGS.volume;
+  video.muted = DEFAULT_SETTINGS.muted;
   video.setAttribute("referrerpolicy", MEDIA_REFERRER_POLICY);
   video.setAttribute("aria-label", title);
   video.setAttribute("controlsList", "nodownload");
@@ -523,7 +537,7 @@ function mountArtPlayer({
   video.disablePictureInPicture = false;
   video.loop = DEFAULT_SETTINGS.loop;
   video.playbackRate = DEFAULT_SETTINGS.playbackRate;
-  applyPlayerBrightness(art, DEFAULT_SETTINGS.brightness);
+  const unbindBrightness = bindPlayerBrightness(art);
 
   async function requestSubtitles() {
     if (
@@ -735,6 +749,7 @@ function mountArtPlayer({
     // 路由回退时必须先退出网页全屏，把节点移回 mount，再执行 destroy；
     // 否则 React 卸载详情页后，脱离组件树的全屏节点会继续覆盖新页面。
     if (art.fullscreenWeb) art.fullscreenWeb = false;
+    unbindBrightness();
     unbindFastRate();
     unbindMobileGestures();
     unbindProgressPreview();
@@ -1432,26 +1447,23 @@ function clearPlayerGestureHud(art: Artplayer) {
 function playerGestureHudIcon(kind: PlayerGestureHudKind, value: string) {
   if (kind === "brightness") {
     return `
-      <svg viewBox="0 0 24 24" fill="none">
-        <circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="1.7"/>
-        <path d="M12 2.8v2.1M12 19.1v2.1M4.9 4.9l1.5 1.5M17.6 17.6l1.5 1.5M2.8 12h2.1M19.1 12h2.1M4.9 19.1l1.5-1.5M17.6 6.4l1.5-1.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">
+        <!--! Font Awesome Pro 7.3.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license (Commercial License) Copyright 2026 Fonticons, Inc. -->
+        <path opacity=".4" fill="currentColor" d="M64 320C64 337.7 78.3 352 96 352L144 352C161.7 352 176 337.7 176 320C176 302.3 161.7 288 144 288L96 288C78.3 288 64 302.3 64 320zM137.4 137.4C124.9 149.9 124.9 170.2 137.4 182.7L169.4 214.7C181.9 227.2 202.2 227.2 214.7 214.7C227.2 202.2 227.2 181.9 214.7 169.4L182.7 137.4C170.2 124.9 149.9 124.9 137.4 137.4zM137.4 457.4C124.9 469.9 124.9 490.2 137.4 502.7C149.9 515.2 170.2 515.2 182.7 502.7L214.7 470.7C227.2 458.2 227.2 437.9 214.7 425.4C202.2 412.9 181.9 412.9 169.4 425.4L137.4 457.4zM288 96L288 144C288 161.7 302.3 176 320 176C337.7 176 352 161.7 352 144L352 96C352 78.3 337.7 64 320 64C302.3 64 288 78.3 288 96zM288 496L288 544C288 561.7 302.3 576 320 576C337.7 576 352 561.7 352 544L352 496C352 478.3 337.7 464 320 464C302.3 464 288 478.3 288 496zM425.4 169.4C412.9 181.9 412.9 202.2 425.4 214.7C437.9 227.2 458.2 227.2 470.7 214.7L502.7 182.7C515.2 170.2 515.2 149.9 502.7 137.4C490.2 124.9 469.9 124.9 457.4 137.4L425.4 169.4zM425.4 425.4C412.9 437.9 412.9 458.2 425.4 470.7L457.4 502.7C469.9 515.2 490.2 515.2 502.7 502.7C515.2 490.2 515.2 469.9 502.7 457.4L470.7 425.4C458.2 412.9 437.9 412.9 425.4 425.4zM464 320C464 337.7 478.3 352 496 352L544 352C561.7 352 576 337.7 576 320C576 302.3 561.7 288 544 288L496 288C478.3 288 464 302.3 464 320z"/>
+        <path fill="currentColor" d="M224 320C224 267 267 224 320 224C373 224 416 267 416 320C416 373 373 416 320 416C267 416 224 373 224 320z"/>
       </svg>
     `;
   }
 
-  if (value === "0%") {
-    return `
-      <svg viewBox="0 0 24 24" fill="none">
-        <path d="M4.8 9.7h3l4.3-3.6v11.8l-4.3-3.6h-3V9.7Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-        <path d="m16.1 9.9 4.1 4.1M20.2 9.9 16.1 14" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
-      </svg>
-    `;
-  }
+  const volumeMark = value === "0%"
+    ? `<path d="M432 264L544 376M544 264L432 376" fill="none" stroke="currentColor" stroke-width="48" stroke-linecap="round"/>`
+    : `<path fill="currentColor" d="M471.3 174.5C479.7 164.2 494.8 162.7 505.1 171C548.3 206.2 576 259.9 576 320C576 380.1 548.3 433.8 505.1 469C494.8 477.4 479.7 475.8 471.3 465.5C462.9 455.2 464.5 440.1 474.8 431.7C507.3 405.3 528 365.1 528 320C528 274.9 507.3 234.7 474.8 208.2C464.5 199.8 463 184.7 471.3 174.4zM410.8 249C419.2 238.7 434.3 237.2 444.6 245.5C466.2 263.1 480 289.9 480 320C480 350.1 466.1 376.9 444.6 394.5C434.3 402.9 419.2 401.3 410.8 391C402.4 380.7 404 365.6 414.3 357.2C425.1 348.4 432 335 432 320C432 305 425.1 291.6 414.3 282.7C404 274.3 402.5 259.2 410.8 248.9z"/>`;
 
   return `
-    <svg viewBox="0 0 24 24" fill="none">
-      <path d="M4.8 9.7h3l4.3-3.6v11.8l-4.3-3.6h-3V9.7Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M15.4 9.2a4.2 4.2 0 0 1 0 5.6M18 6.7a7.7 7.7 0 0 1 0 10.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">
+      <!--! Font Awesome Pro 7.3.1 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license (Commercial License) Copyright 2026 Fonticons, Inc. -->
+      <path opacity=".4" fill="currentColor" d="M64 272L64 368C64 394.5 85.5 416 112 416L160 416L294.1 535.2C300.5 540.9 308.7 544 317.2 544C336.4 544 352 528.4 352 509.2L352 130.8C352 111.6 336.4 96 317.2 96C308.7 96 300.5 99.1 294.1 104.8L160 224L112 224C85.5 224 64 245.5 64 272z"/>
+      ${volumeMark}
     </svg>
   `;
 }
@@ -2028,22 +2040,30 @@ function orientationLabel(mode: OrientationMode) {
   return mode === "landscape" ? "横屏" : "竖屏";
 }
 
+function bindPlayerBrightness(art: Artplayer) {
+  applyPlayerBrightness(art, DEFAULT_SETTINGS.brightness);
+  function restoreBrightness() {
+    // ArtPlayer restores the pre-fullscreen inline styles when leaving web fullscreen.
+    applyPlayerBrightness(art, getPlayerBrightness(art));
+  }
+  art.on("fullscreenWeb", restoreBrightness);
+  return () => {
+    art.off("fullscreenWeb", restoreBrightness);
+    playerBrightness.delete(art);
+  };
+}
+
 function applyPlayerBrightness(art: Artplayer, brightness: number) {
+  const value = Number(clamp(brightness, BRIGHTNESS_MIN, BRIGHTNESS_MAX).toFixed(2));
+  playerBrightness.set(art, value);
   art.template.$player.style.setProperty(
     "--video-player-brightness",
-    clamp(brightness, BRIGHTNESS_MIN, BRIGHTNESS_MAX).toFixed(2)
+    value.toFixed(2)
   );
 }
 
 function getPlayerBrightness(art: Artplayer) {
-  const raw = art.template.$player.style.getPropertyValue(
-    "--video-player-brightness"
-  );
-  if (!raw.trim()) return DEFAULT_SETTINGS.brightness;
-  const value = Number(raw);
-  return Number.isFinite(value)
-    ? clamp(value, BRIGHTNESS_MIN, BRIGHTNESS_MAX)
-    : DEFAULT_SETTINGS.brightness;
+  return playerBrightness.get(art) ?? DEFAULT_SETTINGS.brightness;
 }
 
 function seekGestureLabel(
@@ -2292,18 +2312,26 @@ function bindMobilePlayerGestures(
   }
 
   function handleTouchStart(event: TouchEvent) {
+    resetGesture();
     if (event.touches.length !== 1 || art.isLock) return;
 
     const touch = event.touches[0];
     const rect = player.getBoundingClientRect();
-    const localX = touch.clientX - rect.left;
+    const frame: PlayerGestureFrame = {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      rotated: player.classList.contains(MANUAL_ORIENTATION_CLASS) || art.isRotate,
+    };
+    const startPoint = getPlayerGesturePoint(touch, frame);
     state = {
-      startX: touch.clientX,
-      startY: touch.clientY,
+      frame,
+      startPoint,
       startTime: video.currentTime || 0,
       startVolume: video.muted ? 0 : clamp(video.volume, 0, 1),
       startBrightness: getPlayerBrightness(art),
-      side: localX < rect.width / 2 ? "left" : "right",
+      side: startPoint.x < startPoint.width / 2 ? "left" : "right",
       mode: null,
       targetTime: video.currentTime || 0,
       moved: false,
@@ -2345,14 +2373,15 @@ function bindMobilePlayerGestures(
 
   function handleTouchMove(event: TouchEvent) {
     if (!state) return;
-    if (event.touches.length !== 1) {
+    if (event.touches.length !== 1 || art.isLock) {
       resetGesture();
       return;
     }
 
     const touch = event.touches[0];
-    const dx = touch.clientX - state.startX;
-    const dy = touch.clientY - state.startY;
+    const point = getPlayerGesturePoint(touch, state.frame);
+    const dx = point.x - state.startPoint.x;
+    const dy = point.y - state.startPoint.y;
 
     if (state.fastActive) {
       event.preventDefault();
@@ -2372,20 +2401,19 @@ function bindMobilePlayerGestures(
     }
 
     if (state.mode === "volume") {
-      handleVolumeGesture(touch.clientY);
+      handleVolumeGesture(point.y);
       return;
     }
 
-    handleBrightnessGesture(touch.clientY);
+    handleBrightnessGesture(point.y);
   }
 
   function handleSeekGesture(event: TouchEvent, dx: number) {
     if (!state) return;
     const duration = video.duration;
     if (!Number.isFinite(duration) || duration <= 0) return;
-    const rect = player.getBoundingClientRect();
     const targetTime = clamp(
-      state.startTime + (dx / Math.max(1, rect.width)) * duration,
+      state.startTime + (dx / Math.max(1, state.startPoint.width)) * duration,
       0,
       duration
     );
@@ -2397,20 +2425,22 @@ function bindMobilePlayerGestures(
 
   function handleVolumeGesture(currentY: number) {
     if (!state) return;
-    const rect = player.getBoundingClientRect();
-    const delta = (state.startY - currentY) / Math.max(1, rect.height);
-    const nextVolume = clamp(state.startVolume + delta, 0, 1);
-    const normalized = Math.round(nextVolume * 100) / 100;
-    video.volume = normalized;
-    video.muted = normalized <= 0;
-    showPlayerGestureHud(art, "volume", formatPercent(normalized));
+    const delta =
+      (state.startPoint.y - currentY) / Math.max(1, state.startPoint.height);
+    const volume = setPlayerGestureVolume(video, state.startVolume + delta);
+    if (volume === null) {
+      clearPlayerGestureHud(art);
+      art.notice.show = "当前浏览器不支持音量调节";
+      resetGesture();
+      return;
+    }
+    showPlayerGestureHud(art, "volume", formatPercent(volume));
   }
 
   function handleBrightnessGesture(currentY: number) {
     if (!state) return;
-    const rect = player.getBoundingClientRect();
     const delta =
-      ((state.startY - currentY) / Math.max(1, rect.height)) *
+      ((state.startPoint.y - currentY) / Math.max(1, state.startPoint.height)) *
       GESTURE_VERTICAL_SCALE;
     const nextBrightness = clamp(
       state.startBrightness + delta,
@@ -2447,6 +2477,9 @@ function bindMobilePlayerGestures(
   video.addEventListener("pause", resetGesture);
   video.addEventListener("ended", resetGesture);
   window.addEventListener("blur", resetGesture);
+  art.on("resize", resetGesture);
+  art.on("fullscreen", resetGesture);
+  art.on("fullscreenWeb", resetGesture);
 
   return () => {
     clearPlayerGestureHud(art);
@@ -2458,6 +2491,9 @@ function bindMobilePlayerGestures(
     video.removeEventListener("pause", resetGesture);
     video.removeEventListener("ended", resetGesture);
     window.removeEventListener("blur", resetGesture);
+    art.off("resize", resetGesture);
+    art.off("fullscreen", resetGesture);
+    art.off("fullscreenWeb", resetGesture);
   };
 }
 

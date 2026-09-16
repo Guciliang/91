@@ -47,6 +47,21 @@ test("detail like and dislike buttons are visually separated", () => {
   );
 });
 
+test("reaction hover feedback excludes touch devices and selected buttons", () => {
+  assert.match(
+    detailCss,
+    /@media \(hover:\s*hover\) and \(pointer:\s*fine\)\s*\{\s*\.vd-actions__pill:hover:not\(:disabled\):not\(\.is-active\)\s*\{[^}]*color:\s*var\(--text-strong\)/s
+  );
+  assert.doesNotMatch(
+    detailCss,
+    /\.vd-actions__pill:hover:not\(:disabled\)\s*\{/
+  );
+  assert.match(
+    detailCss,
+    /\.vd-actions__pill\.is-active\s*\{[^}]*background:\s*var\(--accent-softer\)[^}]*border-color:\s*var\(--border-accent\)[^}]*color:\s*var\(--accent\)/s
+  );
+});
+
 test("desktop share button matches the like button without changing narrow screens", () => {
   assert.match(
     detailCss,
@@ -139,15 +154,21 @@ test("detail history navigation renders cached content before background refresh
   );
   assert.match(
     detailPageSource,
-    /const detailRequest = prefetchedDetail[\s\S]*?detailRequest\.then\(\(d\) =>[\s\S]*?setLoading\(false\)/
+    /const detailRequest = prefetchedDetail \?\? fetchVideoDetail\(id\);[\s\S]*?detailRequest[\s\S]*?\.then\(\(d\) =>[\s\S]*?setLoading\(false\)/
   );
   assert.doesNotMatch(
     detailPageSource,
     /Promise\.all\(\[detailRequest, fetchTags\(\)\]\)/
   );
-  assert.match(detailPageSource, /if \(!stableDetail && initialSnapshot\)/);
-  assert.match(detailPageSource, /if \(navigationType !== "POP"\)/);
-  assert.doesNotMatch(detailPageSource, /setLoading\(true\)/);
+  assert.match(
+    detailPageSource,
+    /\.catch\(\(\) => \{[\s\S]*?setDetailError\("视频信息暂时无法加载，请稍后重试"\);[\s\S]*?setLoading\(false\)/
+  );
+  assert.match(
+    detailPageSource,
+    /const \[entryNavigationType\] = useState\(navigationType\)[\s\S]*?if \(entryNavigationType !== "POP"\)/
+  );
+  assert.match(detailPageSource, /if \(!initialSnapshot\) setLoading\(true\)/);
 });
 
 test("detail page defers subtitles to the player menu", () => {

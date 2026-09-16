@@ -47,6 +47,27 @@ func TestVideoSourceUsesDirectStreamForAvi(t *testing.T) {
 	}
 }
 
+func TestHandleVideoDetailReturnsServiceUnavailableWhenCatalogFails(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	req := requestWithVideoID(http.MethodGet, "/api/video/video-1", "video-1", strings.NewReader(""))
+	rr := httptest.NewRecorder()
+	(&Server{Catalog: cat}).handleVideoDetail(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body = %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "database") || strings.Contains(rr.Body.String(), "interrupted") {
+		t.Fatalf("response exposed the catalog error: %q", rr.Body.String())
+	}
+}
+
 func TestVideoSourceUsesDirectStreamForMkv(t *testing.T) {
 	v := &catalog.Video{
 		ID:      "video-1",
@@ -842,7 +863,7 @@ func newHomeRecommendationTestRoute(t *testing.T, total, readyCount int) (*Serve
 	}
 
 	const token = "home-recommendation-session"
-	if err := cat.CreateSession(ctx, token, time.Hour, 0); err != nil {
+	if err := cat.CreateSession(ctx, token, time.Hour, createSessionUser(t, cat)); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	server := &Server{Catalog: cat}
@@ -1987,7 +2008,7 @@ func TestShortsRouteRejectsRemovedPostEndpoint(t *testing.T) {
 		t.Fatalf("open catalog: %v", err)
 	}
 	t.Cleanup(func() { _ = cat.Close() })
-	if err := cat.CreateSession(ctx, "shorts-route-token", time.Hour, 0); err != nil {
+	if err := cat.CreateSession(ctx, "shorts-route-token", time.Hour, createSessionUser(t, cat)); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 

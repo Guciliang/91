@@ -5,11 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/videoid"
 	"github.com/video-site/backend/internal/videoname"
@@ -48,7 +49,7 @@ func (s *Scanner) reconcileFile(ctx context.Context, file File, result *Result) 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		result.addIssue(file, IssueTombstone, err)
+		result.addIssue(ctx, file, IssueTombstone, err)
 		return nil
 	}
 	if deleted {
@@ -66,7 +67,7 @@ func (s *Scanner) reconcileFile(ctx context.Context, file File, result *Result) 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		result.addIssue(file, IssueTags, err)
+		result.addIssue(ctx, file, IssueTags, err)
 		assignments = nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -78,7 +79,7 @@ func (s *Scanner) reconcileFile(ctx context.Context, file File, result *Result) 
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		result.addIssue(file, IssueLookup, err)
+		result.addIssue(ctx, file, IssueLookup, err)
 		return nil
 	}
 	if existing != nil {
@@ -124,6 +125,10 @@ func (s *Scanner) reconcileExisting(
 		patch.DirName = file.DirName
 		patch.DirNameSet = true
 	}
+	if !slices.Equal(existing.AncestorDirIDs, file.AncestorDirIDs) {
+		patch.AncestorDirIDs = append([]string(nil), file.AncestorDirIDs...)
+		patch.AncestorDirIDsSet = true
+	}
 	if entry.Name != "" && existing.FileName != entry.Name {
 		patch.FileName = entry.Name
 		patch.Author = parsedAuthor
@@ -138,21 +143,34 @@ func (s *Scanner) reconcileExisting(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			result.addIssue(file, IssueMetadata, err)
+			result.addIssue(ctx, file, IssueMetadata, err)
 		} else {
 			result.Updated++
 		}
 	}
 
-	duplicate, err := s.findDuplicate(ctx, entry.Hash, entry.Name, entry.Size, existing.ID)
+	source := &catalog.Video{
+		ID: existing.ID, DriveID: s.Drive.ID(), ContentHash: entry.Hash,
+		FileID: entry.ID, FileName: entry.Name, Title: displayTitle, Size: entry.Size,
+		ParentID: file.ParentID, DirName: file.DirName,
+		AncestorDirIDs: append([]string(nil), file.AncestorDirIDs...),
+	}
+	duplicate, err := s.Catalog.FindScannedVideoDuplicate(ctx, source, result.Snapshot.SeenFileIDs)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		result.addIssue(file, IssueDuplicate, err)
+		result.addIssue(ctx, file, IssueDuplicate, err)
 		return nil
 	}
 	if duplicate != nil {
+		if err := s.Catalog.RecordScannedDuplicate(ctx, source, duplicate); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			result.addIssue(ctx, file, IssueDuplicate, err)
+			return nil
+		}
 		result.Duplicates++
 		return nil
 	}
@@ -160,7 +178,7 @@ func (s *Scanner) reconcileExisting(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		result.addIssue(file, IssueTags, err)
+		result.addIssue(ctx, file, IssueTags, err)
 	}
 	return ctx.Err()
 }
@@ -175,45 +193,39 @@ func (s *Scanner) insertNew(
 	result *Result,
 ) error {
 	entry := file.Entry
-	duplicate, err := s.findDuplicate(ctx, entry.Hash, entry.Name, entry.Size, id)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		result.addIssue(file, IssueDuplicate, err)
-		return nil
-	}
-	if duplicate != nil {
-		result.Duplicates++
-		return nil
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	now := time.Now()
 	video := &catalog.Video{
-		ID:            id,
-		DriveID:       s.Drive.ID(),
-		FileID:        entry.ID,
-		FileName:      entry.Name,
-		ContentHash:   entry.Hash,
-		ParentID:      file.ParentID,
-		DirName:       file.DirName,
-		Title:         displayTitle,
-		Author:        parsedAuthor,
-		Ext:           strings.TrimPrefix(strings.ToLower(path.Ext(entry.Name)), "."),
-		Size:          entry.Size,
-		PreviewStatus: "pending",
-		PublishedAt:   now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:             id,
+		DriveID:        s.Drive.ID(),
+		FileID:         entry.ID,
+		FileName:       entry.Name,
+		ContentHash:    entry.Hash,
+		ParentID:       file.ParentID,
+		DirName:        file.DirName,
+		AncestorDirIDs: append([]string(nil), file.AncestorDirIDs...),
+		Title:          displayTitle,
+		Author:         parsedAuthor,
+		Ext:            strings.TrimPrefix(strings.ToLower(path.Ext(entry.Name)), "."),
+		Size:           entry.Size,
+		PreviewStatus:  "pending",
+		PublishedAt:    now,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
-	if err := s.Catalog.UpsertVideo(ctx, video); err != nil {
+	inserted, err := s.Catalog.InsertScannedVideo(ctx, video, result.Snapshot.SeenFileIDs)
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		result.addIssue(file, IssueUpsert, err)
+		result.addIssue(ctx, file, IssueUpsert, err)
+		return nil
+	}
+	if !inserted {
+		result.Duplicates++
 		return nil
 	}
 	if len(assignments) > 0 {
@@ -221,7 +233,7 @@ func (s *Scanner) insertNew(
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
-			result.addIssue(file, IssueTags, err)
+			result.addIssue(ctx, file, IssueTags, err)
 		} else {
 			video.Tags = assignmentLabels(assignments)
 		}
@@ -234,7 +246,7 @@ func (s *Scanner) insertNew(
 	return ctx.Err()
 }
 
-func (r *Result) addIssue(file File, stage IssueStage, err error) {
+func (r *Result) addIssue(ctx context.Context, file File, stage IssueStage, err error) {
 	issue := Issue{
 		Stage:  stage,
 		DirID:  file.ParentID,
@@ -244,12 +256,12 @@ func (r *Result) addIssue(file File, stage IssueStage, err error) {
 	}
 	r.Issues = append(r.Issues, issue)
 	r.Stats.Errors++
-	log.Printf("[scanner] %v", issue)
+	applog.Error(ctx, "File reconciliation failed: "+file.Entry.Name, err, applog.Fields{Component: "scanner", DriveID: r.Snapshot.DriveID, FileID: file.Entry.ID, Stage: string(stage)})
 }
 
 func metadataPatchSet(patch catalog.VideoMetaPatch) bool {
 	return patch.ContentHash != "" || patch.FileName != "" || patch.ParentIDSet ||
-		patch.DirNameSet || patch.TitleSet || patch.AuthorSet
+		patch.DirNameSet || patch.AncestorDirIDsSet || patch.TitleSet || patch.AuthorSet
 }
 
 func assignmentLabels(assignments []catalog.TagAssignment) []string {
@@ -258,29 +270,6 @@ func assignmentLabels(assignments []catalog.TagAssignment) []string {
 		labels = append(labels, assignment.Label)
 	}
 	return labels
-}
-
-func (s *Scanner) findDuplicate(ctx context.Context, hash, fileName string, size int64, currentID string) (*catalog.Video, error) {
-	if hash != "" {
-		duplicate, err := s.Catalog.FindVideoByContentHash(ctx, hash)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
-		if duplicate != nil && duplicate.ID != currentID {
-			return duplicate, nil
-		}
-	}
-	if fileName == "" || size <= 0 {
-		return nil, nil
-	}
-	duplicate, err := s.Catalog.FindVideoByFileSignature(ctx, fileName, size)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if duplicate == nil || duplicate.ID == currentID {
-		return nil, nil
-	}
-	return duplicate, nil
 }
 
 func videoIDFilePart(fileID string) string {

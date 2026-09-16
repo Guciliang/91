@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS videos (
     fingerprint_status TEXT DEFAULT 'pending',  -- pending / ready / failed
     fingerprint_error  TEXT DEFAULT '',
     parent_id        TEXT,
+    ancestor_dir_ids TEXT NOT NULL DEFAULT '',  -- JSON array；扫描起点到直接父目录（含两端）
     dir_name         TEXT DEFAULT '',           -- 所在目录名（扫盘时落库，供标签重算使用）
     title            TEXT NOT NULL,
     author           TEXT,
@@ -164,6 +165,40 @@ CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_hash
 CREATE INDEX IF NOT EXISTS idx_deleted_videos_drive_signature
     ON deleted_videos(drive_id, file_name, size_bytes);
 
+-- Internal decision history, independent of tombstones and public visibility.
+-- Snapshots and evidence survive subsequent renames, merges and source removal.
+-- Repeated observations of an identical decision update one record.
+CREATE TABLE IF NOT EXISTS duplicate_records (
+    record_key          TEXT PRIMARY KEY,
+    origin              TEXT NOT NULL,
+    outcome             TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    video_id            TEXT NOT NULL,
+    drive_id            TEXT NOT NULL,
+    file_id             TEXT NOT NULL,
+    file_name           TEXT NOT NULL,
+    size_bytes          INTEGER NOT NULL,
+    canonical_video_id  TEXT NOT NULL,
+    matched_video_id    TEXT NOT NULL,
+    selection_reason    TEXT NOT NULL,
+    source_snapshot     TEXT NOT NULL,
+    canonical_snapshot  TEXT NOT NULL,
+    matched_snapshot    TEXT NOT NULL,
+    selected_snapshot   TEXT NOT NULL,
+    evidence            TEXT NOT NULL,
+    first_seen_at       INTEGER NOT NULL,
+    last_seen_at        INTEGER NOT NULL,
+    occurrences         INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_source
+    ON duplicate_records(drive_id, file_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_reason
+    ON duplicate_records(reason, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_canonical
+    ON duplicate_records(canonical_video_id);
+CREATE INDEX IF NOT EXISTS idx_duplicate_records_video_outcome
+    ON duplicate_records(video_id, outcome);
+
 -- 爬虫来源记录。用于把已确认重复的 source_id 写回 seen 列表，
 -- 避免后续爬虫反复下载同一个候选视频。
 CREATE TABLE IF NOT EXISTS crawler_seen_sources (
@@ -208,15 +243,23 @@ CREATE TABLE IF NOT EXISTS drives (
     credentials   TEXT,                          -- JSON: cookie / refresh_token 等
     status        TEXT DEFAULT 'disconnected',   -- disconnected / ok / error
     last_error    TEXT,
-    -- 是否给该盘生成预览视频：1 开 / 0 关。封面生成不受影响。
-    -- 替代了早期的全局 preview.enabled 设置（保留旧 setting 行不再读）。
-    teaser_enabled INTEGER NOT NULL DEFAULT 1,
     -- 扫描时要跳过的目录 ID 集合（JSON array of string）。命中其中任意一个的目录及其
-    -- 全部子目录都不会被递归扫描，也不会进入 SeenFileIDs / VisitedDirIDs 统计。
+    -- 全部子目录都不会被递归扫描，并进入发现快照的策略排除集合 X。
     -- 替代了早期硬编码"影视"目录的特例分支。
     skip_dir_ids  TEXT NOT NULL DEFAULT '[]',
+    -- 上一次完成精确策略清理时使用的跳过目录集合；NULL 表示从未执行。
+    skip_cleanup_dir_ids TEXT,
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
+);
+
+-- 升级前无祖先链记录的补课进度按跳过目录保存。一个永久不可达的目录
+-- 不会迫使已经完成的其它跳过目录在每次扫盘时重复遍历。
+CREATE TABLE IF NOT EXISTS drive_skip_cleanup_legacy_dirs (
+    drive_id     TEXT NOT NULL,
+    dir_id       TEXT NOT NULL,
+    completed_at INTEGER NOT NULL,
+    PRIMARY KEY (drive_id, dir_id)
 );
 
 -- 扫描任务状态
@@ -227,12 +270,13 @@ CREATE TABLE IF NOT EXISTS scans (
     finished_at INTEGER,
     scanned     INTEGER DEFAULT 0,
     added       INTEGER DEFAULT 0,
-    error       TEXT
+    error       TEXT,
+    result      TEXT
 );
 
--- A provider listing is not authoritative enough to delete catalog data after
--- one empty response. Missing files are confirmed across complete successful
--- scans; seeing the file again clears the counter immediately.
+-- Presence-authoritative discovery removes eligible missing files immediately.
+-- Incomplete discovery uses this table to require two eligible missing
+-- observations; seeing the file clears its counter in either mode.
 CREATE TABLE IF NOT EXISTS drive_scan_misses (
     drive_id            TEXT NOT NULL,
     file_id             TEXT NOT NULL,
@@ -283,11 +327,17 @@ CREATE INDEX IF NOT EXISTS idx_video_shares_video
 CREATE INDEX IF NOT EXISTS idx_video_shares_session
     ON video_shares(id, session_hash, session_expires_at);
 
--- 管理后台登录永久封禁 IP
+-- 管理后台登录封禁 IP，服务启动或后台解封时清理
 CREATE TABLE IF NOT EXISTS banned_login_ips (
     ip         TEXT PRIMARY KEY,
     reason     TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS login_failures (
+    ip              TEXT PRIMARY KEY,
+    failure_count   INTEGER NOT NULL,
+    first_failed_at INTEGER NOT NULL
 );
 
 -- 全局 key-value 设置（preview 开关等）

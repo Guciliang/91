@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -49,8 +46,8 @@ const (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "hash-password" {
-		if err := runHashPasswordCommand(os.Stdin, os.Stdout); err != nil {
+	if handled, err := runServerCommand(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); handled {
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -58,12 +55,9 @@ func main() {
 	}
 	// stderr is always kept as the operational log sink. The durable admin log
 	// file is attached after configuration paths have been resolved.
-	log.SetOutput(os.Stderr)
+	log.SetOutput(applog.Output(os.Stderr, nil))
 
-	cfgPath := "./config.yaml"
-	if v := os.Getenv("VIDEO_CONFIG"); v != "" {
-		cfgPath = v
-	}
+	cfgPath := applicationConfigPath()
 	workingDir, err := os.Getwd()
 	if err != nil {
 		log.Fatalf("resolve startup directory: %v", err)
@@ -100,6 +94,14 @@ func main() {
 		}
 	}
 
+	logStore := openRuntimeLogs(cfg.Logging)
+	if logStore != nil {
+		defer func() {
+			if err := logStore.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close runtime log: %s\n", applog.Redact(err.Error()))
+			}
+		}()
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Storage.DBPath), 0o755); err != nil {
 		log.Fatalf("mkdir db dir: %v", err)
 	}
@@ -127,6 +129,9 @@ func main() {
 		log.Fatalf("open catalog: %v", err)
 	}
 	defer cat.Close()
+	if err := cat.ResetLoginProtection(context.Background()); err != nil {
+		log.Fatalf("reset login protection at startup: %v", err)
+	}
 	if appliedRestore != nil {
 		if err := backup.CommitAppliedRestore(appliedRestore); err != nil {
 			log.Printf("[restore] restored catalog opened, but rollback cleanup/report write failed: %v", err)
@@ -137,6 +142,9 @@ func main() {
 	configManager, err := config.NewManager(cfgPath)
 	if err != nil {
 		log.Fatalf("configure config manager: %v", err)
+	}
+	if _, err := migrateLegacyAdmin(context.Background(), cat, configManager); err != nil {
+		log.Fatalf("migrate administrator configuration: %v", err)
 	}
 	legacyRuntimeSettings, err := loadLegacyRuntimeSettings(context.Background(), cat)
 	if err != nil {
@@ -161,29 +169,6 @@ func main() {
 		log.Printf("[config] migrated runtime settings into config.yaml")
 	}
 
-	var logStore *applog.Store
-	if cfg.Logging.IsFileEnabled() {
-		logStore, err = applog.Open(applog.Config{
-			Directory:         cfg.Logging.Directory,
-			MaxLineBytes:      applog.DefaultMaxLineBytes,
-			MaxFileSizeBytes:  int64(cfg.Logging.MaxFileSizeMB) * 1024 * 1024,
-			MaxTotalSizeBytes: int64(cfg.Logging.MaxTotalSizeMB) * 1024 * 1024,
-		})
-		if err != nil {
-			log.Printf("[logging] file logging unavailable: %v", err)
-			logStore = nil
-		} else {
-			defer func() {
-				if closeErr := logStore.Close(); closeErr != nil {
-					fmt.Fprintf(os.Stderr, "close runtime log: %v\n", closeErr)
-				}
-			}()
-			log.SetOutput(io.MultiWriter(os.Stderr, logStore.Writer(applog.SourceApplication)))
-			log.Printf("[logging] durable runtime log enabled dir=%s max_file_mb=%d max_total_mb=%d",
-				logStore.Directory(), cfg.Logging.MaxFileSizeMB, cfg.Logging.MaxTotalSizeMB)
-		}
-	}
-
 	app := &App{
 		cfg:                cfg,
 		cat:                cat,
@@ -192,7 +177,6 @@ func main() {
 		workers:            make(map[string]*preview.Worker),
 		thumbWorkers:       make(map[string]*preview.ThumbWorker),
 		fingerprintWorkers: make(map[string]*fingerprint.Worker),
-		previewConcurrency: cfg.Preview.Concurrency,
 		scriptCrawlers:     make(map[string]*scriptcrawler.Crawler),
 	}
 	app.proxy = proxy.New(app.registry)
@@ -202,6 +186,7 @@ func main() {
 		Catalog:          cat,
 		Registry:         app.registry,
 		GetDrive:         app.activeDriveConfig,
+		PreviewEnabled:   app.previewEnabled,
 		CommonThumbDir:   app.commonThumbsDir(),
 		OnUploadProgress: app.updateCrawlerUploadProgress,
 	})
@@ -262,18 +247,7 @@ func main() {
 		log.Fatalf("start remote upload: %v", err)
 	}
 
-	authr := &auth.Authenticator{
-		Username: cfg.Server.Admin.Username,
-		Password: cfg.Server.Admin.Password,
-		Catalog:  cat,
-	}
-	setupRequired := config.RequiresAdminSetup(cfg)
-	if !setupRequired {
-		if err := ensureConfigAdminUser(ctx, cat, cfg); err != nil {
-			log.Printf("[auth] migrate config admin: %v", err)
-		}
-	}
-	var setupMu sync.Mutex
+	authr := &auth.Authenticator{Catalog: cat}
 	versionFilePath := strings.TrimSpace(os.Getenv("VIDEO_VERSION_FILE"))
 	if versionFilePath == "" {
 		versionFilePath = filepath.Join(filepath.Dir(cfgPath), ".version")
@@ -333,49 +307,21 @@ func main() {
 			_, err := app.deleteVideo(reqCtx, videoID, false)
 			return err
 		},
-		GetTheme: func() string { return app.Theme() },
+		GetTheme:          func() string { return app.Theme() },
+		GetPreviewEnabled: app.previewEnabled,
 	}
 	app.onTagsChanged = apiServer.InvalidateTagCache
 
 	adminServer := &api.AdminServer{
-		Catalog:         cat,
-		Auth:            authr,
-		Backups:         backupManager,
-		BackupTransfers: backupTransferManager,
-		Logs:            logStore,
-		ConfigManager:   configManager,
-		VersionFilePath: versionFilePath,
-		ImageVersion:    imageVersion,
-		GitHubRepo:      githubRepo,
-		SetupRequired: func() bool {
-			setupMu.Lock()
-			defer setupMu.Unlock()
-			return setupRequired
-		},
-		OnSetup: func(username, password string) error {
-			setupMu.Lock()
-			defer setupMu.Unlock()
-			if !setupRequired {
-				return nil
-			}
-			if err := configManager.UpdateAdminCredentials(username, password); err != nil {
-				return err
-			}
-			hashed, err := auth.HashPassword(password)
-			if err != nil {
-				return err
-			}
-			if _, err := cat.CreateUser(ctx, username, hashed, "admin"); err != nil {
-				return err
-			}
-			fileConfig.Server.Admin.Username = username
-			fileConfig.Server.Admin.Password = password
-			cfg.Server.Admin.Username = username
-			cfg.Server.Admin.Password = password
-			authr.SetCredentials(username, password)
-			setupRequired = false
-			return nil
-		},
+		Catalog:                cat,
+		Auth:                   authr,
+		Backups:                backupManager,
+		BackupTransfers:        backupTransferManager,
+		Logs:                   logStore,
+		ConfigManager:          configManager,
+		VersionFilePath:        versionFilePath,
+		ImageVersion:           imageVersion,
+		GitHubRepo:             githubRepo,
 		LocalPreviewDir:        cfg.Storage.LocalPreviewDir,
 		BeginDriveConfigUpdate: app.beginDriveConfigUpdate,
 		OnDriveRuntimeConfigChanged: func(driveID string) error {
@@ -391,16 +337,17 @@ func main() {
 		OnDriveRemoved: func(driveID string) {
 			app.detachDrive(driveID)
 		},
-		OnScanRequested: func(driveID string) bool {
+		OnScanRequested: func(requestCtx context.Context, driveID string) bool {
+			taskCtx := applog.WithFields(ctx, applog.ContextFields(requestCtx))
 			// 爬虫类 drive 的"重扫"等同于手动触发一次爬取；其它 drive 走标准 scan
 			isScriptCrawler := false
 			if d, err := app.cat.GetDrive(ctx, driveID); err == nil && d != nil {
 				isScriptCrawler = d.Kind == scriptcrawler.Kind
 			}
 			if isScriptCrawler {
-				return app.scheduleScriptCrawlerCrawl(ctx, driveID)
+				return app.scheduleScriptCrawlerCrawl(taskCtx, driveID)
 			}
-			return app.scheduleScan(ctx, driveID)
+			return app.scheduleScan(taskCtx, driveID)
 		},
 		OnCrawlerUploadRequested: func(driveID string) (bool, string) {
 			return app.scheduleManualCrawlerUploadMigration(ctx, driveID)
@@ -451,18 +398,6 @@ func main() {
 		GetPreviewGenerationVideoIDs: func() map[string]bool {
 			return app.previewGenerationVideoIDs()
 		},
-		OnTeaserEnabledChanged: func(driveID string, enabled bool) {
-			// 从关到开时立刻补扫该盘 pending 预览视频，行为对齐旧的"全局开关从关到开"。
-			// 关闭分支不需要做事 —— 入队前会重新查 catalog，新的 enqueue 自然停。
-			if !enabled {
-				return
-			}
-			app.mu.Lock()
-			worker := app.workers[driveID]
-			thumbWorker := app.thumbWorkers[driveID]
-			app.mu.Unlock()
-			app.scheduleDriveGenerationEnqueue(ctx, driveID, worker, thumbWorker)
-		},
 		GetTheme: func() string { return app.Theme() },
 		SetTheme: func(theme string) error {
 			return app.SetTheme(ctx, theme)
@@ -496,8 +431,8 @@ func main() {
 	adminServer.Register(r)
 	mountFrontend(r)
 
-	// 凌晨流水线：每天按后台可热更新的 HH:mm + IANA 时区触发一次，串行跑
-	//   Phase 1 扫所有非爬虫 / localupload 网盘 + 连续缺失确认清理 + 入队封面/预览视频
+	// 凌晨流水线：每天按后台可热更新的 HH:mm + IANA 时区触发一次，依次运行以下阶段：
+	//   Phase 1 并行扫所有非爬虫 / localupload 网盘 + 跳过策略/缺失确认清理 + 入队封面/预览视频
 	//   Phase 1b 对账本地封面/预览文件 + 将丢失资产重置入队并等待补生成
 	//   Phase 2 脚本爬虫 + 入队预览视频
 	//   Phase 3 爬虫本地视频 → 云盘上传
@@ -573,6 +508,24 @@ func main() {
 	backupManager.Close()
 }
 
+func openRuntimeLogs(cfg config.Logging) *applog.Store {
+	if !cfg.IsFileEnabled() {
+		return nil
+	}
+	store, err := applog.Open(applog.Config{
+		Directory: cfg.Directory, MaxLineBytes: applog.DefaultMaxLineBytes,
+		MaxFileSizeBytes:  int64(cfg.MaxFileSizeMB) * 1024 * 1024,
+		MaxTotalSizeBytes: int64(cfg.MaxTotalSizeMB) * 1024 * 1024,
+	})
+	if err != nil {
+		log.Printf("[logging] file logging unavailable: %v", err)
+		return nil
+	}
+	log.SetOutput(applog.Output(os.Stderr, store))
+	log.Printf("[logging] durable runtime log enabled dir=%s max_file_mb=%d max_total_mb=%d", store.Directory(), cfg.MaxFileSizeMB, cfg.MaxTotalSizeMB)
+	return store
+}
+
 func loadApplicationConfig(path, workingDir string) (*config.Config, *config.Config, error) {
 	fileConfig, err := config.Load(path)
 	if err != nil {
@@ -628,27 +581,5 @@ func runHashPasswordCommand(r io.Reader, w io.Writer) error {
 		return fmt.Errorf("hash password: %w", err)
 	}
 	_, err = fmt.Fprintln(w, hashed)
-	return err
-}
-
-func ensureConfigAdminUser(ctx context.Context, cat *catalog.Catalog, cfg *config.Config) error {
-	if cat == nil || cfg == nil {
-		return nil
-	}
-	username := strings.TrimSpace(cfg.Server.Admin.Username)
-	password := cfg.Server.Admin.Password
-	if username == "" || password == "" {
-		return nil
-	}
-	if _, err := cat.GetUserByUsername(ctx, username); err == nil {
-		return nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	hashed, err := auth.HashPassword(password)
-	if err != nil {
-		return err
-	}
-	_, err = cat.CreateUser(ctx, username, hashed, "admin")
 	return err
 }

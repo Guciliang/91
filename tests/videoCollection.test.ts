@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { createMemoryRouter } from "react-router";
 
 const componentSource = readFileSync(
   new URL("../src/components/MobileVideoCollection.tsx", import.meta.url),
@@ -208,7 +209,7 @@ test("desktop collection creates thumbnail resources only near the viewport", ()
     activePreviewHookSource,
     /function useIsActivePreview\(videoID: string\): boolean[\s\S]*?previewController\.getActiveId\(\) === videoID/
   );
-  assert.match(railSource, /import \{ useIsActivePreview \}/);
+  assert.match(railSource, /import \{ useIsActivePreview, usePreviewEnabled \}/);
   assert.doesNotMatch(railSource, /function useActivePreviewId/);
   assert.doesNotMatch(railSource, /media\.addEventListener\("change", update\)/);
 });
@@ -244,7 +245,7 @@ test("desktop and mobile collections request previews and share preview behavior
     /shouldInterceptPreviewTap\([\s\S]*?previewActive/
   );
   assert.match(componentSource, /previewController\.setActiveId\(video\.id\)/);
-  assert.match(componentSource, /import \{ useIsActivePreview \}/);
+  assert.match(componentSource, /import \{ useIsActivePreview, usePreviewEnabled \}/);
   assert.match(
     componentSource,
     /function startTouchPreviewIntent\(\)[\s\S]*?setPreviewState\("intent"\)[\s\S]*?window\.setTimeout\([\s\S]*?setShouldRenderPreview\(true\)[\s\S]*?TOUCH_PREVIEW_DELAY_MS/
@@ -409,6 +410,88 @@ test("mobile collection uses an accessible scroll-locked bottom sheet", () => {
   assert.match(componentSource, /aria-current=\{current \? "page" : undefined\}/);
 });
 
+test("mobile collection sheet is one browser-history layer", () => {
+  assert.match(componentSource, /useNavigate\(\)/);
+  assert.match(
+    componentSource,
+    /const open = collectionSheetVideoId\(locationState\) === videoId/
+  );
+  assert.match(
+    componentSource,
+    /navigate\(routeToPath\(location\), \{[\s\S]*?\[COLLECTION_SHEET_HISTORY_STATE_KEY\]: \{ videoId \}/
+  );
+  assert.match(
+    componentSource,
+    /function closeSheet\([\s\S]*?navigate\(-1\)/
+  );
+  assert.match(
+    componentSource,
+    /const detailNavigationState = useMemo\([\s\S]*?continueVideoDetailNavigationState\(returnPath, location\.state\)/
+  );
+  assert.match(
+    componentSource,
+    /<Link\s+to=\{video\.href\}\s+replace\s+state=\{navigationState\}/
+  );
+  assert.doesNotMatch(componentSource, /setOpen\(/);
+});
+
+test("browser back closes the collection layer before leaving the video", async () => {
+  const router = createMemoryRouter([{ path: "*", element: null }], {
+    initialEntries: [
+      "/list",
+      { pathname: "/video/current", state: { from: "/list" } },
+    ],
+    initialIndex: 1,
+  });
+
+  try {
+    await router.navigate("/video/current", {
+      state: {
+        from: "/list",
+        mobileVideoCollection: { videoId: "current" },
+      },
+    });
+    await router.navigate(-1);
+
+    assert.equal(router.state.location.pathname, "/video/current");
+    assert.deepEqual(router.state.location.state, { from: "/list" });
+
+    await router.navigate(-1);
+    assert.equal(router.state.location.pathname, "/list");
+  } finally {
+    router.dispose();
+  }
+});
+
+test("selecting another collection item replaces the open sheet layer", async () => {
+  const router = createMemoryRouter([{ path: "*", element: null }], {
+    initialEntries: [
+      "/list",
+      { pathname: "/video/current", state: { from: "/list" } },
+    ],
+    initialIndex: 1,
+  });
+
+  try {
+    await router.navigate("/video/current", {
+      state: {
+        from: "/list",
+        mobileVideoCollection: { videoId: "current" },
+      },
+    });
+    await router.navigate("/video/next", {
+      replace: true,
+      state: { from: "/list" },
+    });
+    await router.navigate(-1);
+
+    assert.equal(router.state.location.pathname, "/video/current");
+    assert.deepEqual(router.state.location.state, { from: "/list" });
+  } finally {
+    router.dispose();
+  }
+});
+
 test("collection view counts use the shared eye icon", () => {
   assert.match(
     componentSource,
@@ -459,12 +542,12 @@ test("collection sheet follows a downward drag and dismisses past a threshold", 
   assert.match(componentSource, /onPointerDown=\{beginSheetDrag\}/);
   assert.match(componentSource, /setPointerCapture\(pointerId\)/);
   assert.match(componentSource, /offset >= distanceThreshold/);
-  assert.match(componentSource, /velocityY >= SHEET_DISMISS_VELOCITY/);
+  assert.doesNotMatch(componentSource, /velocityY|SHEET_DISMISS_(?:FLICK|VELOCITY)/);
+  assert.match(componentSource, /SHEET_DISMISS_HEIGHT_RATIO\s*=\s*0\.25/);
   assert.match(
     componentSource,
-    /SHEET_DISMISS_FLICK_MIN_DISTANCE\s*=\s*64[\s\S]*?offset >= SHEET_DISMISS_FLICK_MIN_DISTANCE/
+    /sheetHeight \* SHEET_DISMISS_HEIGHT_RATIO/
   );
-  assert.match(componentSource, /sheetHeight \* 0\.22/);
   assert.match(componentSource, /finishSheetDrag\(event, true\)/);
   assert.match(
     stylesSource,
@@ -473,6 +556,17 @@ test("collection sheet follows a downward drag and dismisses past a threshold", 
   assert.match(
     stylesSource,
     /\.vd-collection-sheet\.is-dragging\s*\{[\s\S]*?transition:\s*none;/
+  );
+});
+
+test("collection toolbar is part of the drag surface without stealing controls", () => {
+  assert.match(
+    componentSource,
+    /<header className="vd-collection-sheet__head">[\s\S]*?<\/header>\s*<div className="vd-collection-sheet__toolbar">[\s\S]*?<\/div>\s*<\/div>\s*\{loading && !data/
+  );
+  assert.match(
+    componentSource,
+    /if \(target\.closest\("button, a, input, select, textarea"\)\) return/
   );
 });
 
@@ -521,6 +615,28 @@ test("detail, collection, and info cards use a compact mobile stack", () => {
   assert.match(
     stylesSource,
     /@media \(max-width:\s*768px\)[\s\S]*?\.vd-detail-panels\s*\{\s*gap:\s*10px;/
+  );
+});
+
+test("mobile recommendations use one layout gap without stacked top spacing", () => {
+  const mobileStyles = stylesSource.slice(
+    stylesSource.lastIndexOf("@media (max-width: 768px)")
+  );
+  assert.match(
+    mobileStyles,
+    /\.vd-layout\s*\{\s*gap:\s*var\(--space-4\);/
+  );
+
+  const railRules = Array.from(mobileStyles.matchAll(/\.vd-rail\s*\{([^}]*)\}/g));
+  assert.ok(railRules.length > 0);
+  for (const [, rule] of railRules) {
+    assert.match(rule, /border-top:\s*0;/);
+    assert.match(rule, /padding-top:\s*0;/);
+  }
+
+  assert.match(
+    mobileStyles,
+    /\.vd-rail__head\s*\{\s*padding:\s*0 0 var\(--space-3\);/
   );
 });
 

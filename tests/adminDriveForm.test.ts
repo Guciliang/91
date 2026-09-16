@@ -784,21 +784,7 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /<Upload size=\{12\} \/>\s*替换脚本文件/);
   assert.match(crawlerPageSource, /CrawlerUploadTargetField/);
   assert.match(crawlerPageSource, /uploadDriveId/);
-  assert.match(crawlerPageSource, /api\.setDriveTeaserEnabled/);
-  assert.match(crawlerPageSource, /toggleCrawlerTeasers/);
-  assert.match(crawlerPageSource, /className="admin-crawler-global-teaser"/);
-  assert.equal(crawlerPageSource.match(/className="admin-crawler-global-teaser"/g)?.length, 1);
-  assert.match(crawlerPageSource, /const allCrawlerTeasersEnabled = list\.every/);
-  assert.doesNotMatch(crawlerPageSource, /暂无爬虫，新增后默认开启预览视频生成/);
-  assert.match(
-    crawlerPageSource,
-    /\{hasCrawlers && \(\s*<div className="admin-crawler-list__controls">\s*<div className="admin-crawler-global-teaser">/
-  );
-  assert.doesNotMatch(crawlerPageSource, /admin-crawler-row__preview-toggle|onToggleTeaser/);
-  assert.match(crawlerPageSource, /className=\{`toggle-switch \$\{allCrawlerTeasersEnabled \? "is-on" : ""\}/);
-  assert.match(crawlerPageSource, /role="switch"/);
-  assert.match(crawlerPageSource, /aria-checked=\{allCrawlerTeasersEnabled\}/);
-  assert.match(crawlerPageSource, /className="toggle-switch__dot"/);
+  assert.doesNotMatch(crawlerPageSource, /setDriveTeaserEnabled|toggleCrawlerTeasers|admin-crawler-global-teaser|allCrawlerTeasersEnabled/);
   assert.match(crawlerPageSource, /预览视频/);
   assert.doesNotMatch(crawlerPageSource, /admin-crawler-preview-card-toggle/);
   assert.doesNotMatch(crawlerPageSource, /预览：开/);
@@ -821,8 +807,6 @@ test("crawler management is a separate admin section", () => {
   assert.doesNotMatch(crawlerPageSource, /label: "本轮总数"/);
   assert.doesNotMatch(crawlerPageSource, /admin-crawler-preview-card-toggle \$\{crawler\.teaserEnabled/);
   assert.doesNotMatch(adminCss, /admin-crawler-preview-card-toggle\.is-on/);
-  assert.match(adminCss, /\.admin-crawler-list__controls\s*\{[^}]*align-items\s*:\s*flex-start;[^}]*justify-content\s*:\s*flex-start/s);
-  assert.match(adminCss, /\.admin-crawler-global-teaser\s*\{[^}]*display\s*:\s*inline-grid;[^}]*justify-items\s*:\s*center/s);
   assert.match(adminCss, /\.admin-crawler-console\s*\{[^}]*width\s*:\s*min\(100%,\s*920px\);[^}]*margin-inline\s*:\s*auto/s);
   assert.match(adminCss, /\.admin-crawler-list\s*\{[^}]*border\s*:\s*0;[^}]*background\s*:\s*transparent;[^}]*box-shadow\s*:\s*none/s);
   assert.match(adminCss, /\.admin-crawler-table\s*\{[^}]*display\s*:\s*grid;[^}]*gap\s*:\s*var\(--space-3\);[^}]*padding\s*:\s*var\(--space-4\)/s);
@@ -848,7 +832,7 @@ test("crawler management is a separate admin section", () => {
   assert.match(apiSource, /uploadDriveId\?: string/);
   assert.match(apiSource, /uploadProxy\?: string/);
   assert.match(apiSource, /paused: boolean/);
-  assert.match(apiSource, /teaserEnabled: boolean/);
+  assert.doesNotMatch(apiSource, /teaserEnabled: boolean/);
   assert.doesNotMatch(apiSource, /teaserEnabled\?: boolean/);
   assert.match(apiSource, /"\/crawlers"/);
   assert.match(apiSource, /\/crawlers\/\$\{encodeURIComponent\(id\)\}\/upload/);
@@ -1075,10 +1059,7 @@ test("empty crawler list renders the shared empty visual", () => {
     crawlerPageSource,
     /<AdminEmptyVisual[\s\S]*?variant="empty"[\s\S]*?text="暂无爬虫"[\s\S]*?className="admin-crawler-empty"/
   );
-  assert.match(
-    crawlerPageSource,
-    /\{hasCrawlers && \([\s\S]*?className="admin-crawler-list__controls"[\s\S]*?\)\}\s*\{loading \? \(/
-  );
+  assert.doesNotMatch(crawlerPageSource, /admin-crawler-list__controls/);
   assert.doesNotMatch(crawlerPageSource, /<SpiderIcon size=\{28\} \/>/);
   assert.match(
     adminCss,
@@ -1313,6 +1294,13 @@ test("drive generation panel shows scan or crawler status first", () => {
   assert.match(constantsSource, /if \(state === "scanning"\) return "扫盘中"/);
 });
 
+test("drive scan results follow generation status in a separate card", () => {
+  assert.match(drivesPageSource, /<DriveGenerationPanel[\s\S]*?<ScanResultDetails\s+result=\{d\.scanGenerationStatus\?\.result\}\s+scanning=\{isGenerationBusy\(d\.scanGenerationStatus\?\.state \?\? "idle"\)\}\s*\/>[\s\S]*?本地存储占用/);
+  assert.doesNotMatch(driveComponentsSource, /ScanResultDetails|ScanStatusPanel/);
+  assert.match(drivesPageLoadingSource, /生成状态[\s\S]*?<ScanResultDetails loading \/>[\s\S]*?本地存储占用/);
+  assert.doesNotMatch(adminCss, /\.admin-drive-generation|\.admin-drive-scan__/);
+});
+
 test("drive management has no spider91 storage branch", () => {
   assert.doesNotMatch(drivesPageSource, /spider91|91Spider/);
   assert.doesNotMatch(constantsSource, /spider91|91Spider/);
@@ -1357,8 +1345,9 @@ test("drive detail refresh state uses the detail skeleton without list actions",
   assert.match(skipDirsPanelSource, /\{showLoading && <SkipDirsLoadingIndicator \/>\}/);
   assert.match(
     skipDirsLoadingIndicatorSource,
-    /className="lds-ellipsis is-xs"/
+    /<div className="admin-skipdirs-status" role="status">\s*加载中\s*<\/div>/
   );
+  assert.doesNotMatch(skipDirsLoadingIndicatorSource, /lds-ellipsis|<span|aria-hidden/);
 });
 
 test("drive discard confirmation matches delete confirmation modal styling", () => {
@@ -1440,34 +1429,84 @@ test("drive generation actions are iconless and evenly distributed", () => {
   );
 });
 
-test("drive preview generation uses an accessible slider switch", () => {
-  assert.match(
-    driveComponentsSource,
-    /className=\{`toggle-switch \$\{d\.teaserEnabled \? "is-on" : ""\}/
-  );
-  assert.match(driveComponentsSource, /role="switch"/);
-  assert.match(driveComponentsSource, /aria-checked=\{d\.teaserEnabled\}/);
-  assert.match(driveComponentsSource, /className="toggle-switch__dot"/);
-  assert.match(
-    driveComponentsSource,
-    /disabled=\{togglingTeaserId === d\.id\}/
-  );
-  assert.doesNotMatch(driveComponentsSource, /previewSettingBusy|暂不能修改预览开关/);
-  assert.doesNotMatch(driveComponentsSource, /预览视频：开|预览视频：关|PowerOff/);
+test("drive preview generation has no per-drive switch", () => {
+  assert.doesNotMatch(driveComponentsSource, /teaserEnabled|onToggleTeaser|togglingTeaserId/);
+  assert.doesNotMatch(drivesPageSource, /setDriveTeaserEnabled|handleToggleTeaser/);
+  assert.doesNotMatch(apiSource, /setDriveTeaserEnabled|teaser-enabled/);
 });
 
-test("drive skip directory tree uses a solid selection box without status pills", () => {
+test("skip-directory header uses the matching solid folder icon in loaded and loading views", () => {
+  assert.match(skipDirsPanelSource, /<SkipDirsIcon \/>/);
+  assert.match(drivesPageLoadingSource, /<SkipDirsIcon \/>/);
+  assert.doesNotMatch(skipDirsPanelSource, /FolderX/);
+  assert.doesNotMatch(drivesPageLoadingSource, /FolderX/);
+});
+
+test("drive skip directory tree uses persistent visibility icons without extra actions", () => {
   assert.doesNotMatch(skipDirsPanelSource, /SelectedDirsChips/);
   assert.doesNotMatch(skipDirsPanelSource, /admin-mono-cell/);
   assert.doesNotMatch(skipDirsPanelSource, /根目录/);
   assert.match(skipDirsPanelSource, /\{name\}/);
   assert.doesNotMatch(skipDirsPanelSource, /admin-skipdirs-flag|已跳过/);
-  assert.doesNotMatch(adminCss, /\.admin-skipdirs-checkbox(?::checked)?::before/);
+  assert.doesNotMatch(skipDirsPanelSource, /type="checkbox"|admin-skipdirs-checkbox/);
+  assert.doesNotMatch(adminCss, /\.admin-skipdirs-checkbox/);
+  assert.match(skipDirsPanelSource, /<EyeOff size=\{16\} aria-hidden="true" \/>/);
+  assert.match(skipDirsPanelSource, /<Eye size=\{16\} aria-hidden="true" \/>/);
+  assert.match(skipDirsPanelSource, /className=\{`admin-skipdirs-visibility\$\{isSelected \? " is-hidden" : ""\}`\}/);
   assert.match(
     adminCss,
-    /\.admin-skipdirs-checkbox:checked\s*\{[^}]*border-color:\s*var\(--accent\)[^}]*background:\s*var\(--accent\)/s
+    /\.admin-skipdirs-visibility\.is-hidden\s*\{[^}]*background:\s*var\(--accent-softer\);[^}]*color:\s*var\(--accent\);/s
   );
+  assert.match(skipDirsPanelSource, /aria-pressed=\{isSelected\}/);
+  assert.match(skipDirsPanelSource, /onClick=\{\(\) => onToggle\(id\)\}/);
+  assert.match(skipDirsPanelSource, /aria-label=\{visibilityLabel\}/);
+  assert.match(skipDirsPanelSource, /title=\{ancestorSkipped \?/);
+  assert.doesNotMatch(skipDirsPanelSource, /Trash2|Edit3|FolderPlus|onDoubleClick/);
+  assert.match(
+    adminCss,
+    /\.admin-skipdirs-visibility\s*\{[^}]*display:\s*grid;[^}]*flex:\s*0 0 28px;/s
+  );
+  assert.doesNotMatch(adminCss, /\.admin-skipdirs-visibility[^{}]*\{[^}]*(?:opacity:\s*0\s*;|visibility:\s*hidden|display:\s*none|pointer-events:\s*none)/s);
   assert.doesNotMatch(adminCss, /\.admin-skipdirs-flag\s*\{/);
+});
+
+test("drive directory rows use folder icons and independent expand and hide buttons", () => {
+  assert.match(skipDirsPanelSource, /<FolderOpen className="admin-skipdirs-folder"/);
+  assert.match(skipDirsPanelSource, /<Folder className="admin-skipdirs-folder"/);
+  assert.match(skipDirsPanelSource, /aria-expanded=\{open\}/);
+  assert.match(skipDirsPanelSource, /<span className="admin-skipdirs-name">\{name\}<\/span>\s*<\/button>/);
+  assert.match(skipDirsPanelSource, /const dimmed = ancestorSkipped \|\| isSelected/);
+  assert.match(skipDirsPanelSource, /listDriveDirChildren\(driveId, id \|\| undefined\)/);
+  assert.match(adminCss, /\.admin-skipdirs-row\s*\{[^}]*height:\s*32px;[^}]*18px/s);
+  assert.match(adminCss, /\.admin-skipdirs-toggle\s*\{[^}]*min-width:\s*0/s);
+  assert.match(adminCss, /\.admin-drive-detail-layout\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1\.2fr\) minmax\(0, 1fr\)/s);
+  assert.match(adminCss, /@media \(max-width: 1024px\)\s*\{\s*\.admin-drive-detail-layout\s*\{\s*grid-template-columns:\s*minmax\(0, 1fr\)/s);
+  assert.match(adminCss, /\.admin-skipdirs-toggle\.is-open \.admin-skipdirs-chevron\s*\{[^}]*transform:\s*rotate\(90deg\)/s);
+  assert.match(adminCss, /\.admin-skipdirs-visibility:focus-visible/);
+  assert.match(adminCss, /@media \(pointer: coarse\)\s*\{\s*\.admin-skipdirs-row\s*\{\s*height:\s*40px;/s);
+});
+
+test("drive skip directories follow status panels on mobile, including loading", () => {
+  for (const source of [drivesPageSource, drivesPageLoadingSource]) {
+    const info = source.indexOf('className="admin-drive-detail-layout__info"');
+    const status = source.indexOf('className="admin-drive-detail-layout__status"');
+    const skipDirs = source.indexOf('className="admin-drive-detail-layout__skip-dirs"');
+    const storage = source.indexOf("本地存储占用", status);
+    assert.ok(info >= 0 && status > info && skipDirs > status);
+    assert.ok(storage > status && storage < skipDirs);
+  }
+  assert.equal(drivesPageSource.match(/<SkipDirsPanel\b/g)?.length, 1);
+  assert.match(adminCss, /\.admin-drive-detail-layout\s*\{[^}]*grid-template-areas:\s*"info status"\s*"skip-dirs status"/s);
+  assert.match(adminCss, /@media \(max-width: 1024px\)\s*\{\s*\.admin-drive-detail-layout\s*\{[^}]*grid-template-areas:\s*"info"\s*"status"\s*"skip-dirs"/s);
+  assert.match(adminCss, /\.admin-drive-detail-layout > div > \.admin-detail-card:last-child\s*\{\s*margin-bottom:\s*0;/s);
+});
+
+test("drive skip directory panel omits the deferred policy cleanup notice", () => {
+  assert.doesNotMatch(
+    skipDirsPanelSource,
+    /下次扫盘时从媒体库移除|在此之前取消即可保留|手动标签和播放记录不会恢复/
+  );
+  assert.doesNotMatch(skipDirsPanelSource, /admin-skipdirs-note/);
 });
 
 test("drive skip directory selections auto-save without polling away local edits", () => {
@@ -1482,6 +1521,8 @@ test("drive skip directory selections auto-save without polling away local edits
     /draftRevisionRef\.current !== savedRevisionRef\.current/
   );
   assert.match(skipDirsPanelSource, /保存失败，正在重试…/);
+  assert.match(skipDirsPanelSource, /saved: "已保存"/);
+  assert.doesNotMatch(skipDirsPanelSource, /已自动保存并生效/);
   assert.match(skipDirsPanelSource, /已保存，任务结束后生效/);
   assert.doesNotMatch(skipDirsPanelSource, /drive\.scanGenerationStatus\?\.state/);
   assert.match(skipDirsPanelSource, /disabled=\{disabled\}/);

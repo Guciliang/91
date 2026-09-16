@@ -152,7 +152,15 @@ export async function fetchVideoFeed(
 
 export function fetchVideoDetail(id: string): Promise<VideoDetail | null> {
   return apiGet<VideoDetail>(`/api/video/${encodeURIComponent(id)}`).catch(
-    () => null
+    (error: unknown) => {
+      if (
+        error instanceof HTTPStatusError &&
+        (error.status === 404 || error.status === 410)
+      ) {
+        return null;
+      }
+      throw error;
+    }
   );
 }
 
@@ -184,14 +192,21 @@ export function prefetchVideoDetail(id: string): Promise<VideoDetail | null> {
   prefetchedVideoDetailsByID.set(id, entry);
   trimVideoDetailPrefetches();
 
-  void request.then((detail) => {
-    if (
-      detail === null &&
-      prefetchedVideoDetailsByID.get(id)?.request === request
-    ) {
-      prefetchedVideoDetailsByID.delete(id);
+  void request.then(
+    (detail) => {
+      if (
+        detail === null &&
+        prefetchedVideoDetailsByID.get(id)?.request === request
+      ) {
+        prefetchedVideoDetailsByID.delete(id);
+      }
+    },
+    () => {
+      if (prefetchedVideoDetailsByID.get(id)?.request === request) {
+        prefetchedVideoDetailsByID.delete(id);
+      }
     }
-  });
+  );
   return request;
 }
 
@@ -482,6 +497,18 @@ export function recordView(id: string): Promise<{ views: number }> {
     `/api/video/${encodeURIComponent(id)}/view`,
     { method: "POST" }
   );
+}
+
+/** Legacy counter-style like endpoint used by the immersive shorts UI. */
+export async function setVideoLike(id: string, liked: boolean): Promise<number> {
+  const result = await apiJSON<{ likes: number }>(
+    `/api/video/${encodeURIComponent(id)}/like`,
+    { method: liked ? "POST" : "DELETE" }
+  );
+  if (!result || !Number.isInteger(result.likes) || result.likes < 0) {
+    throw new Error("Invalid video like response");
+  }
+  return result.likes;
 }
 
 export type VideoReactionResult = VideoReactionCounts & {

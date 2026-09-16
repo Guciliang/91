@@ -1,3 +1,5 @@
+import { applyPreviewEnabled } from "../lib/previewSettings";
+
 // 管理后台 API 客户端
 // 所有请求都带 cookie，401 会抛错让路由守卫跳登录
 const BASE = "/admin/api";
@@ -118,6 +120,14 @@ export type AdminLogEntry = {
   bytes?: number;
   elapsed?: string;
   requestId?: string;
+  taskId?: string;
+  component?: string;
+  driveId?: string;
+  videoId?: string;
+  fileId?: string;
+  stage?: string;
+  error?: string;
+  stack?: string;
   message: string;
 };
 
@@ -128,19 +138,28 @@ export type AdminLogSnapshot = {
   maxStorageBytes: number;
   nextCursor?: string;
   reset?: boolean;
+  hasMore?: boolean;
+  writeHealth?: {
+    lastError?: string;
+    failedWrites: number;
+    lastFailureAt?: string;
+    lastSuccessAt?: string;
+  };
 };
 
-export function listLogs(
-  filters: {
+export type AdminLogFilters = {
     source?: AdminLogSource;
     level?: AdminLogLevel;
     method?: AdminLogMethod;
     query?: string;
     limit?: number;
     cursor?: string;
-  } = {},
-  signal?: AbortSignal
-) {
+    before?: number;
+    from?: string;
+    to?: string;
+};
+
+export function logQueryParams(filters: AdminLogFilters = {}) {
   const params = new URLSearchParams();
   params.set("limit", String(filters.limit ?? 500));
   if (filters.cursor) params.set("cursor", filters.cursor);
@@ -148,6 +167,14 @@ export function listLogs(
   if (filters.level) params.set("level", filters.level);
   if (filters.method) params.set("method", filters.method);
   if (filters.query?.trim()) params.set("q", filters.query.trim());
+  if (filters.before) params.set("before", String(filters.before));
+  if (filters.from) params.set("from", filters.from);
+  if (filters.to) params.set("to", filters.to);
+  return params;
+}
+
+export function listLogs(filters: AdminLogFilters = {}, signal?: AbortSignal) {
+  const params = logQueryParams(filters);
   const timeoutController = new AbortController();
   let timedOut = false;
   const abortFromCaller = () => timeoutController.abort();
@@ -169,6 +196,17 @@ export function listLogs(
       globalThis.clearTimeout(timeout);
       signal?.removeEventListener("abort", abortFromCaller);
     });
+}
+
+export async function downloadLogs(filters: AdminLogFilters = {}, signal?: AbortSignal) {
+  const params = logQueryParams(filters);
+  params.set("download", "1");
+  params.delete("cursor");
+  params.delete("before");
+  const response = await fetch(`${BASE}/logs?${params}`, { credentials: "include", signal });
+  if (response.status === 401) throw new UnauthorizedError();
+  if (!response.ok) throw new APIResponseError(response.status, "日志导出失败");
+  return response.blob();
 }
 
 export function clearLogs() {
@@ -493,11 +531,10 @@ export type AdminDrive = {
   hasCredential: boolean;
   /** 后端能力表声明该挂载可写入文件；爬虫上传目标据此展示。 */
   canUpload: boolean;
-  /** 当前是否给该盘生成预览视频（per-drive 开关，替代旧的全局 preview.enabled；封面不受影响）。 */
-  teaserEnabled: boolean;
   /**
    * 用户在 admin 配置的"扫描跳过目录"集合（drive 侧目录 fileID 列表）。
    * 命中其中任一目录时 scanner 直接跳过、不递归；空数组 = 不跳过任何目录。
+   * 名单变化后的下一次扫盘会先从媒体库清理对应目录，不删除网盘源文件。
    * 替代旧版硬编码 p115 "影视" 目录例外分支。
    */
   skipDirIds: string[];
@@ -520,6 +557,7 @@ export type AdminDrive = {
 };
 
 export type DriveGenerationStatus = {
+  result?: ScanResult;
   state: string;
   currentTitle?: string;
   queueLength: number;
@@ -624,7 +662,6 @@ export type AdminCrawler = {
   targetNew?: string;
   uploadDriveId?: string;
   paused: boolean;
-  teaserEnabled: boolean;
   lastCrawlAt?: number;
   scanGenerationStatus?: DriveGenerationStatus;
   thumbnailGenerationStatus?: DriveGenerationStatus;
@@ -889,21 +926,6 @@ export function getGuangYaPanQRStatus(deviceCode: string) {
   return request<GuangYaPanQRStatus>(`/drives/guangyapan/qr/status?${qs.toString()}`);
 }
 
-/**
- * 切换某个云盘的预览视频生成开关。点击网盘列表里行内的 toggle 按钮时调用。
- *
- * 后端会写 catalog.drives.teaser_enabled；空闲时立即生效，有任务时返回
- * deferred=true 并在当前任务结束后切换。
- */
-export function setDriveTeaserEnabled(id: string, enabled: boolean) {
-  return request<DriveConfigSaveResult & { teaserEnabled: boolean }>(
-    `/drives/${encodeURIComponent(id)}/teaser-enabled`,
-    {
-      method: "POST",
-      body: JSON.stringify({ enabled }),
-    }
-  );
-}
 
 /**
  * dirtree 接口的一个目录条目。前端构建按需展开的树时用。
@@ -930,7 +952,7 @@ export function listDriveDirChildren(id: string, parentId?: string) {
 
 /**
  * 整体覆盖某盘的"扫描跳过目录"集合（drive 侧目录 fileID）。
- * 传空数组 = 清空跳过列表。下次扫描时生效，不会立刻重扫。
+ * 传空数组 = 清空跳过列表。不会立刻重扫或删除；下次扫描时执行策略清理。
  */
 export function setDriveSkipDirIds(id: string, dirIds: string[]) {
   return request<DriveConfigSaveResult & { skipDirIds: string[] }>(
@@ -1240,7 +1262,10 @@ export type ConfigSaveResult = {
     nightlyStartTime: string;
     nightlyTimezone: string;
     builtinTagsEnabled: boolean;
+    previewEnabled: boolean;
     previewConcurrency: number;
+    thumbnailConcurrency: number;
+    fingerprintConcurrency: number;
   };
 };
 
@@ -1300,11 +1325,32 @@ export async function updateConfigYAML(
     throw new ConfigConflictError(await configResponseError(res));
   }
   if (!res.ok) throw new Error(await configResponseError(res));
-  return (await res.json()) as ConfigSaveResult;
+  const result = (await res.json()) as ConfigSaveResult;
+  applyPreviewEnabled(result.settings.previewEnabled);
+  return result;
 }
 
 
 // ---------- Jobs ----------
+
+export type ScanOutcome = "succeeded" | "partial" | "failed" | "canceled" | "skipped";
+
+export type ScanIssue = { stage: string; message: string };
+
+export type ScanResult = {
+  driveId: string;
+  state: ScanOutcome;
+  startedAt: string;
+  finishedAt: string;
+  scannedCount: number;
+  addedCount: number;
+  updatedCount: number;
+  duplicateCount: number;
+  tombstonedCount: number;
+  errorCount: number;
+  message?: string;
+  issues?: ScanIssue[];
+};
 
 /**
  * 扫描所有已配置的真实网盘，等待新视频资产处理完成后执行全库视频去重。
@@ -1317,6 +1363,9 @@ export type MaintenanceJobStatus = {
   queued: boolean;
   startedAt?: string;
   lastFinishedAt?: string;
+  outcome?: ScanOutcome;
+  scanResults?: ScanResult[];
+  issues?: ScanIssue[];
 };
 
 export function getScanAllJobStatus() {

@@ -242,8 +242,8 @@
   background-size: contain;
 }
 
-.video-player .art-video,
-.video-player .art-poster {
+.video-player__art .art-video,
+.video-player__art .art-poster {
   filter: brightness(var(--video-player-brightness, 1));
 }
 
@@ -296,17 +296,17 @@
     display: flex;
   }
 
-  .video-player .art-video-player,
-  .video-player .art-video {
+  .video-player__art,
+  .video-player__art .art-video {
     touch-action: pan-y;
   }
 
-  .video-player .art-video-player.art-fullscreen,
-  .video-player .art-video-player.art-fullscreen .art-video,
-  .video-player .art-video-player.art-fullscreen-web,
-  .video-player .art-video-player.art-fullscreen-web .art-video,
-  .video-player .art-video-player.art-manual-orientation,
-  .video-player .art-video-player.art-manual-orientation .art-video {
+  .video-player__art.art-fullscreen,
+  .video-player__art.art-fullscreen .art-video,
+  .video-player__art.art-fullscreen-web,
+  .video-player__art.art-fullscreen-web .art-video,
+  .video-player__art.art-manual-orientation,
+  .video-player__art.art-manual-orientation .art-video {
     touch-action: none;
   }
 }
@@ -910,10 +910,13 @@
   transition: all var(--transition-fast);
 }
 
-.vd-actions__pill:hover:not(:disabled) {
-  color: var(--text-strong);
-  background: rgba(255, 255, 255, 0.06);
-  border-color: var(--border-strong);
+/* Hover is transient feedback; it must not mask a selected reaction. */
+@media (hover: hover) and (pointer: fine) {
+  .vd-actions__pill:hover:not(:disabled):not(.is-active) {
+    color: var(--text-strong);
+    background: rgba(255, 255, 255, 0.06);
+    border-color: var(--border-strong);
+  }
 }
 
 .vd-actions__pill:focus-visible {
@@ -2304,8 +2307,12 @@
   transition: transform var(--transition-normal);
 }
 
-.vd-rail__link:hover .vd-rail__thumb img {
+.vd-rail__item[data-preview-enabled="true"] .vd-rail__link:hover .vd-rail__thumb img {
   transform: scale(1.04);
+}
+
+.vd-rail__item[data-preview-enabled="false"] .vd-rail__thumb img {
+  transition: none;
 }
 
 .vd-rail__duration,
@@ -2579,6 +2586,28 @@
   border-radius: var(--radius-lg);
 }
 
+.vd-empty__retry {
+  min-height: 44px;
+  margin-top: var(--space-4);
+  padding: 0 var(--space-5);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.vd-empty__retry:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+.vd-empty__retry:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* =========================================================
  * Responsive
  * ========================================================= */
@@ -2622,7 +2651,17 @@
   }
 
   .vd-layout {
-    gap: var(--space-5);
+    gap: var(--space-4);
+  }
+
+  /* The layout gap owns the transition from info panels to recommendations. */
+  .vd-rail {
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  .vd-rail__head {
+    padding: 0 0 var(--space-3);
   }
 
   .vd-main {
@@ -2883,10 +2922,6 @@
   }
 
   /* 推荐栏：横向紧凑列表。合集仍由移动端底部浮窗承载。 */
-  .vd-rail {
-    padding-top: var(--space-4);
-  }
-
   .vd-rail--collection-only,
   .vd-rail__tabs,
   .vd-rail__tabpanel--collection {

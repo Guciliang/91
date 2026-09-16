@@ -535,18 +535,28 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, link *drives.Strea
 	if link.HTTPClient != nil {
 		client = link.HTTPClient
 	}
-	if link.PassThroughRedirects && !forceRelay {
+	if link.PassThroughRedirects {
 		// A per-drive proxy still needs to be honoured when relaying a provider
 		// redirect. The standard client follows redirects, so clone only this
 		// small behavior difference.
-		if link.HTTPClient != nil {
-			clone := *link.HTTPClient
-			clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-				return http.ErrUseLastResponse
+		if !forceRelay {
+			if link.HTTPClient != nil {
+				clone := *link.HTTPClient
+				clone.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+					return http.ErrUseLastResponse
+				}
+				client = &clone
+			} else {
+				client = p.relay
 			}
+		} else if link.HTTPClient != nil && link.HTTPClient.CheckRedirect != nil {
+			// Some drives deliberately use ErrUseLastResponse for normal browser
+			// playback. Forced same-origin relay must instead consume the redirect
+			// and copy the final response, while retaining that drive's Transport,
+			// proxy, timeout, and cookie settings.
+			clone := *link.HTTPClient
+			clone.CheckRedirect = nil
 			client = &clone
-		} else {
-			client = p.relay
 		}
 	}
 	resp, err := client.Do(req)
@@ -554,7 +564,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, link *drives.Strea
 		return fmt.Errorf("request upstream: %w", err)
 	}
 	defer resp.Body.Close()
-	if link.PassThroughRedirects && isRedirectStatus(resp.StatusCode) {
+	if link.PassThroughRedirects && !forceRelay && isRedirectStatus(resp.StatusCode) {
 		return relayUpstreamRedirect(w, resp)
 	}
 	if resp.StatusCode >= http.StatusBadRequest && resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {

@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -16,14 +15,12 @@ import (
 )
 
 const (
-	DefaultAdminUsername      = "admin"
-	DefaultAdminPassword      = "admin123"
-	DefaultNightlyDisabled    = false
-	DefaultNightlyStartTime   = "01:00"
-	DefaultNightlyTimezone    = schedule.DefaultTimezone
-	DefaultBuiltinTagsEnabled = true
-	DefaultPreviewConcurrency = 1
-	MaxPreviewConcurrency     = 5
+	DefaultNightlyDisabled       = false
+	DefaultNightlyStartTime      = "01:00"
+	DefaultNightlyTimezone       = schedule.DefaultTimezone
+	DefaultBuiltinTagsEnabled    = true
+	DefaultGenerationConcurrency = 1
+	MaxGenerationConcurrency     = 5
 )
 
 var ErrInvalidNightlyStartTime = errors.New("nightly start time must use HH:mm")
@@ -40,6 +37,7 @@ type Config struct {
 	Logging      Logging      `yaml:"logging"`
 	Scanner      Scanner      `yaml:"scanner"`
 	Preview      Preview      `yaml:"preview"`
+	Generation   Generation   `yaml:"generation"`
 	Proxy        Proxy        `yaml:"proxy"`
 	Nightly      Nightly      `yaml:"nightly"`
 	Tags         Tags         `yaml:"tags"`
@@ -48,81 +46,11 @@ type Config struct {
 
 type Server struct {
 	Listen string `yaml:"listen"`
-	Admin  Admin  `yaml:"admin"`
 	// AllowedOrigins 是允许跨源访问的前端 Origin 白名单（如 "https://video.example.com"）。
 	// 默认空 → 不开启 CORS 跨源；同源部署（前后端在同一个域名 + 端口下）不需要配置此项。
 	// 浏览器对不在列表里的 Origin 不会拿到 Access-Control-Allow-Origin 头，自然就读不到响应。
 	// 不要写 "*"；带 cookie 的 CORS 必须是具体 Origin。
 	AllowedOrigins []string `yaml:"allowed_origins"`
-}
-
-type Admin struct {
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-}
-
-func RequiresAdminSetup(c *Config) bool {
-	if c == nil {
-		return true
-	}
-	username := strings.TrimSpace(c.Server.Admin.Username)
-	password := c.Server.Admin.Password
-	if username == "" || password == "" {
-		return true
-	}
-	return username == DefaultAdminUsername && password == DefaultAdminPassword
-}
-
-func WriteAdminCredentials(path, username, password string) error {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return fmt.Errorf("username is required")
-	}
-	if password == "" {
-		return fmt.Errorf("password is required")
-	}
-
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	out, err := rewriteAdminCredentials(b, username, password)
-	if err != nil {
-		return err
-	}
-
-	return writeFileAtomically(path, out, configFileMode(path))
-}
-
-// RedactAdminCredentials clears only the configured administrator username and
-// password while preserving the rest of the YAML document, including unknown
-// fields that may belong to a newer application version.
-func RedactAdminCredentials(data []byte) ([]byte, error) {
-	return rewriteAdminCredentials(data, "", "")
-}
-
-func rewriteAdminCredentials(data []byte, username, password string) ([]byte, error) {
-	var root yaml.Node
-	if err := yaml.Unmarshal(data, &root); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	doc := ensureDocumentMapping(&root)
-	server := ensureMappingValue(doc, "server")
-	admin := ensureMappingValue(server, "admin")
-	setScalarValue(admin, "username", username)
-	setScalarValue(admin, "password", password)
-
-	var out bytes.Buffer
-	enc := yaml.NewEncoder(&out)
-	enc.SetIndent(2)
-	if err := enc.Encode(&root); err != nil {
-		_ = enc.Close()
-		return nil, fmt.Errorf("encode config: %w", err)
-	}
-	if err := enc.Close(); err != nil {
-		return nil, fmt.Errorf("encode config: %w", err)
-	}
-	return out.Bytes(), nil
 }
 
 func ensureDocumentMapping(root *yaml.Node) *yaml.Node {
@@ -265,17 +193,21 @@ type Scanner struct {
 	VideoExtensions []string `yaml:"video_extensions"`
 }
 
+// Generation bounds work across every drive, independently of scan concurrency.
+type Generation struct {
+	ThumbnailConcurrency   int `yaml:"thumbnail_concurrency"`
+	PreviewConcurrency     int `yaml:"preview_concurrency"`
+	FingerprintConcurrency int `yaml:"fingerprint_concurrency"`
+}
+
 type Preview struct {
 	Enabled         bool   `yaml:"enabled"`
 	FFmpegPath      string `yaml:"ffmpeg_path"`
 	FFprobePath     string `yaml:"ffprobe_path"`
+	FFmpegThreads   int    `yaml:"ffmpeg_threads"`
 	DurationSeconds int    `yaml:"duration_seconds"`
 	Width           int    `yaml:"width"`
 	Segments        int    `yaml:"segments"`
-	// Concurrency is the number of video-level preview tasks admitted by each
-	// attached drive's worker. Segments inside one video task run serially. It is
-	// not a process-wide shared task budget.
-	Concurrency int `yaml:"concurrency"`
 }
 
 type Proxy struct {
@@ -365,7 +297,7 @@ func Load(path string) (*Config, error) {
 // loading and the management API use this function, so an accepted panel save
 // is guaranteed to satisfy the same invariants as a process restart.
 func Parse(data []byte) (*Config, error) {
-	var c Config
+	c := Config{Preview: Preview{Enabled: true}}
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -393,13 +325,13 @@ func (c *Config) applyDefaults() error {
 		c.Logging.Directory = "./data/logs"
 	}
 	if c.Logging.MaxFileSizeMB == 0 {
-		c.Logging.MaxFileSizeMB = 10
+		c.Logging.MaxFileSizeMB = 5
 	}
 	if c.Logging.MaxFileSizeMB < 1 || c.Logging.MaxFileSizeMB > 1024 {
 		return errors.New("logging.max_file_size_mb must be between 1 and 1024")
 	}
 	if c.Logging.MaxTotalSizeMB == 0 {
-		c.Logging.MaxTotalSizeMB = 50
+		c.Logging.MaxTotalSizeMB = 30
 	}
 	if c.Logging.MaxTotalSizeMB < c.Logging.MaxFileSizeMB || c.Logging.MaxTotalSizeMB > 10240 {
 		return errors.New("logging.max_total_size_mb must be at least max_file_size_mb and no more than 10240")
@@ -411,6 +343,27 @@ func (c *Config) applyDefaults() error {
 		c.Scanner.VideoExtensions = append([]string{}, defaultVideoExtensions...)
 	} else if isLegacyDefaultVideoExtensions(c.Scanner.VideoExtensions) {
 		c.Scanner.VideoExtensions = append(c.Scanner.VideoExtensions, ".strm")
+	}
+	for _, field := range []struct {
+		name  string
+		value *int
+	}{
+		{"thumbnail_concurrency", &c.Generation.ThumbnailConcurrency},
+		{"preview_concurrency", &c.Generation.PreviewConcurrency},
+		{"fingerprint_concurrency", &c.Generation.FingerprintConcurrency},
+	} {
+		if *field.value == 0 {
+			*field.value = DefaultGenerationConcurrency
+		}
+		if *field.value < 1 || *field.value > MaxGenerationConcurrency {
+			return fmt.Errorf("generation.%s must be between 1 and %d", field.name, MaxGenerationConcurrency)
+		}
+	}
+	if c.Preview.FFmpegThreads == 0 {
+		c.Preview.FFmpegThreads = 1
+	}
+	if c.Preview.FFmpegThreads < 1 || c.Preview.FFmpegThreads > 16 {
+		return fmt.Errorf("preview.ffmpeg_threads must be between 1 and 16")
 	}
 	if c.Preview.FFmpegPath == "" {
 		c.Preview.FFmpegPath = "ffmpeg"
@@ -426,15 +379,6 @@ func (c *Config) applyDefaults() error {
 	}
 	if c.Preview.Segments == 0 {
 		c.Preview.Segments = 3
-	}
-	if c.Preview.Concurrency == 0 {
-		c.Preview.Concurrency = DefaultPreviewConcurrency
-	}
-	if c.Preview.Concurrency < 1 || c.Preview.Concurrency > MaxPreviewConcurrency {
-		return fmt.Errorf(
-			"preview.concurrency must be between 1 and %d",
-			MaxPreviewConcurrency,
-		)
 	}
 	if c.Nightly.CronHour <= 0 || c.Nightly.CronHour > 23 {
 		c.Nightly.CronHour = 1

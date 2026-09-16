@@ -12,7 +12,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 )
 
-func TestLoginBansIPAfterThreeFailuresPermanently(t *testing.T) {
+func TestLoginBanLastsUntilStartupReset(t *testing.T) {
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
 		t.Fatalf("open catalog: %v", err)
@@ -24,15 +24,14 @@ func TestLoginBansIPAfterThreeFailuresPermanently(t *testing.T) {
 	})
 
 	now := time.Unix(1_700_000_000, 0)
+	createTestAdmin(t, cat)
 	authr := &Authenticator{
-		Username: "admin",
-		Password: "secret",
-		Catalog:  cat,
-		Now:      func() time.Time { return now },
+		Catalog: cat,
+		Now:     func() time.Time { return now },
 	}
 
 	for i := 0; i < loginFailThreshold-1; i++ {
-		ok, err := authr.Login(httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "wrong")
+		ok, err := login(authr, httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "wrong")
 		if err != nil {
 			t.Fatalf("failure %d returned error: %v", i+1, err)
 		}
@@ -41,7 +40,7 @@ func TestLoginBansIPAfterThreeFailuresPermanently(t *testing.T) {
 		}
 	}
 
-	ok, err := authr.Login(httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "wrong")
+	ok, err := login(authr, httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "wrong")
 	if ok {
 		t.Fatal("third failed login returned ok")
 	}
@@ -58,13 +57,44 @@ func TestLoginBansIPAfterThreeFailuresPermanently(t *testing.T) {
 	}
 
 	now = now.Add(loginFailWindow * 2)
-	reloaded := &Authenticator{Username: "admin", Password: "secret", Catalog: cat, Now: func() time.Time { return now }}
-	ok, err = reloaded.Login(httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "secret")
+	reloaded := &Authenticator{Catalog: cat, Now: func() time.Time { return now }}
+	ok, err = login(reloaded, httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "secret")
 	if ok {
-		t.Fatal("permanently banned ip logged in with correct credentials")
+		t.Fatal("banned ip logged in without a startup reset")
 	}
 	if !errors.Is(err, ErrLoginIPBanned) {
 		t.Fatalf("banned ip error = %v, want ErrLoginIPBanned", err)
+	}
+	if err := cat.ResetLoginProtection(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restarted := &Authenticator{Catalog: cat, Now: func() time.Time { return now }}
+	if ok, err := login(restarted, httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "wrong"); err != nil || ok {
+		t.Fatalf("first failure after restart ok=%v err=%v", ok, err)
+	}
+	if ok, err := login(restarted, httptest.NewRecorder(), loginRequest("203.0.113.10"), "admin", "secret"); err != nil || !ok {
+		t.Fatalf("login after restart ok=%v err=%v", ok, err)
+	}
+}
+
+func TestAuthenticatorsShareFailureCounts(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	for i := 0; i < loginFailThreshold; i++ {
+		a := &Authenticator{Catalog: cat}
+		role, err := a.UserLogin(httptest.NewRecorder(), loginRequest("203.0.113.22"), "missing-user", "wrong")
+		if role != "" {
+			t.Fatal("missing user logged in")
+		}
+		if i < loginFailThreshold-1 && err != nil {
+			t.Fatal(err)
+		}
+		if i == loginFailThreshold-1 && !errors.Is(err, ErrLoginIPBanned) {
+			t.Fatalf("shared failures did not ban IP: %v", err)
+		}
 	}
 }
 
@@ -79,21 +109,20 @@ func TestSuccessfulLoginClearsFailedLoginWindow(t *testing.T) {
 		}
 	})
 
+	createTestAdmin(t, cat)
 	authr := &Authenticator{
-		Username: "admin",
-		Password: "secret",
-		Catalog:  cat,
+		Catalog: cat,
 	}
 
 	for i := 0; i < loginFailThreshold-1; i++ {
-		if ok, err := authr.Login(httptest.NewRecorder(), loginRequest("203.0.113.11"), "admin", "wrong"); err != nil || ok {
+		if ok, err := login(authr, httptest.NewRecorder(), loginRequest("203.0.113.11"), "admin", "wrong"); err != nil || ok {
 			t.Fatalf("failed login %d ok=%v err=%v", i+1, ok, err)
 		}
 	}
-	if ok, err := authr.Login(httptest.NewRecorder(), loginRequest("203.0.113.11"), "admin", "secret"); err != nil || !ok {
+	if ok, err := login(authr, httptest.NewRecorder(), loginRequest("203.0.113.11"), "admin", "secret"); err != nil || !ok {
 		t.Fatalf("successful login after failures ok=%v err=%v", ok, err)
 	}
-	if ok, err := authr.Login(httptest.NewRecorder(), loginRequest("203.0.113.11"), "admin", "wrong"); err != nil || ok {
+	if ok, err := login(authr, httptest.NewRecorder(), loginRequest("203.0.113.11"), "admin", "wrong"); err != nil || ok {
 		t.Fatalf("failure after successful login ok=%v err=%v", ok, err)
 	}
 }
@@ -110,15 +139,14 @@ func TestLoginCreatesSevenDaySession(t *testing.T) {
 		}
 	})
 
+	createTestAdmin(t, cat)
 	authr := &Authenticator{
-		Username: "admin",
-		Password: "secret",
-		Catalog:  cat,
+		Catalog: cat,
 	}
 
 	before := time.Now()
 	rr := httptest.NewRecorder()
-	ok, err := authr.Login(rr, loginRequest("203.0.113.12"), "admin", "secret")
+	ok, err := login(authr, rr, loginRequest("203.0.113.12"), "admin", "secret")
 	after := time.Now()
 	if err != nil || !ok {
 		t.Fatalf("login ok=%v err=%v", ok, err)
@@ -157,7 +185,7 @@ func TestRequiredRenewsSessionWhenLessThanHalfRemaining(t *testing.T) {
 
 	now := time.Now().Truncate(time.Millisecond)
 	token := "renew-token"
-	if err := cat.CreateSessionUntil(ctx, token, now.Add(sessionRenewBefore-time.Minute), 0); err != nil {
+	if err := cat.CreateSessionUntil(ctx, token, now.Add(sessionRenewBefore-time.Minute), createTestAdmin(t, cat)); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	authr := &Authenticator{
@@ -204,7 +232,7 @@ func TestRequiredDoesNotRenewSessionWhenMoreThanHalfRemaining(t *testing.T) {
 	now := time.Now().Truncate(time.Millisecond)
 	token := "fresh-token"
 	expiresAt := now.Add(sessionRenewBefore + time.Minute)
-	if err := cat.CreateSessionUntil(ctx, token, expiresAt, 0); err != nil {
+	if err := cat.CreateSessionUntil(ctx, token, expiresAt, createTestAdmin(t, cat)); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	authr := &Authenticator{
@@ -247,7 +275,7 @@ func TestRequiredProvidesOpaqueSessionIdentity(t *testing.T) {
 	})
 
 	token := "identity-token"
-	if err := cat.CreateSession(ctx, token, time.Hour, 0); err != nil {
+	if err := cat.CreateSession(ctx, token, time.Hour, createTestAdmin(t, cat)); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	authr := &Authenticator{Catalog: cat}
@@ -359,7 +387,50 @@ func TestRequiredRejectsDeletedUserSession(t *testing.T) {
 	}
 }
 
-func TestUserLoginOnlyFallsBackToConfigWhenUsersTableIsEmpty(t *testing.T) {
+func TestAuthMiddlewareReturnsServiceUnavailableWhenCatalogFails(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	if err := cat.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+	authr := &Authenticator{Catalog: cat}
+
+	tests := []struct {
+		name string
+		wrap func(http.Handler) http.Handler
+	}{
+		{name: "required", wrap: authr.Required},
+		{name: "admin required", wrap: authr.AdminRequired},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			})
+			req := httptest.NewRequest(http.MethodGet, "/api/home", nil)
+			req.AddCookie(&http.Cookie{Name: sessionCookie, Value: "valid-looking-token"})
+			res := httptest.NewRecorder()
+
+			tt.wrap(next).ServeHTTP(res, req)
+
+			if called {
+				t.Fatal("protected handler was called")
+			}
+			if res.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503; body = %s", res.Code, res.Body.String())
+			}
+			if strings.Contains(res.Body.String(), "database") || strings.Contains(res.Body.String(), "interrupted") {
+				t.Fatalf("response exposed the catalog error: %q", res.Body.String())
+			}
+		})
+	}
+}
+
+func TestUserLoginRejectsMissingUser(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -378,7 +449,7 @@ func TestUserLoginOnlyFallsBackToConfigWhenUsersTableIsEmpty(t *testing.T) {
 		t.Fatalf("create user: %v", err)
 	}
 
-	authr := &Authenticator{Username: "legacy-admin", Password: "legacy-secret", Catalog: cat}
+	authr := &Authenticator{Catalog: cat}
 	role, err := authr.UserLogin(httptest.NewRecorder(), loginRequest("203.0.113.32"), "legacy-admin", "legacy-secret")
 	if err != nil {
 		t.Fatalf("login: %v", err)
@@ -408,9 +479,7 @@ func TestCheckCurrentPasswordUsesDatabaseAdminSession(t *testing.T) {
 	}
 
 	authr := &Authenticator{
-		Username: "legacy-admin",
-		Password: "different-config-secret",
-		Catalog:  cat,
+		Catalog: cat,
 	}
 	loginResponse := httptest.NewRecorder()
 	role, err := authr.UserLogin(
@@ -438,37 +507,32 @@ func TestCheckCurrentPasswordUsesDatabaseAdminSession(t *testing.T) {
 	}
 }
 
-func TestCheckCurrentPasswordSupportsLegacyAdminSession(t *testing.T) {
+func TestLegacyAdminSessionsAreRejected(t *testing.T) {
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
-		t.Fatalf("open catalog: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := cat.Close(); err != nil {
-			t.Fatalf("close catalog: %v", err)
+	t.Cleanup(func() { _ = cat.Close() })
+	if err := cat.CreateSession(context.Background(), "legacy-token", time.Hour, 0); err != nil {
+		t.Fatal(err)
+	}
+	authr := &Authenticator{Catalog: cat}
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/me", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: "legacy-token"})
+	if ok, _, err := authr.ValidateRequest(httptest.NewRecorder(), req); err != nil || ok {
+		t.Fatalf("legacy session accepted: ok=%v err=%v", ok, err)
+	}
+	if ok, err := authr.CheckCurrentPassword(req, "legacy-secret"); err != nil || ok {
+		t.Fatalf("legacy password accepted: ok=%v err=%v", ok, err)
+	}
+	for _, middleware := range []func(http.Handler) http.Handler{authr.Required, authr.AdminRequired} {
+		res := httptest.NewRecorder()
+		middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			t.Error("legacy session reached authenticated handler")
+		})).ServeHTTP(res, req)
+		if res.Code != http.StatusUnauthorized {
+			t.Fatalf("status=%d", res.Code)
 		}
-	})
-	authr := &Authenticator{
-		Username: "legacy-admin",
-		Password: "legacy-secret",
-		Catalog:  cat,
-	}
-	loginResponse := httptest.NewRecorder()
-	ok, err := authr.Login(
-		loginResponse,
-		loginRequest("203.0.113.34"),
-		"legacy-admin",
-		"legacy-secret",
-	)
-	if err != nil || !ok {
-		t.Fatalf("login ok=%v err=%v", ok, err)
-	}
-	request := httptest.NewRequest(http.MethodPost, "/admin/api/backups/example/restore", nil)
-	request.AddCookie(responseCookie(t, loginResponse, sessionCookie))
-
-	ok, err = authr.CheckCurrentPassword(request, "legacy-secret")
-	if err != nil || !ok {
-		t.Fatalf("legacy password check ok=%v err=%v", ok, err)
 	}
 }
 
@@ -482,17 +546,16 @@ func TestLoginUsesForwardedClientIPFromTrustedProxy(t *testing.T) {
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
+	createTestAdmin(t, cat)
 	authr := &Authenticator{
-		Username: "admin",
-		Password: "secret",
-		Catalog:  cat,
+		Catalog: cat,
 	}
 
 	const forwardedIP = "203.0.113.12"
 	for i := 0; i < loginFailThreshold; i++ {
 		request := loginRequest("127.0.0.1")
 		request.Header.Set("X-Forwarded-For", forwardedIP)
-		ok, err := authr.Login(httptest.NewRecorder(), request, "admin", "wrong")
+		ok, err := login(authr, httptest.NewRecorder(), request, "admin", "wrong")
 		if ok {
 			t.Fatalf("failed login %d returned ok", i+1)
 		}
@@ -542,4 +605,36 @@ func absDuration(d time.Duration) time.Duration {
 		return -d
 	}
 	return d
+}
+
+func createTestAdmin(t *testing.T, cat *catalog.Catalog) int64 {
+	t.Helper()
+	hash, err := HashPassword("secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := cat.CreateUser(context.Background(), "admin", hash, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func login(a *Authenticator, w http.ResponseWriter, r *http.Request, username, password string) (bool, error) {
+	role, err := a.UserLogin(w, r, username, password)
+	return role == "admin", err
+}
+
+func TestUserLoginDoesNotAcceptDefaultCredentialsOnEmptyDatabase(t *testing.T) {
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cat.Close() })
+	a := &Authenticator{Catalog: cat}
+	response := httptest.NewRecorder()
+	role, err := a.UserLogin(response, loginRequest("203.0.113.50"), "admin", "admin123")
+	if err != nil || role != "" || len(response.Result().Cookies()) != 0 {
+		t.Fatalf("default login role=%q err=%v", role, err)
+	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives/quark"
+	"github.com/video-site/backend/internal/scanjob"
 )
 
 type DriveConfigUpdateScope uint8
@@ -22,8 +23,6 @@ const (
 	// DriveConfigUpdateRuntime covers kind, root, credentials, and provider
 	// options captured by a mounted Driver.
 	DriveConfigUpdateRuntime DriveConfigUpdateScope = 1 << iota
-	// DriveConfigUpdatePreview covers the per-drive preview switch.
-	DriveConfigUpdatePreview
 	// DriveConfigUpdateScan covers skip-directory settings.
 	DriveConfigUpdateScan
 	// DriveConfigUpdateDestructive reserves deletion. It blocks admissions while
@@ -65,10 +64,6 @@ type AdminServer struct {
 	// ReleaseAPIURL and HTTPClient are injectable for tests. Production code leaves them empty.
 	ReleaseAPIURL string
 	HTTPClient    *http.Client
-	// SetupRequired 表示当前是否仍处于首次部署初始化状态。
-	SetupRequired func() bool
-	// OnSetup 持久化首次部署时设置的管理员账号密码，并更新运行中认证器。
-	OnSetup func(username, password string) error
 	// LocalPreviewDir is the local directory that stores generated preview videos and thumbs.
 	LocalPreviewDir string
 	// Hooks：外层注入实际执行者。
@@ -85,7 +80,7 @@ type AdminServer struct {
 	OnPrepareDriveDelete           func(ctx context.Context, driveID string) error
 	OnDriveDeleteCleanup           func(ctx context.Context, driveID string) (int, error)
 	OnDriveRemoved                 func(driveID string)
-	OnScanRequested                func(driveID string) bool
+	OnScanRequested                func(context.Context, string) bool
 	OnCrawlerUploadRequested       func(driveID string) (bool, string)
 	OnStopDriveTasks               func(driveID string) bool
 	OnStopAllTasks                 func() int
@@ -107,10 +102,6 @@ type AdminServer struct {
 	GetTagJobStatus              func() TagJobStatus
 	GetDriveGenerationStatuses   func() map[string]DriveGenerationStatuses
 	GetPreviewGenerationVideoIDs func() map[string]bool
-	// OnTeaserEnabledChanged 在 per-drive 预览视频开关被切换后调用。
-	// enabled=true 时上层应该重新把 pending 预览视频入队（类似旧的全局开关从关到开）；
-	// enabled=false 时通常不用做事 —— worker 入队前会再次查 catalog，自然停止。
-	OnTeaserEnabledChanged func(driveID string, enabled bool)
 	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
 	SetTheme func(theme string) error
@@ -157,14 +148,15 @@ type DriveDirEntry struct {
 }
 
 type GenerationStatus struct {
-	State         string `json:"state"`
-	CurrentTitle  string `json:"currentTitle,omitempty"`
-	QueueLength   int    `json:"queueLength"`
-	CooldownUntil string `json:"cooldownUntil,omitempty"`
-	ScannedCount  int    `json:"scannedCount"`
-	AddedCount    int    `json:"addedCount"`
-	DoneCount     int    `json:"doneCount"`
-	TotalCount    int    `json:"totalCount"`
+	Result        *scanjob.Result `json:"result,omitempty"`
+	State         string          `json:"state"`
+	CurrentTitle  string          `json:"currentTitle,omitempty"`
+	QueueLength   int             `json:"queueLength"`
+	CooldownUntil string          `json:"cooldownUntil,omitempty"`
+	ScannedCount  int             `json:"scannedCount"`
+	AddedCount    int             `json:"addedCount"`
+	DoneCount     int             `json:"doneCount"`
+	TotalCount    int             `json:"totalCount"`
 }
 
 type DriveGenerationStatuses struct {
@@ -176,11 +168,14 @@ type DriveGenerationStatuses struct {
 }
 
 type NightlyJobStatus struct {
-	State          string `json:"state"`
-	Running        bool   `json:"running"`
-	Queued         bool   `json:"queued"`
-	StartedAt      string `json:"startedAt,omitempty"`
-	LastFinishedAt string `json:"lastFinishedAt,omitempty"`
+	Outcome        scanjob.State    `json:"outcome,omitempty"`
+	ScanResults    []scanjob.Result `json:"scanResults,omitempty"`
+	Issues         []scanjob.Issue  `json:"issues,omitempty"`
+	State          string           `json:"state"`
+	Running        bool             `json:"running"`
+	Queued         bool             `json:"queued"`
+	StartedAt      string           `json:"startedAt,omitempty"`
+	LastFinishedAt string           `json:"lastFinishedAt,omitempty"`
 }
 
 type TagJobStatus struct {
@@ -256,7 +251,6 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
 			r.Post("/drives/{id}/tasks/stop", a.handleStopDriveTasks)
-			r.Post("/drives/{id}/teaser-enabled", a.handleSetDriveTeaserEnabled)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
 			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)

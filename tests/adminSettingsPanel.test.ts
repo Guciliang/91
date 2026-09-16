@@ -7,6 +7,7 @@ import {
   SettingsRow,
   SettingsSection,
 } from "../src/admin/settings/SettingsSection";
+import { DEFAULT_DRAFT, parseConfig } from "../src/admin/settings/configYaml";
 
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const layoutSource = readFileSync(
@@ -93,35 +94,69 @@ test("configuration panel groups typed fields from the real YAML document", () =
   assert.match(apiSource, /nightlyTimezone: string/);
 });
 
-test("preview concurrency is a per-storage hot-reloadable visual setting", () => {
+test("media generation exposes three independent global concurrency controls", () => {
   assert.match(pageSource, /id: "config-preview"/);
-  assert.match(pageSource, /title="预览视频"/);
-  assert.match(pageSource, /控制每个存储生成预览视频的并发数/);
-  assert.match(pageSource, /label="并发数"/);
-  assert.match(pageSource, /请根据服务器性能和网盘API并发风控适当调整，建议最高不超过3/);
-  assert.match(pageSource, /id="preview-concurrency"/);
-  assert.match(pageSource, /PREVIEW_CONCURRENCY_OPTIONS\.map/);
-  assert.match(
-    pageSource,
-    /updateVisualField\(\s*"previewConcurrency",\s*Number\(event\.target\.value\)/
-  );
-  assert.match(configYamlSource, /previewConcurrency: number/);
-  assert.match(configYamlSource, /\["preview", "concurrency"\]/);
-  assert.match(configYamlSource, /previewConcurrencyEdits/);
-  assert.match(apiSource, /previewConcurrency: number/);
+  assert.match(pageSource, /title="媒体生成"/);
+  assert.match(pageSource, /控制视频资源生成的并发数，请根据服务器性能和网盘API风控调整，如果性能允许推荐 1-3-1/);
+  for (const label of ["封面并发", "预览并发", "视频指纹并发"]) {
+    assert.ok(pageSource.includes(`label: "${label}"`));
+  }
+  for (const field of ["thumbnailConcurrency", "previewConcurrency", "fingerprintConcurrency"]) {
+    assert.ok(configYamlSource.includes(`${field}: number`));
+    assert.ok(apiSource.includes(`${field}: number`));
+  }
+  assert.doesNotMatch(pageSource, /单盘预览并发|封面与预览总并发|PREVIEW_CONCURRENCY_OPTIONS/);
+  assert.match(pageSource, /GENERATION_CONCURRENCY_OPTIONS\.map/);
+  assert.match(configYamlSource, /integerSettingEdits/);
   assert.match(adminCss, /\.admin-config-picker-field--concurrency\s*\{/);
 });
 
-test("nightly schedule stop switch uses the shared YAML save flow", () => {
-  assert.match(pageSource, /\n\s+label="停止定时任务"/);
+test("media generation uses one column on mobile and three concurrency columns on desktop", () => {
   assert.match(
     pageSource,
-    /label="启动时间"[\s\S]*?label="时区配置"[\s\S]*?label="停止定时任务"/
+    /const GENERATION_FIELDS = \[\s*\{\s*field: "thumbnailConcurrency",[\s\S]*?field: "previewConcurrency",[\s\S]*?field: "fingerprintConcurrency",/
+  );
+  const mediaSection = pageSource.slice(
+    pageSource.indexOf('activeSection === "config-preview"'),
+    pageSource.indexOf('activeSection === "config-tags"')
+  );
+  assert.match(mediaSection, /GENERATION_FIELDS\.map[\s\S]*?label="预览视频"/);
+  assert.match(
+    adminCss,
+    /#config-preview \.admin-config-section__body\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s
+  );
+  assert.match(
+    adminCss,
+    /@media \(min-width: 769px\)[\s\S]*?#config-preview \.admin-config-section__body,\s*#config-tags \.admin-config-section__body\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/s
+  );
+  assert.match(
+    adminCss,
+    /#config-preview \.admin-config-row\s*\{[^}]*display:\s*flex;[^}]*flex-wrap:\s*wrap;[^}]*justify-content:\s*space-between;/s
+  );
+});
+
+test("desktop built-in tags use the same column width as the preview switch", () => {
+  assert.match(
+    adminCss,
+    /@media \(min-width: 769px\)[\s\S]*?#config-preview \.admin-config-section__body,\s*#config-tags \.admin-config-section__body\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/s
+  );
+});
+
+test("nightly schedule enable switch inverts the disabled flag in the shared YAML save flow", () => {
+  assert.equal(DEFAULT_DRAFT.nightlyDisabled, false);
+  assert.equal(parseConfig("{}").draft.nightlyDisabled, false);
+  assert.equal(parseConfig("nightly: { disabled: true }").draft.nightlyDisabled, true);
+  assert.match(pageSource, /\n\s+label="定时任务"/);
+  assert.doesNotMatch(pageSource, /停止定时任务|nightly-disabled-toggle/);
+  assert.match(
+    pageSource,
+    /label="启动时间"[\s\S]*?label="时区配置"[\s\S]*?label="定时任务"/
   );
   assert.doesNotMatch(pageSource, /开启后不再自动执行每日任务/);
-  assert.match(pageSource, /id="nightly-disabled-toggle"/);
-  assert.match(pageSource, /aria-checked=\{draft\.nightlyDisabled\}/);
-  assert.match(pageSource, /aria-labelledby="nightly-disabled-label"/);
+  assert.match(pageSource, /id="nightly-enabled-toggle"/);
+  assert.match(pageSource, /aria-checked=\{!draft\.nightlyDisabled\}/);
+  assert.match(pageSource, /toggle-switch \$\{!draft\.nightlyDisabled \? "is-on" : ""\}/);
+  assert.match(pageSource, /aria-labelledby="nightly-enabled-label"/);
   assert.match(
     pageSource,
     /const scheduleControlsDisabled = controlsDisabled \|\| draft\.nightlyDisabled/
@@ -145,6 +180,49 @@ test("nightly schedule stop switch uses the shared YAML save flow", () => {
   assert.match(apiSource, /settings:\s*\{[\s\S]*?nightlyDisabled: boolean/);
 });
 
+test("nightly time and timezone share a responsive two-column row", () => {
+  assert.match(
+    pageSource,
+    /<div className="admin-config-schedule-row">\s*<SettingsRow\s+label="启动时间"[\s\S]*?<\/SettingsRow>\s*<SettingsRow\s+label="时区配置"[\s\S]*?<\/SettingsRow>\s*<\/div>/
+  );
+  assert.match(
+    adminCss,
+    /\.admin-config-schedule-row\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0, 1fr\) minmax\(0, 2fr\);/s
+  );
+  assert.match(
+    adminCss,
+    /@media \(max-width: 768px\)[\s\S]*?\.admin-config-schedule-row > \.admin-config-row\s*\{[^}]*flex-direction:\s*column;/s
+  );
+  assert.match(
+    adminCss,
+    /\.admin-config-schedule-row \.admin-config-picker-field\s*\{[^}]*max-width:\s*100%;/s
+  );
+});
+
+test("desktop schedule keeps three-column widths with its switch on the second row", () => {
+  assert.match(
+    adminCss,
+    /@media \(min-width: 769px\)\s*\{\s*\.admin-config-schedule-row\s*\{[^}]*grid-column:\s*span 2;[^}]*grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\);/s
+  );
+  assert.match(
+    adminCss,
+    /@media \(min-width: 769px\)[\s\S]*?#config-automation \.admin-config-section__body,\s*#config-preview \.admin-config-section__body,\s*#config-tags \.admin-config-section__body\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*repeat\(3, minmax\(0, 1fr\)\);/s
+  );
+  assert.match(
+    adminCss,
+    /@media \(min-width: 769px\)[\s\S]*?#config-automation \.admin-config-section__body > \.admin-config-row\s*\{[^}]*grid-column:\s*1;[^}]*grid-row:\s*2;/s
+  );
+});
+
+test("configuration switches keep their labels without status text above them", () => {
+  assert.doesNotMatch(pageSource, /admin-config-control__status|待开启|待关闭|已开启|已关闭|待恢复|待移除|已启用|已移除/);
+  assert.doesNotMatch(adminCss, /admin-config-control__status/);
+  for (const label of ["nightly-enabled-label", "preview-enabled-label", "builtin-tags-label"]) {
+    assert.ok(pageSource.includes(`labelID="${label}"`));
+    assert.ok(pageSource.includes(`aria-labelledby="${label}"`));
+  }
+});
+
 test("built-in tag changes use the configuration draft and shared save review", () => {
   assert.match(pageSource, /id: "config-tags"/);
   assert.match(pageSource, /title="内置标签"/);
@@ -165,7 +243,6 @@ test("built-in tag changes use the configuration draft and shared save review", 
     pageSource,
     /api\.updateConfigYAML\(pendingSave\.after, pendingSave\.version\)[\s\S]*?builtinTagsChanged[\s\S]*?invalidateTagsCache\(\)/
   );
-  assert.match(pageSource, /visualDirtyFields\.has\("builtinTagsEnabled"\)[\s\S]*?"待恢复"[\s\S]*?"待移除"/);
   assert.doesNotMatch(pageSource, /ConfirmModal|removeBuiltinTagsConfirmOpen/);
   assert.match(configYamlSource, /builtinTagsEnabled: boolean/);
   assert.match(configYamlSource, /\["tags", "builtin_pack_enabled"\]/);
@@ -292,11 +369,11 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
   );
   assert.match(
     adminCss,
-    /\.admin-config-section-nav\s*\{[^}]*position:\s*sticky[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*border-bottom:\s*1px solid var\(--border-default\)/s
+    /\.admin-config-section-nav\s*\{[^}]*position:\s*sticky[^}]*display:\s*flex;[^}]*overflow-x:\s*auto;[^}]*overflow-y:\s*hidden;[^}]*border-bottom:\s*1px solid var\(--border-default\)/s
   );
   assert.match(
     adminCss,
-    /\.admin-config-section-nav button::after\s*\{[^}]*bottom:\s*-1px;[^}]*height:\s*2px;[^}]*background:\s*transparent;/s
+    /\.admin-config-section-nav button::after\s*\{[^}]*bottom:\s*0;[^}]*height:\s*2px;[^}]*background:\s*transparent;/s
   );
   assert.match(
     adminCss,
@@ -307,7 +384,7 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
   assert.match(adminCss, /\.admin-config-sections\s*\{[^}]*display:\s*block/s);
   assert.match(
     adminCss,
-    /\.admin-config-section\s*\{[^}]*border-radius:\s*8px;[^}]*background:\s*color-mix\(in srgb, var\(--bg-surface\) 50%, transparent\);/s
+    /\.admin-config-section\s*\{[^}]*border-radius:\s*8px;[^}]*background:\s*var\(--bg-surface\);/s
   );
   assert.match(
     adminCss,
@@ -366,10 +443,6 @@ test("configuration panel follows the CLIProxy configuration workspace UI", () =
     /admin-config-picker-field__value--time[\s\S]*?draft\.nightlyStartTime \|\| "--:--"[\s\S]*?event\.currentTarget\.showPicker\(\)/
   );
   assert.doesNotMatch(adminCss, /calendar-picker-indicator/);
-  assert.match(
-    adminCss,
-    /@media \(max-width: 768px\)[\s\S]*?\.admin-config-section\s*\{[^}]*height:\s*clamp\(420px,\s*calc\(100dvh - var\(--admin-header-height\) - 260px\),\s*680px\)/s
-  );
   assert.match(pageSource, /data-admin-floating-actions/);
 });
 
@@ -443,7 +516,7 @@ test("compact configuration rows stay inline on mobile", () => {
 
   assert.match(markup, /class="admin-config-row admin-config-row--inline"/);
   assert.match(pageSource, /label="启动时间"[\s\S]*?layout="inline"/);
-  assert.match(pageSource, /label="并发数"[\s\S]*?layout="inline"/);
+  assert.match(pageSource, /label=\{label\}[\s\S]*?layout="inline"/);
   assert.match(pageSource, /label="内置标签"[\s\S]*?layout="inline"/);
   assert.match(
     adminCss,
@@ -457,4 +530,9 @@ test("compact configuration rows stay inline on mobile", () => {
     adminCss,
     /\.admin-config-control--switch\s*\{[^}]*flex-direction:\s*column;[^}]*justify-content:\s*center;/s
   );
+});
+test("media settings expose the only global preview generation switch", () => {
+  assert.match(pageSource, /id="preview-enabled-toggle"/);
+  assert.match(pageSource, /aria-checked=\{draft\.previewEnabled\}/);
+  assert.match(pageSource, /updateVisualField\("previewEnabled", !draft\.previewEnabled\)/);
 });

@@ -29,8 +29,8 @@ import { useAdminRouteRevalidation } from "./AdminRouteCache";
 import { SettingsRow, SettingsSection } from "./settings/SettingsSection";
 import {
   DEFAULT_DRAFT,
-  MAX_PREVIEW_CONCURRENCY,
-  MIN_PREVIEW_CONCURRENCY,
+  MAX_GENERATION_CONCURRENCY,
+  MIN_GENERATION_CONCURRENCY,
   applyVisualFields,
   changedVisualFields,
   isValidStartTime,
@@ -83,10 +83,24 @@ const NIGHTLY_TIMEZONE_OPTIONS = [
   "America/Los_Angeles",
 ] as const;
 
-const PREVIEW_CONCURRENCY_OPTIONS = Array.from(
-  { length: MAX_PREVIEW_CONCURRENCY - MIN_PREVIEW_CONCURRENCY + 1 },
-  (_, index) => MIN_PREVIEW_CONCURRENCY + index
+const GENERATION_CONCURRENCY_OPTIONS = Array.from(
+  { length: MAX_GENERATION_CONCURRENCY - MIN_GENERATION_CONCURRENCY + 1 },
+  (_, index) => MIN_GENERATION_CONCURRENCY + index
 );
+const GENERATION_FIELDS = [
+  {
+    field: "thumbnailConcurrency",
+    label: "封面并发",
+  },
+  {
+    field: "previewConcurrency",
+    label: "预览并发",
+  },
+  {
+    field: "fingerprintConcurrency",
+    label: "视频指纹并发",
+  },
+] as const;
 const CONFIG_FIELD_COUNT = Object.keys(DEFAULT_DRAFT).length;
 
 const SECTION_META: Array<{
@@ -101,7 +115,7 @@ const SECTION_META: Array<{
   },
   {
     id: "config-preview",
-    title: "预览视频",
+    title: "媒体生成",
     icon: Film,
   },
   {
@@ -123,7 +137,9 @@ function ConfigPageMeta({ statusClass, statusText }: ConfigPageMetaProps) {
       <span className="admin-config-meta__separator" aria-hidden="true">
         ·
       </span>
-      <span className={`admin-config-meta__status ${statusClass}`}>{statusText}</span>
+      <span className={`admin-config-meta__status ${statusClass}`} title={statusText}>
+        {statusText}
+      </span>
     </p>
   );
 }
@@ -154,17 +170,22 @@ export function SettingsPage() {
   dirtyRef.current = dirty;
   const timeValid = isValidStartTime(draft.nightlyStartTime);
   const timezoneValid = isValidTimezone(draft.nightlyTimezone);
-  const previewConcurrencyValid =
-    Number.isInteger(draft.previewConcurrency) &&
-    draft.previewConcurrency >= MIN_PREVIEW_CONCURRENCY &&
-    draft.previewConcurrency <= MAX_PREVIEW_CONCURRENCY;
+  const generationConcurrencyValid = GENERATION_FIELDS.every(
+    ({ field }) =>
+      Number.isInteger(draft[field]) &&
+      draft[field] >= MIN_GENERATION_CONCURRENCY &&
+      draft[field] <= MAX_GENERATION_CONCURRENCY
+  );
   const timezoneIsBuiltIn = NIGHTLY_TIMEZONE_OPTIONS.some(
     (timezone) => timezone === draft.nightlyTimezone
   );
   const controlsDisabled = loading || saving || loaded === null;
   const scheduleControlsDisabled = controlsDisabled || draft.nightlyDisabled;
   const hasConfigError =
-    Boolean(sourceError) || !timeValid || !timezoneValid || !previewConcurrencyValid;
+    Boolean(sourceError) ||
+    !timeValid ||
+    !timezoneValid ||
+    !generationConcurrencyValid;
   const statusClass = loading || saving
     ? "is-busy"
     : hasConfigError
@@ -271,7 +292,7 @@ export function SettingsPage() {
       !dirty ||
       !timeValid ||
       !timezoneValid ||
-      !previewConcurrencyValid ||
+      !generationConcurrencyValid ||
       sourceError ||
       saving
     )
@@ -519,106 +540,108 @@ export function SettingsPage() {
                   title="定时任务"
                   description="控制每日扫盘和库内视频维护"
                 >
-                  <SettingsRow
-                    label="启动时间"
-                    htmlFor="nightly-start-time"
-                    layout="inline"
-                  >
-                    <div className="admin-config-control admin-config-control--picker">
-                      <div
-                        className={`admin-config-picker-field admin-config-picker-field--time${
-                          !timeValid ? " is-invalid" : ""
-                        }${scheduleControlsDisabled ? " is-disabled" : ""}`}
-                      >
-                        <span
-                          className="admin-config-picker-field__value admin-config-picker-field__value--time"
-                          aria-hidden="true"
+                  <div className="admin-config-schedule-row">
+                    <SettingsRow
+                      label="启动时间"
+                      htmlFor="nightly-start-time"
+                      layout="inline"
+                    >
+                      <div className="admin-config-control admin-config-control--picker">
+                        <div
+                          className={`admin-config-picker-field admin-config-picker-field--time${
+                            !timeValid ? " is-invalid" : ""
+                          }${scheduleControlsDisabled ? " is-disabled" : ""}`}
                         >
-                          {draft.nightlyStartTime || "--:--"}
-                        </span>
-                        <input
-                          id="nightly-start-time"
-                          type="time"
-                          step={60}
-                          value={draft.nightlyStartTime}
-                          disabled={scheduleControlsDisabled}
-                          aria-invalid={!timeValid}
-                          aria-describedby={!timeValid ? "nightly-start-time-hint" : undefined}
-                          onClick={(event) => {
-                            try {
-                              event.currentTarget.showPicker();
-                            } catch {
-                              // The input's native click behavior remains the fallback.
+                          <span
+                            className="admin-config-picker-field__value admin-config-picker-field__value--time"
+                            aria-hidden="true"
+                          >
+                            {draft.nightlyStartTime || "--:--"}
+                          </span>
+                          <input
+                            id="nightly-start-time"
+                            type="time"
+                            step={60}
+                            value={draft.nightlyStartTime}
+                            disabled={scheduleControlsDisabled}
+                            aria-invalid={!timeValid}
+                            aria-describedby={!timeValid ? "nightly-start-time-hint" : undefined}
+                            onClick={(event) => {
+                              try {
+                                event.currentTarget.showPicker();
+                              } catch {
+                                // The input's native click behavior remains the fallback.
+                              }
+                            }}
+                            onChange={(event) =>
+                              updateVisualField("nightlyStartTime", event.target.value)
                             }
-                          }}
-                          onChange={(event) =>
-                            updateVisualField("nightlyStartTime", event.target.value)
-                          }
-                        />
+                          />
+                        </div>
+                        {!timeValid && (
+                          <span id="nightly-start-time-hint" className="is-error">
+                            请选择有效时间
+                          </span>
+                        )}
                       </div>
-                      {!timeValid && (
-                        <span id="nightly-start-time-hint" className="is-error">
-                          请选择有效时间
-                        </span>
-                      )}
-                    </div>
-                  </SettingsRow>
-                  <SettingsRow
-                    label="时区配置"
-                    htmlFor="nightly-timezone"
-                    layout="inline"
-                  >
-                    <div className="admin-config-control admin-config-control--picker">
-                      <div
-                        className={`admin-config-picker-field admin-config-picker-field--timezone${
-                          !timezoneValid ? " is-invalid" : ""
-                        }${scheduleControlsDisabled ? " is-disabled" : ""}`}
-                      >
-                        <span className="admin-config-picker-field__value" aria-hidden="true">
-                          {draft.nightlyTimezone || "--"}
-                        </span>
-                        <select
-                          id="nightly-timezone"
-                          value={draft.nightlyTimezone}
-                          disabled={scheduleControlsDisabled}
-                          aria-invalid={!timezoneValid}
-                          aria-describedby={!timezoneValid ? "nightly-timezone-hint" : undefined}
-                          onChange={(event) =>
-                            updateVisualField("nightlyTimezone", event.target.value)
-                          }
+                    </SettingsRow>
+                    <SettingsRow
+                      label="时区配置"
+                      htmlFor="nightly-timezone"
+                      layout="inline"
+                    >
+                      <div className="admin-config-control admin-config-control--picker">
+                        <div
+                          className={`admin-config-picker-field admin-config-picker-field--timezone${
+                            !timezoneValid ? " is-invalid" : ""
+                          }${scheduleControlsDisabled ? " is-disabled" : ""}`}
                         >
-                          {!timezoneIsBuiltIn && (
-                            <option value={draft.nightlyTimezone}>
-                              {draft.nightlyTimezone || "无效时区"}
-                            </option>
-                          )}
-                          {NIGHTLY_TIMEZONE_OPTIONS.map((timezone) => (
-                            <option key={timezone} value={timezone}>
-                              {timezone}
-                            </option>
-                          ))}
-                        </select>
+                          <span className="admin-config-picker-field__value" aria-hidden="true">
+                            {draft.nightlyTimezone || "--"}
+                          </span>
+                          <select
+                            id="nightly-timezone"
+                            value={draft.nightlyTimezone}
+                            disabled={scheduleControlsDisabled}
+                            aria-invalid={!timezoneValid}
+                            aria-describedby={!timezoneValid ? "nightly-timezone-hint" : undefined}
+                            onChange={(event) =>
+                              updateVisualField("nightlyTimezone", event.target.value)
+                            }
+                          >
+                            {!timezoneIsBuiltIn && (
+                              <option value={draft.nightlyTimezone}>
+                                {draft.nightlyTimezone || "无效时区"}
+                              </option>
+                            )}
+                            {NIGHTLY_TIMEZONE_OPTIONS.map((timezone) => (
+                              <option key={timezone} value={timezone}>
+                                {timezone}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        {!timezoneValid && (
+                          <span id="nightly-timezone-hint" className="is-error">
+                            请输入有效的 IANA 时区名
+                          </span>
+                        )}
                       </div>
-                      {!timezoneValid && (
-                        <span id="nightly-timezone-hint" className="is-error">
-                          请输入有效的 IANA 时区名
-                        </span>
-                      )}
-                    </div>
-                  </SettingsRow>
+                    </SettingsRow>
+                  </div>
                   <SettingsRow
-                    label="停止定时任务"
-                    labelID="nightly-disabled-label"
+                    label="定时任务"
+                    labelID="nightly-enabled-label"
                     layout="inline"
                   >
                     <div className="admin-config-control admin-config-control--switch">
                       <button
-                        id="nightly-disabled-toggle"
+                        id="nightly-enabled-toggle"
                         type="button"
-                        className={`toggle-switch ${draft.nightlyDisabled ? "is-on" : ""}`}
+                        className={`toggle-switch ${!draft.nightlyDisabled ? "is-on" : ""}`}
                         role="switch"
-                        aria-checked={draft.nightlyDisabled}
-                        aria-labelledby="nightly-disabled-label"
+                        aria-checked={!draft.nightlyDisabled}
+                        aria-labelledby="nightly-enabled-label"
                         disabled={controlsDisabled}
                         onClick={() =>
                           updateVisualField("nightlyDisabled", !draft.nightlyDisabled)
@@ -635,45 +658,64 @@ export function SettingsPage() {
                   id="config-preview"
                   index="02"
                   icon={<Film size={16} />}
-                  title="预览视频"
-                  description="控制每个存储生成预览视频的并发数"
+                  title="媒体生成"
+                  description="控制视频资源生成的并发数，请根据服务器性能和网盘API风控调整，如果性能允许推荐 1-3-1"
                 >
+                  {GENERATION_FIELDS.map(({ field, label }) => (
+                    <SettingsRow
+                      key={field}
+                      label={label}
+                      htmlFor={field}
+                      layout="inline"
+                    >
+                      <div className="admin-config-control admin-config-control--picker">
+                        <div
+                          className={`admin-config-picker-field admin-config-picker-field--concurrency${
+                            controlsDisabled ? " is-disabled" : ""
+                          }`}
+                        >
+                          <span className="admin-config-picker-field__value" aria-hidden="true">
+                            {draft[field]}
+                          </span>
+                          <select
+                            id={field}
+                            value={draft[field]}
+                            disabled={controlsDisabled}
+                            aria-invalid={!generationConcurrencyValid}
+                            onChange={(event) =>
+                              updateVisualField(field, Number(event.target.value))
+                            }
+                          >
+                            {GENERATION_CONCURRENCY_OPTIONS.map((concurrency) => (
+                              <option key={concurrency} value={concurrency}>
+                                {concurrency}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </SettingsRow>
+                  ))}
                   <SettingsRow
-                    label="并发数"
-                    description="请根据服务器性能和网盘API并发风控适当调整，建议最高不超过3"
-                    descriptionID="preview-concurrency-description"
-                    htmlFor="preview-concurrency"
+                    label="预览视频"
+                    labelID="preview-enabled-label"
                     layout="inline"
                   >
-                    <div className="admin-config-control admin-config-control--picker">
-                      <div
-                        className={`admin-config-picker-field admin-config-picker-field--concurrency${
-                          !previewConcurrencyValid ? " is-invalid" : ""
-                        }${controlsDisabled ? " is-disabled" : ""}`}
+                    <div className="admin-config-control admin-config-control--switch">
+                      <button
+                        id="preview-enabled-toggle"
+                        type="button"
+                        className={`toggle-switch ${draft.previewEnabled ? "is-on" : ""}`}
+                        role="switch"
+                        aria-checked={draft.previewEnabled}
+                        aria-labelledby="preview-enabled-label"
+                        disabled={controlsDisabled}
+                        onClick={() =>
+                          updateVisualField("previewEnabled", !draft.previewEnabled)
+                        }
                       >
-                        <span className="admin-config-picker-field__value" aria-hidden="true">
-                          {draft.previewConcurrency}
-                        </span>
-                        <select
-                          id="preview-concurrency"
-                          value={draft.previewConcurrency}
-                          disabled={controlsDisabled}
-                          aria-invalid={!previewConcurrencyValid}
-                          aria-describedby="preview-concurrency-description"
-                          onChange={(event) =>
-                            updateVisualField(
-                              "previewConcurrency",
-                              Number(event.target.value)
-                            )
-                          }
-                        >
-                          {PREVIEW_CONCURRENCY_OPTIONS.map((concurrency) => (
-                            <option key={concurrency} value={concurrency}>
-                              {concurrency}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
+                        <span className="toggle-switch__dot" />
+                      </button>
                     </div>
                   </SettingsRow>
                 </SettingsSection>
@@ -692,15 +734,6 @@ export function SettingsPage() {
                     layout="inline"
                   >
                     <div className="admin-config-control admin-config-control--switch">
-                      <span className="admin-config-control__status">
-                        {visualDirtyFields.has("builtinTagsEnabled")
-                          ? draft.builtinTagsEnabled
-                            ? "待恢复"
-                            : "待移除"
-                          : draft.builtinTagsEnabled
-                            ? "已启用"
-                            : "已移除"}
-                      </span>
                       <button
                         id="builtin-tags-toggle"
                         type="button"
@@ -757,7 +790,7 @@ export function SettingsPage() {
               !dirty ||
               !timeValid ||
               !timezoneValid ||
-              !previewConcurrencyValid ||
+              !generationConcurrencyValid ||
               Boolean(sourceError)
             }
             title="预览并保存配置"

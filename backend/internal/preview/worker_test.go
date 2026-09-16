@@ -333,7 +333,7 @@ func TestPreviewWorkerDeduplicatesQueuedVideos(t *testing.T) {
 	}
 }
 
-func TestPreviewWorkerRunsConfiguredConsumersConcurrently(t *testing.T) {
+func TestSingleDriveUsesGlobalPreviewConcurrency(t *testing.T) {
 	ctx := context.Background()
 	cat, first := seedPreviewTestVideo(t, "preview-concurrent-1")
 	videos := []*catalog.Video{first}
@@ -357,7 +357,7 @@ func TestPreviewWorkerRunsConfiguredConsumersConcurrently(t *testing.T) {
 		release: release,
 	}
 	worker := NewWorker(gen, cat, &concurrentPreviewDrive{})
-	worker.SetConcurrency(3)
+	worker.Limiter.SetLimit(3)
 	runCtx, cancel := context.WithCancel(ctx)
 	runDone := make(chan struct{})
 	go func() {
@@ -418,7 +418,7 @@ func TestPreviewWorkerRunsConfiguredConsumersConcurrently(t *testing.T) {
 	}
 }
 
-func TestPreviewWorkerAppliesConcurrencyUpdatesWhileRunning(t *testing.T) {
+func TestPreviewWorkerAppliesGlobalConcurrencyUpdatesWhileRunning(t *testing.T) {
 	ctx := context.Background()
 	cat, first := seedPreviewTestVideo(t, "preview-resize-1")
 	second := *first
@@ -434,7 +434,7 @@ func TestPreviewWorkerAppliesConcurrencyUpdatesWhileRunning(t *testing.T) {
 		release: release,
 	}
 	worker := NewWorker(gen, cat, &concurrentPreviewDrive{})
-	worker.SetConcurrency(1)
+	worker.Limiter.SetLimit(1)
 	runCtx, cancel := context.WithCancel(ctx)
 	runDone := make(chan struct{})
 	go func() {
@@ -464,10 +464,7 @@ func TestPreviewWorkerAppliesConcurrencyUpdatesWhileRunning(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	worker.SetConcurrency(2)
-	if got := worker.CurrentConcurrency(); got != 2 {
-		t.Fatalf("current concurrency = %d, want 2", got)
-	}
+	worker.Limiter.SetLimit(2)
 	select {
 	case <-gen.started:
 	case <-time.After(2 * time.Second):
@@ -897,7 +894,7 @@ func TestThumbWorkerPikPakMoovAtomErrorFailsWithoutCooldown(t *testing.T) {
 	}
 }
 
-func TestPreviewWorkerP115TransientErrorKeepsVideoPending(t *testing.T) {
+func TestPreviewWorkerP115ForbiddenFailsOnlyThisVideo(t *testing.T) {
 	ctx := context.Background()
 	cat, video := seedPreviewTestVideo(t, "preview-p115-transient")
 
@@ -913,8 +910,11 @@ func TestPreviewWorkerP115TransientErrorKeepsVideoPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get video: %v", err)
 	}
-	if got.PreviewStatus != "pending" {
-		t.Fatalf("preview status = %q, want pending for transient 115 media error", got.PreviewStatus)
+	if got.PreviewStatus != "failed" {
+		t.Fatalf("preview status = %q, want failed after rejected original source", got.PreviewStatus)
+	}
+	if !worker.Status().CooldownUntil.IsZero() {
+		t.Fatal("one rejected file must not cool down the drive")
 	}
 	if gen.generateCalls != 1 {
 		t.Fatalf("generate calls = %d, want 1", gen.generateCalls)
@@ -1514,5 +1514,49 @@ func TestThumbWorkerWaitIdleBlocksUntilQueueDrains(t *testing.T) {
 	defer cancel()
 	if err := worker.WaitIdle(ctx); err != nil {
 		t.Fatalf("ThumbWorker.WaitIdle: %v", err)
+	}
+}
+
+func TestRejectedRefreshedHLSFallsBackToOriginal(t *testing.T) {
+	for _, kind := range []string{"thumbnail", "preview"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			cat, v := seedPreviewTestVideo(t, "hls-rejected-"+kind)
+			rejected := errors.New("Server returned 403 Forbidden")
+			drv := &generationPreviewDrive{previewFakeDrive: &previewFakeDrive{kind: "p115"}}
+			var sources []string
+			if kind == "thumbnail" {
+				gen := &fakeThumbGenerator{generateErrs: []error{rejected, rejected, nil}}
+				w := NewThumbWorker(gen, cat, drv)
+				w.process(ctx, v)
+				sources = gen.thumbnailURLs
+				if !w.Status().CooldownUntil.IsZero() {
+					t.Fatal("HLS failure cooled down healthy original")
+				}
+			} else {
+				gen := &fakeTeaserGenerator{generateErrs: []error{rejected, rejected, nil}}
+				w := NewWorker(gen, cat, drv)
+				w.process(ctx, v)
+				sources = gen.generatedURLs
+				if !w.Status().CooldownUntil.IsZero() {
+					t.Fatal("HLS failure cooled down healthy original")
+				}
+			}
+			if len(sources) != 3 || sources[2] != "https://video.example/clip.mp4" || drv.streamCalls != 1 {
+				t.Fatalf("sources=%v direct=%d", sources, drv.streamCalls)
+			}
+		})
+	}
+}
+
+func TestHLS429DoesNotFallBackAndMultiplyRequests(t *testing.T) {
+	ctx := context.Background()
+	cat, v := seedPreviewTestVideo(t, "hls-limited")
+	err := &drives.RateLimitError{Provider: "p115", Err: errors.New("HTTP status=429")}
+	drv := &generationPreviewDrive{previewFakeDrive: &previewFakeDrive{kind: "p115"}}
+	gen := &fakeTeaserGenerator{generateErr: err}
+	worker := NewWorker(gen, cat, drv)
+	if !worker.process(ctx, v) || drv.streamCalls != 0 {
+		t.Fatal("explicit limit should pause instead of requesting original")
 	}
 }

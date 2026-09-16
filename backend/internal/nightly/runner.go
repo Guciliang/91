@@ -5,9 +5,9 @@
 // "扫描所有网盘" action uses TriggerScanAll and intentionally runs only the
 // cloud-scan and duplicate-maintenance stages.
 //
-//	Phase 1: for each non-crawler cloud drive
+//	Phase 1: concurrently for each non-crawler cloud drive
 //	           scan + delete-detection + enqueue thumb + enqueue preview video
-//	         wait until all thumb / preview-video queues are idle
+//	         wait for all scans, then all thumb / preview-video queues to be idle
 //	Phase 1b: reconcile generated thumbnails/previews against local storage
 //	          enqueue repaired pending rows and wait for their queues to drain
 //	Phase 2: if any script crawler configured
@@ -37,6 +37,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/video-site/backend/internal/scanjob"
 	"github.com/video-site/backend/internal/schedule"
 )
 
@@ -80,13 +81,14 @@ type Config struct {
 	// the persisted last-run calendar date. It never changes the host timezone.
 	Timezone string
 
-	// ListScanTargets returns the drive IDs to run Phase 1 on, in deterministic
-	// order. Should exclude crawler and localupload drives.
-	ListScanTargets func(ctx context.Context) []string
+	// ListScanTargets returns unique drive IDs to run Phase 1 on concurrently.
+	// Should exclude crawler and localupload drives.
+	ListScanTargets func(ctx context.Context) ([]string, error)
 
 	// RunScan synchronously runs scan + cleanup + enqueueDriveGeneration for
-	// one drive. Errors are expected to be logged inside, not surfaced.
-	RunScan func(ctx context.Context, driveID string)
+	// one drive, returning its final outcome even when it failed or was skipped.
+	// It must support concurrent calls for different drives and honor cancellation.
+	RunScan func(ctx context.Context, driveID string) scanjob.Result
 
 	// ListCrawlerDrives returns script crawler drive IDs to crawl in Phase 2.
 	// Returns empty slice when no crawler is configured.
@@ -134,6 +136,9 @@ type Status struct {
 	Queued         bool
 	StartedAt      time.Time
 	LastFinishedAt time.Time
+	Outcome        scanjob.State
+	ScanResults    []scanjob.Result // completed scans, in completion order
+	Issues         []scanjob.Issue
 }
 
 // Runner drives the nightly pipeline.
@@ -151,6 +156,9 @@ type Runner struct {
 	startedAt      time.Time
 	lastFinishedAt time.Time
 	currentCancel  context.CancelFunc
+	outcome        scanjob.State
+	scanResults    []scanjob.Result
+	issues         []scanjob.Issue
 }
 
 // New constructs a Runner. cfg is shallow-copied; defaults are applied.
@@ -358,6 +366,9 @@ func (r *Runner) Status() Status {
 	queued := r.queued
 	startedAt := r.startedAt
 	lastFinishedAt := r.lastFinishedAt
+	outcome := r.outcome
+	scanResults := append([]scanjob.Result(nil), r.scanResults...)
+	issues := append([]scanjob.Issue(nil), r.issues...)
 	r.stateMu.Unlock()
 
 	state := "idle"
@@ -376,6 +387,9 @@ func (r *Runner) Status() Status {
 		Queued:         queued,
 		StartedAt:      startedAt,
 		LastFinishedAt: lastFinishedAt,
+		Outcome:        outcome,
+		ScanResults:    scanResults,
+		Issues:         issues,
 	}
 }
 
@@ -457,8 +471,8 @@ func (r *Runner) runModeLockedForDate(ctx context.Context, mode runMode, schedul
 	runCtx, cancel := context.WithCancel(ctx)
 	r.markStarted(started, cancel)
 	defer func() {
+		r.markFinished(r.cfg.Now(), runCtx.Err())
 		cancel()
-		r.markFinished(r.cfg.Now())
 		r.runMu.Unlock()
 	}()
 
@@ -492,21 +506,67 @@ func (r *Runner) markStarted(started time.Time, cancel context.CancelFunc) {
 	r.queued = false
 	r.startedAt = started
 	r.currentCancel = cancel
+	r.outcome = ""
+	r.scanResults = nil
+	r.issues = nil
 }
 
-func (r *Runner) markFinished(finished time.Time) {
+func (r *Runner) markFinished(finished time.Time, err error) {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
 	r.running = false
 	r.startedAt = time.Time{}
 	r.lastFinishedAt = finished
 	r.currentCancel = nil
+	r.outcome = scanOutcome(r.scanResults, len(r.issues) > 0)
+	if err != nil {
+		r.outcome = scanjob.Canceled
+	}
+}
+
+func scanOutcome(results []scanjob.Result, phaseFailed bool) scanjob.State {
+	succeeded, failed, skipped, canceled := 0, 0, 0, 0
+	partial := false
+	for _, result := range results {
+		switch result.State {
+		case scanjob.Succeeded:
+			succeeded++
+		case scanjob.Partial:
+			partial = true
+		case scanjob.Skipped:
+			skipped++
+		case scanjob.Canceled:
+			canceled++
+		default:
+			failed++
+		}
+	}
+	switch {
+	case phaseFailed || failed > 0:
+		if succeeded > 0 || partial {
+			return scanjob.Partial
+		}
+		return scanjob.Failed
+	case partial || (succeeded > 0 && skipped+canceled > 0):
+		return scanjob.Partial
+	case canceled > 0:
+		return scanjob.Canceled
+	case skipped > 0 && succeeded == 0:
+		return scanjob.Skipped
+	default:
+		return scanjob.Succeeded
+	}
+}
+
+func (r *Runner) recordIssue(phase string, err error) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	r.issues = append(r.issues, scanjob.Issue{Stage: phase, Message: err.Error()})
 }
 
 // runPipeline executes the maintenance phases. It returns when the pipeline
-// finishes or ctx is done. Errors are logged but not propagated —
-// each phase is best-effort; downstream phases still attempt to run unless ctx
-// is dead.
+// finishes or ctx is done. Phase errors are retained in Status; downstream
+// phases still attempt to run unless ctx is canceled.
 func (r *Runner) runPipeline(ctx context.Context) {
 	if !r.runScanPhase(ctx, "nightly", "phase 1") {
 		return
@@ -551,6 +611,7 @@ func (r *Runner) runPipeline(ctx context.Context) {
 	if r.cfg.RunMigration != nil {
 		if err := r.cfg.RunMigration(ctx); err != nil {
 			log.Printf("[nightly] phase 3 migration: %v", err)
+			r.recordIssue("migration", err)
 		}
 	}
 
@@ -563,6 +624,7 @@ func (r *Runner) runPipeline(ctx context.Context) {
 		for _, id := range crawlerIDs {
 			if err := r.cfg.RestoreCrawlerVideos(ctx, id); err != nil {
 				log.Printf("[nightly] phase 4 restore drive=%s: %v", id, err)
+				r.recordIssue("restore", err)
 			}
 		}
 	}
@@ -591,20 +653,42 @@ func (r *Runner) runScanPhase(ctx context.Context, component, phase string) bool
 	}
 	scanIDs := []string{}
 	if r.cfg.ListScanTargets != nil {
-		scanIDs = r.cfg.ListScanTargets(ctx)
+		var err error
+		scanIDs, err = r.cfg.ListScanTargets(ctx)
+		if err != nil {
+			r.recordIssue(phase, err)
+			log.Printf("[%s] %s: list scan targets: %v", component, phase, err)
+			return false
+		}
 	}
 	if len(scanIDs) == 0 {
 		log.Printf("[%s] %s skipped: no cloud drives to scan", component, phase)
 	} else {
-		log.Printf("[%s] %s: scanning %d drive(s)", component, phase, len(scanIDs))
+		log.Printf("[%s] %s: scanning %d drive(s) concurrently", component, phase, len(scanIDs))
+		var scans sync.WaitGroup
 		for _, id := range scanIDs {
 			if ctx.Err() != nil {
-				log.Printf("[%s] %s aborted by ctx: %v", component, phase, ctx.Err())
-				return false
+				break
 			}
-			log.Printf("[%s] %s: scanning drive=%s", component, phase, id)
-			r.cfg.RunScan(ctx, id)
+			scans.Add(1)
+			go func() {
+				defer scans.Done()
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[%s] %s: scanning drive=%s", component, phase, id)
+				result := r.cfg.RunScan(ctx, id)
+				r.stateMu.Lock()
+				r.scanResults = append(r.scanResults, result)
+				r.stateMu.Unlock()
+			}()
 		}
+		// Keep ownership of the pipeline until every admitted scan has returned,
+		// including saving its final result and releasing its drive task on stop.
+		scans.Wait()
+	}
+	if r.shouldStop(ctx, component, phase) {
+		return false
 	}
 	log.Printf("[%s] %s: waiting for preview queues to drain", component, phase)
 	if err := r.waitIdle(ctx, component, phase); err != nil {
@@ -624,6 +708,7 @@ func (r *Runner) runLocalAssetReconciliationPhase(ctx context.Context, component
 	resets, err := r.cfg.RunLocalAssetReconciliation(ctx)
 	if err != nil {
 		log.Printf("[%s] %s local asset reconciliation: %v", component, phase, err)
+		r.recordIssue(phase, err)
 	}
 	if r.shouldStop(ctx, component, phase) {
 		return false
@@ -650,6 +735,7 @@ func (r *Runner) waitIdle(ctx context.Context, component, phase string) error {
 	}
 	if err := r.cfg.WaitPreviewQueuesIdle(ctx); err != nil {
 		log.Printf("[%s] %s: wait preview queues: %v", component, phase, err)
+		r.recordIssue(phase, err)
 		return err
 	}
 	return nil
@@ -665,6 +751,7 @@ func (r *Runner) runTagMaintenancePhase(ctx context.Context, component, phase st
 	log.Printf("[%s] %s: tag maintenance", component, phase)
 	if err := r.cfg.RunTagMaintenance(ctx); err != nil {
 		log.Printf("[%s] %s tag maintenance: %v", component, phase, err)
+		r.recordIssue(phase, err)
 	}
 }
 
@@ -678,6 +765,7 @@ func (r *Runner) runDedupeAssetCleanupPhase(ctx context.Context, component, phas
 	log.Printf("[%s] %s: duplicate video maintenance", component, phase)
 	if err := r.cfg.RunDedupeAssetCleanup(ctx); err != nil {
 		log.Printf("[%s] %s duplicate video maintenance: %v", component, phase, err)
+		r.recordIssue(phase, err)
 	}
 }
 

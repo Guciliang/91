@@ -47,18 +47,18 @@ func (s *Server) handleCreateVideoShare(w http.ResponseWriter, r *http.Request) 
 	videoID := routeParam(r, "id")
 	v, err := s.availableVideo(r.Context(), videoID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+		writeCatalogLookupError(w, r, err)
 		return
 	}
 
 	shareID, _, err := newOpaqueHex(videoShareIDBytes)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeErr(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	token, tokenBytes, err := newOpaqueHex(videoShareTokenBytes)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeErr(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	if err := s.Catalog.CreateVideoShare(
@@ -69,10 +69,10 @@ func (s *Server) handleCreateVideoShare(w http.ResponseWriter, r *http.Request) 
 		s.shareCurrentTime(),
 	); err != nil {
 		if errors.Is(err, catalog.ErrVideoShareUnavailable) {
-			writeErr(w, http.StatusNotFound, sql.ErrNoRows)
+			writeErr(w, r, http.StatusNotFound, sql.ErrNoRows)
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, err)
+		writeServiceUnavailable(w, r, "create video share", err)
 		return
 	}
 
@@ -88,12 +88,12 @@ func (s *Server) handleConsumeVideoShare(w http.ResponseWriter, r *http.Request)
 	var body consumeVideoShareRequest
 	decoder := json.NewDecoder(io.LimitReader(r.Body, 1024))
 	if err := decoder.Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, errors.New("invalid share request"))
+		writeErr(w, r, http.StatusBadRequest, errors.New("invalid share request"))
 		return
 	}
 	tokenHash, ok := digestHexShareSecret(body.Token, videoShareTokenBytes)
 	if !ok {
-		writeErr(w, http.StatusNotFound, catalog.ErrVideoShareUnavailable)
+		writeErr(w, r, http.StatusNotFound, catalog.ErrVideoShareUnavailable)
 		return
 	}
 
@@ -103,7 +103,7 @@ func (s *Server) handleConsumeVideoShare(w http.ResponseWriter, r *http.Request)
 		var err error
 		sessionValue, sessionBytes, err = newOpaqueHex(videoShareTokenBytes)
 		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
+			writeErr(w, r, http.StatusInternalServerError, err)
 			return
 		}
 		sessionHash = digestShareSecret(sessionBytes)
@@ -120,18 +120,22 @@ func (s *Server) handleConsumeVideoShare(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		switch {
 		case errors.Is(err, catalog.ErrVideoShareConsumed):
-			writeErr(w, http.StatusGone, err)
+			writeErr(w, r, http.StatusGone, err)
 		case errors.Is(err, catalog.ErrVideoShareUnavailable):
-			writeErr(w, http.StatusNotFound, err)
+			writeErr(w, r, http.StatusNotFound, err)
 		default:
-			writeErr(w, http.StatusInternalServerError, err)
+			writeServiceUnavailable(w, r, "claim video share", err)
 		}
 		return
 	}
 
 	v, err := s.availableVideo(r.Context(), share.VideoID)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, catalog.ErrVideoShareUnavailable)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, r, http.StatusNotFound, catalog.ErrVideoShareUnavailable)
+		} else {
+			writeServiceUnavailable(w, r, "load shared video", err)
+		}
 		return
 	}
 	setVideoShareSessionCookie(w, r, sessionValue, share.SessionExpiresAt, now)
@@ -153,7 +157,7 @@ func (s *Server) handleSharedVideoSubtitles(w http.ResponseWriter, r *http.Reque
 	}
 	subs, err := s.loadVideoSubtitles(r.Context(), v)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err)
+		writeErr(w, r, http.StatusBadGateway, err)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -167,7 +171,7 @@ func (s *Server) handleSharedVideoView(w http.ResponseWriter, r *http.Request) {
 	}
 	views, err := s.Catalog.IncrementView(r.Context(), v.ID)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeErr(w, r, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"views": views})
@@ -212,7 +216,7 @@ func (s *Server) handleSharedSubtitleFile(w http.ResponseWriter, r *http.Request
 	}
 	index, err := strconv.Atoi(routeParam(r, "index"))
 	if err != nil || index < 0 {
-		writeErr(w, http.StatusBadRequest, errors.New("invalid subtitle index"))
+		writeErr(w, r, http.StatusBadRequest, errors.New("invalid subtitle index"))
 		return
 	}
 	s.serveSubtitleSelection(w, r, v, index)
@@ -231,12 +235,20 @@ func (s *Server) activeSharedVideo(w http.ResponseWriter, r *http.Request) (*cat
 		s.shareCurrentTime(),
 	)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, catalog.ErrVideoShareUnavailable) {
+			http.NotFound(w, r)
+		} else {
+			writeServiceUnavailable(w, r, "validate video share", err)
+		}
 		return nil, false
 	}
 	v, err := s.availableVideo(r.Context(), videoID)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+		} else {
+			writeServiceUnavailable(w, r, "load shared video", err)
+		}
 		return nil, false
 	}
 	return v, true
@@ -247,7 +259,10 @@ func (s *Server) availableVideo(ctx context.Context, id string) (*catalog.Video,
 		return nil, sql.ErrNoRows
 	}
 	v, err := s.videoByPublicID(ctx, id)
-	if err != nil || v.Hidden {
+	if err != nil {
+		return nil, err
+	}
+	if v.Hidden {
 		return nil, sql.ErrNoRows
 	}
 	if v.DriveID == localUploadDriveID {
@@ -255,11 +270,16 @@ func (s *Server) availableVideo(ctx context.Context, id string) (*catalog.Video,
 	}
 	if _, err := s.Catalog.GetDrive(ctx, v.DriveID); err == nil {
 		return v, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
 	}
 	// Preserve the catalog-only development/test mode used by the existing API:
 	// when no drives have been configured at all, metadata remains readable.
 	drives, err := s.Catalog.ListDrives(ctx)
-	if err != nil || len(drives) > 0 {
+	if err != nil {
+		return nil, err
+	}
+	if len(drives) > 0 {
 		return nil, sql.ErrNoRows
 	}
 	return v, nil
@@ -423,23 +443,23 @@ func (s *Server) serveSubtitleSelection(
 	for attempt := 0; attempt < 2; attempt++ {
 		subs, err := s.loadVideoSubtitles(r.Context(), v)
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err)
+			writeErr(w, r, http.StatusBadGateway, err)
 			return
 		}
 		if index >= len(subs) {
-			writeErr(w, http.StatusNotFound, errors.New("subtitle not found"))
+			writeErr(w, r, http.StatusNotFound, errors.New("subtitle not found"))
 			return
 		}
 		sub = subs[index]
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, sub.URL, nil)
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err)
+			writeErr(w, r, http.StatusBadGateway, err)
 			return
 		}
 		req.Header.Set("User-Agent", "Mozilla/5.0")
 		resp, err = subtitleHTTPClient.Do(req)
 		if err != nil {
-			writeErr(w, http.StatusBadGateway, err)
+			writeErr(w, r, http.StatusBadGateway, err)
 			return
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -451,22 +471,22 @@ func (s *Server) serveSubtitleSelection(
 			s.invalidateSubtitleCache(v.ID)
 			continue
 		}
-		writeErr(w, http.StatusBadGateway, fmt.Errorf("subtitle upstream status=%d", status))
+		writeErr(w, r, http.StatusBadGateway, fmt.Errorf("subtitle upstream status=%d", status))
 		return
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSubtitleBytes+1))
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err)
+		writeErr(w, r, http.StatusBadGateway, err)
 		return
 	}
 	if int64(len(data)) > maxSubtitleBytes {
-		writeErr(w, http.StatusBadGateway, errSubtitleTooLarge)
+		writeErr(w, r, http.StatusBadGateway, errSubtitleTooLarge)
 		return
 	}
 	data, err = normalizeSubtitleUTF8(data, resp.Header.Get("Content-Type"), maxSubtitleBytes)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err)
+		writeErr(w, r, http.StatusBadGateway, err)
 		return
 	}
 	w.Header().Set("Content-Type", subtitleContentType(sub.Ext))

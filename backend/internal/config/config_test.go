@@ -6,93 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"gopkg.in/yaml.v3"
 )
-
-func TestRequiresAdminSetup(t *testing.T) {
-	if !RequiresAdminSetup(&Config{Server: Server{Admin: Admin{Username: DefaultAdminUsername, Password: DefaultAdminPassword}}}) {
-		t.Fatal("default admin credentials should require setup")
-	}
-	if RequiresAdminSetup(&Config{Server: Server{Admin: Admin{Username: "owner", Password: "secret123"}}}) {
-		t.Fatal("custom admin credentials should not require setup")
-	}
-}
-
-func TestWriteAdminCredentialsUpdatesConfigFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte(`
-server:
-  listen: "127.0.0.1:9192"
-  admin:
-    username: "admin"
-    password: "admin123"
-storage:
-  db_path: "./data/video-site.db"
-`), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	if err := WriteAdminCredentials(path, "owner", "new-secret"); err != nil {
-		t.Fatalf("write admin credentials: %v", err)
-	}
-
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.Server.Admin.Username != "owner" {
-		t.Fatalf("username = %q, want owner", cfg.Server.Admin.Username)
-	}
-	if cfg.Server.Admin.Password != "new-secret" {
-		t.Fatalf("password = %q, want new-secret", cfg.Server.Admin.Password)
-	}
-	if cfg.Server.Listen != "127.0.0.1:9192" {
-		t.Fatalf("listen = %q, want preserved value", cfg.Server.Listen)
-	}
-	if cfg.Storage.DBPath != "./data/video-site.db" {
-		t.Fatalf("db path = %q, want preserved value", cfg.Storage.DBPath)
-	}
-}
-
-func TestRedactAdminCredentialsPreservesOtherConfig(t *testing.T) {
-	source := []byte(`# retained comment
-server:
-  listen: "127.0.0.1:9192"
-  admin:
-    username: "source-owner"
-    password: "source-secret"
-  future_option: "keep-me"
-storage:
-  db_path: "./data/video-site.db"
-`)
-	redacted, err := RedactAdminCredentials(source)
-	if err != nil {
-		t.Fatalf("redact admin credentials: %v", err)
-	}
-	if strings.Contains(string(redacted), "source-owner") ||
-		strings.Contains(string(redacted), "source-secret") {
-		t.Fatalf("redacted config still contains administrator credentials:\n%s", redacted)
-	}
-	if !strings.Contains(string(redacted), "# retained comment") {
-		t.Fatalf("redaction discarded unrelated config:\n%s", redacted)
-	}
-	var document map[string]any
-	if err := yaml.Unmarshal(redacted, &document); err != nil {
-		t.Fatalf("parse redacted config: %v", err)
-	}
-	server, ok := document["server"].(map[string]any)
-	if !ok {
-		t.Fatalf("redacted server config = %#v", document["server"])
-	}
-	admin, ok := server["admin"].(map[string]any)
-	if !ok || admin["username"] != "" || admin["password"] != "" {
-		t.Fatalf("redacted administrator config = %#v", server["admin"])
-	}
-	if server["future_option"] != "keep-me" {
-		t.Fatalf("redacted future server option = %#v", server["future_option"])
-	}
-}
 
 func TestLoadDefaultScannerVideoExtensionsIncludeSTRM(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -151,7 +65,7 @@ func TestLoggingDefaultsAndCanBeDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !defaults.Logging.IsFileEnabled() || defaults.Logging.Directory != "./data/logs" ||
-		defaults.Logging.MaxFileSizeMB != 10 || defaults.Logging.MaxTotalSizeMB != 50 {
+		defaults.Logging.MaxFileSizeMB != 5 || defaults.Logging.MaxTotalSizeMB != 30 {
 		t.Fatalf("logging defaults = %+v", defaults.Logging)
 	}
 
@@ -229,38 +143,38 @@ scanner:
 	}
 }
 
-func TestPreviewConcurrency(t *testing.T) {
+func TestGlobalPreviewConcurrency(t *testing.T) {
 	cfg, err := Parse([]byte(`
-preview:
-  concurrency: 3
+generation:
+  preview_concurrency: 3
 `))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
 	}
-	if got := cfg.Preview.Concurrency; got != 3 {
+	if got := cfg.Generation.PreviewConcurrency; got != 3 {
 		t.Fatalf("preview concurrency = %d, want 3", got)
 	}
-	maximum, err := Parse([]byte("preview:\n  concurrency: 5\n"))
+	maximum, err := Parse([]byte("generation:\n  preview_concurrency: 5\n"))
 	if err != nil {
 		t.Fatalf("parse maximum preview concurrency: %v", err)
 	}
-	if got := maximum.Preview.Concurrency; got != MaxPreviewConcurrency {
-		t.Fatalf("maximum preview concurrency = %d, want %d", got, MaxPreviewConcurrency)
+	if got := maximum.Generation.PreviewConcurrency; got != MaxGenerationConcurrency {
+		t.Fatalf("maximum preview concurrency = %d, want %d", got, MaxGenerationConcurrency)
 	}
 
 	defaults, err := Parse([]byte(`{}`))
 	if err != nil {
 		t.Fatalf("parse default config: %v", err)
 	}
-	if got := defaults.Preview.Concurrency; got != DefaultPreviewConcurrency {
-		t.Fatalf("default preview concurrency = %d, want %d", got, DefaultPreviewConcurrency)
+	if got := defaults.Generation.PreviewConcurrency; got != DefaultGenerationConcurrency {
+		t.Fatalf("default preview concurrency = %d, want %d", got, DefaultGenerationConcurrency)
 	}
 }
 
-func TestPreviewConcurrencyRejectsInvalidValue(t *testing.T) {
+func TestGlobalPreviewConcurrencyRejectsInvalidValue(t *testing.T) {
 	_, err := Parse([]byte(`
-preview:
-  concurrency: 6
+generation:
+  preview_concurrency: 6
 `))
 	if err == nil || !strings.Contains(err.Error(), "must be between 1 and 5") {
 		t.Fatalf("parse error = %v, want concurrency validation error", err)
@@ -470,4 +384,29 @@ func hasVideoExtension(exts []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestGenerationConcurrencyDefaultsAndValidation(t *testing.T) {
+	cfg, err := Parse([]byte("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Generation.ThumbnailConcurrency != 1 || cfg.Generation.PreviewConcurrency != 1 || cfg.Generation.FingerprintConcurrency != 1 || cfg.Preview.FFmpegThreads != 1 {
+		t.Fatalf("unsafe generation defaults: generation=%+v threads=%d", cfg.Generation, cfg.Preview.FFmpegThreads)
+	}
+	for _, key := range []string{"thumbnail_concurrency", "preview_concurrency", "fingerprint_concurrency"} {
+		for _, value := range []string{"-1", "6", "abc"} {
+			if _, err := Parse([]byte("generation:\n  " + key + ": " + value + "\n")); err == nil {
+				t.Fatalf("accepted %s=%s", key, value)
+			}
+		}
+		if _, err := Parse([]byte("generation:\n  " + key + ": 5\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, value := range []string{"-1", "17"} {
+		if _, err := Parse([]byte("preview:\n  ffmpeg_threads: " + value + "\n")); err == nil {
+			t.Fatalf("accepted threads=%s", value)
+		}
+	}
 }
