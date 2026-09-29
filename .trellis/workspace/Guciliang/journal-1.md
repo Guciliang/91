@@ -27,3 +27,26 @@ Documented the repository-backed frontend directory, component, hook, state-mana
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: Integrated upstream and fixed SQLite writer contention
+<!-- trellis-session: v=2 fp=8d6d6abb47ba0cff -->
+
+**Date**: 2026-09-29
+**Task**: Integrated upstream and fixed SQLite writer contention
+**Branch**: `main`
+
+### Summary
+
+Merged upstream/main while preserving fork features; fixed inherited SQLite SQLITE_BUSY contention with bounded, context-aware transaction retries. Uncached backend suite and npm run verify passed; user manually confirmed Docker playback. Commits: ad600a0 and 99166cc. Task archived as 6fa3c40; no push.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ad600a0` | Merge upstream main while preserving fork features |
+| `99166cc` | Retry transient SQLite catalog write contention |
+
+### Status
+
+[OK] **Completed**
