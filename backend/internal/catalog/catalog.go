@@ -791,7 +791,10 @@ func (c *Catalog) UpdateVideoMeta(ctx context.Context, id string, p VideoMetaPat
 	args = append(args, now)
 	args = append(args, id)
 	q := `UPDATE videos SET ` + strings.Join(parts, ", ") + ` WHERE id = ?`
-	if _, err := c.db.ExecContext(ctx, q, args...); err != nil {
+	if _, err := withImmediateWriteRetry(ctx, c.db, defaultBusyRetryPolicy, func(conn *sql.Conn) (struct{}, error) {
+		_, err := conn.ExecContext(ctx, q, args...)
+		return struct{}{}, err
+	}); err != nil {
 		return err
 	}
 	if p.TagsSet {

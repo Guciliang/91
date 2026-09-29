@@ -17,55 +17,31 @@ func (c *Catalog) InsertScannedVideo(ctx context.Context, v *Video, seenFileIDs 
 	if v == nil || v.ID == "" || v.DriveID == "" || v.FileID == "" {
 		return false, errors.New("catalog: scanned video requires video, drive, and file IDs")
 	}
-	conn, err := c.db.Conn(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer conn.Close()
-	// Acquire SQLite's writer reservation before reading candidates. A deferred
-	// read transaction could observe an obsolete snapshot before trying to write.
-	// This also coordinates scanners using separate Catalog instances.
-	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
-		}
-	}()
-
-	var exists bool
-	if err := conn.QueryRowContext(ctx, `SELECT EXISTS (
+	return withImmediateWriteRetry(ctx, c.db, defaultBusyRetryPolicy, func(conn *sql.Conn) (bool, error) {
+		var exists bool
+		if err := conn.QueryRowContext(ctx, `SELECT EXISTS (
 SELECT 1 FROM videos WHERE id = ? OR (drive_id = ? AND file_id = ?)
 )`, v.ID, v.DriveID, v.FileID).Scan(&exists); err != nil {
-		return false, err
-	}
-	if exists {
-		return false, nil
-	}
-	duplicate, err := findScannedVideoDuplicate(ctx, conn, v, seenFileIDs)
-	if err != nil {
-		return false, err
-	}
-	if duplicate != nil {
-		if err := recordScannedDuplicate(ctx, conn, v, duplicate, DuplicateOutcomeSkipped); err != nil {
 			return false, err
 		}
-		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		if exists {
+			return false, nil
+		}
+		duplicate, err := findScannedVideoDuplicate(ctx, conn, v, seenFileIDs)
+		if err != nil {
 			return false, err
 		}
-		committed = true
-		return false, nil
-	}
-	if _, err := upsertVideoRow(ctx, conn, v); err != nil {
-		return false, err
-	}
-	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return false, err
-	}
-	committed = true
-	return true, nil
+		if duplicate != nil {
+			if err := recordScannedDuplicate(ctx, conn, v, duplicate, DuplicateOutcomeSkipped); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
+		if _, err := upsertVideoRow(ctx, conn, v); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
 }
 
 // FindScannedVideoDuplicate applies the same duplicate policy to an existing

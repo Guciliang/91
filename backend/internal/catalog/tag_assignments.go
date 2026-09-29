@@ -326,23 +326,22 @@ func (c *Catalog) replaceManualVideoTags(ctx context.Context, videoID string, la
 // ReplaceAutoVideoTags 用给定分配覆盖视频的引擎标签（source IN auto/legacy），
 // 其它来源的行保留。人工锁定视频直接跳过。返回是否发生了变更。
 func (c *Catalog) ReplaceAutoVideoTags(ctx context.Context, videoID string, assignments []TagAssignment) (bool, error) {
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
+	return withImmediateWriteRetry(ctx, c.db, defaultBusyRetryPolicy, func(conn *sql.Conn) (bool, error) {
+		changed, err := replaceAutoVideoTagsTx(ctx, conn, videoID, assignments)
+		if err != nil || !changed {
+			return changed, err
+		}
+		if err := syncVideoTagsJSONTx(ctx, conn, videoID, false); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
+}
 
-	changed, err := replaceAutoVideoTagsTx(ctx, tx, videoID, assignments)
-	if err != nil {
-		return false, err
-	}
-	if !changed {
-		return false, nil
-	}
-	if err := syncVideoTagsJSONTx(ctx, tx, videoID, false); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
+type videoTagTransaction interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 type videoTagAssignmentRow struct {
@@ -361,7 +360,7 @@ type desiredVideoTagAssignment struct {
 
 // replaceAutoVideoTagsTx 是 ReplaceAutoVideoTags 的事务内实现，供批量重算复用。
 // 返回是否有实际变更（用于跳过无谓的 JSON 同步）。
-func replaceAutoVideoTagsTx(ctx context.Context, tx *sql.Tx, videoID string, assignments []TagAssignment) (bool, error) {
+func replaceAutoVideoTagsTx(ctx context.Context, tx videoTagTransaction, videoID string, assignments []TagAssignment) (bool, error) {
 	// The manual lock may have changed while this transaction waited to write.
 	if hasManualTagsTx(ctx, tx, videoID) {
 		return false, nil
@@ -712,7 +711,7 @@ func (c *Catalog) getTagByLabelTx(ctx context.Context, tx *sql.Tx, label string)
 	return getTagByLabelTxRaw(ctx, tx, label)
 }
 
-func getTagByLabelTxRaw(ctx context.Context, tx *sql.Tx, label string) (Tag, error) {
+func getTagByLabelTxRaw(ctx context.Context, tx videoTagTransaction, label string) (Tag, error) {
 	row := tx.QueryRowContext(ctx,
 		`SELECT `+tagSelectCols+` FROM tags WHERE label = ? COLLATE NOCASE`,
 		label)
@@ -726,13 +725,13 @@ func (c *Catalog) getTagByIDTx(ctx context.Context, tx *sql.Tx, id int64) (Tag, 
 	return scanTag(row)
 }
 
-func hasManualTagsTx(ctx context.Context, tx *sql.Tx, videoID string) bool {
+func hasManualTagsTx(ctx context.Context, tx videoTagTransaction, videoID string) bool {
 	var manual int
 	err := tx.QueryRowContext(ctx, `SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, videoID).Scan(&manual)
 	return err == nil && manual == 1
 }
 
-func syncVideoTagsJSONTx(ctx context.Context, tx *sql.Tx, videoID string, manual bool) error {
+func syncVideoTagsJSONTx(ctx context.Context, tx videoTagTransaction, videoID string, manual bool) error {
 	rows, err := tx.QueryContext(ctx, `
 SELECT t.label
 FROM video_tags vt
