@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/09-29-upstream-review/research/upstream-diff.md", "reason": "Check the merged result against the exact conflicts and local-feature preservation matrix."}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "Review frontend accessibility and component behavior after upstream migration."}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "Review frontend API/configuration types and boundaries."}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Run and review the established frontend test/type/build gates."}

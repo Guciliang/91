@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/09-29-upstream-review/research/upstream-diff.md", "reason": "Authoritative upstream/fork conflict, feature-preservation, and regression-test inventory."}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend spec index for the player, admin-drive, and shared-toast integration."}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "Component composition, accessibility, and UI conventions for player/admin changes."}
+{"file": ".trellis/spec/frontend/hook-guidelines.md", "reason": "Hook lifecycle, cancellation, and async behavior guidance for playback changes."}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "State/context conventions for drive configuration and shared toast integration."}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "Type-safe frontend API and configuration integration guidance."}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Required frontend tests, type checks, build, and review checks."}
