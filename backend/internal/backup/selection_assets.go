@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/video-site/backend/internal/drives/telegramstorage"
 	"github.com/video-site/backend/internal/localpath"
 	"github.com/video-site/backend/internal/mediaasset"
 )
@@ -28,7 +29,9 @@ func (m *Manager) snapshotSelectedPreviews(
 		candidates = append(candidates, mediaasset.ThumbnailAssetPathCandidates(m.previewPath, videoID)...)
 		candidates = append(candidates, mediaasset.FrameSignaturePath(m.previewPath, videoID))
 		if previewPath := strings.TrimSpace(state.SelectedPreviewPaths[videoID]); previewPath != "" {
-			candidates = append(candidates, previewPath)
+			if absolute, ok := localpath.Managed(m.previewPath, previewPath); ok {
+				candidates = append(candidates, absolute)
+			}
 		}
 		for _, candidate := range candidates {
 			relative, ok := localpath.RelativeWithin(m.previewPath, candidate)
@@ -62,6 +65,10 @@ func (m *Manager) snapshotSelectedUploads(
 		if filepath.Base(fileName) != fileName || strings.ContainsAny(fileName, `/\`+"\x00") {
 			return fmt.Errorf("backup: invalid local upload file id %q", fileName)
 		}
+		if _, ok := state.TelegramUploadFiles[fileName]; ok {
+			continue
+		}
+
 		if err := snapshotSelectedFile(ctx, sourceRoot, destination, filepath.Join(sourceRoot, fileName)); err != nil {
 			return fmt.Errorf("backup: snapshot upload %s: %w", fileName, err)
 		}
@@ -223,4 +230,29 @@ func sortedSetValues(values map[string]struct{}) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func (m *Manager) snapshotTelegramUploads(ctx context.Context, snapshotRoot string, state snapshotSelectionState) error {
+	root := m.telegramFilesRoot()
+	destination := filepath.Join(snapshotRoot, "payload", "uploads")
+	if err := os.MkdirAll(destination, 0700); err != nil {
+		return err
+	}
+	for fileName, local := range state.TelegramUploadFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		source, err := telegramstorage.Path(root, local.FileID)
+		if err != nil {
+			return fmt.Errorf("backup: TG video %s is unavailable", fileName)
+		}
+		info, err := os.Stat(source)
+		if err != nil {
+			return fmt.Errorf("backup: TG video %s is missing", fileName)
+		}
+		if err := linkOrCopy(source, filepath.Join(destination, fileName), info.Mode().Perm()); err != nil {
+			return fmt.Errorf("backup: cannot snapshot TG video %s", fileName)
+		}
+	}
+	return nil
 }

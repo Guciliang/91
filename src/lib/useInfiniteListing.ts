@@ -1,4 +1,17 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  filterDeletedVideos,
+  getDeletedVideoIDs,
+  subscribeVideoDeletions,
+} from "@/lib/videoDeletions";
 import type { VideoFeedCursor } from "@/data/videos";
 import {
   emptyInfiniteListingState,
@@ -8,15 +21,15 @@ import {
   nextListingRequest,
   type InfiniteListingState,
 } from "@/lib/infiniteListing";
-import type {
-  InfiniteFeedRequest,
-  InfiniteFeedSource,
+import {
+  fetchInfiniteFeedRange,
+  type InfiniteFeedRequest,
+  type InfiniteFeedSource,
 } from "@/lib/infiniteFeedSource";
 import type { VideoItem } from "@/types";
 
 const INFINITE_LISTING_CACHE_TTL_MS = 60_000;
 const INFINITE_LISTING_CACHE_MAX_ENTRIES = 8;
-const MAX_INITIAL_BATCH_SIZE = 240;
 
 const EMPTY_CURSOR: VideoFeedCursor = { feedToken: "", position: 0 };
 
@@ -31,6 +44,13 @@ type CachedInfiniteListing = {
 };
 
 const infiniteListingCache = new Map<string, CachedInfiniteListing>();
+
+subscribeVideoDeletions(() => {
+  for (const [key, cached] of infiniteListingCache) {
+    const items = filterDeletedVideos(cached.items);
+    if (items !== cached.items) infiniteListingCache.set(key, { ...cached, items });
+  }
+});
 
 function readInfiniteListingCache(
   key: string,
@@ -59,7 +79,10 @@ function readInfiniteListingCache(
 
 function writeInfiniteListingCache(entry: CachedInfiniteListing) {
   infiniteListingCache.delete(entry.key);
-  infiniteListingCache.set(entry.key, entry);
+  infiniteListingCache.set(entry.key, {
+    ...entry,
+    items: filterDeletedVideos(entry.items),
+  });
   while (infiniteListingCache.size > INFINITE_LISTING_CACHE_MAX_ENTRIES) {
     const oldestKey = infiniteListingCache.keys().next().value as
       | string
@@ -81,12 +104,12 @@ function cacheIsFresh(entry: CachedInfiniteListing, now: number): boolean {
   return now - entry.receivedAt < INFINITE_LISTING_CACHE_TTL_MS;
 }
 
-function initialBatchSize(restoreCount: number, batchSize: number): number {
+function initialRequestSize(restoreCount: number, batchSize: number): number {
   const normalizedBatch = Math.max(1, Math.floor(batchSize));
   if (!Number.isInteger(restoreCount) || restoreCount <= normalizedBatch) {
     return normalizedBatch;
   }
-  return Math.min(MAX_INITIAL_BATCH_SIZE, restoreCount);
+  return restoreCount;
 }
 
 function errorValue(error: unknown): Error {
@@ -128,6 +151,11 @@ export function useInfiniteListing(
   source: InfiniteFeedSource,
   options: UseInfiniteListingOptions = {}
 ) {
+  const deletedVideoIDs = useSyncExternalStore(
+    subscribeVideoDeletions,
+    getDeletedVideoIDs,
+    getDeletedVideoIDs
+  );
   const enabled = options.enabled ?? true;
   const pausePagination = options.pausePagination ?? false;
   const key = source.key;
@@ -166,8 +194,7 @@ export function useInfiniteListing(
       controllerRef.current = controller;
       dispatch({ type: "load-start", requestID });
 
-      feed
-        .fetchBatch(request, { signal: controller.signal })
+      fetchInfiniteFeedRange(feed, request, { signal: controller.signal })
         .then((result) => {
           if (controller.signal.aborted) return;
           dispatch({
@@ -175,7 +202,7 @@ export function useInfiniteListing(
             requestID,
             requestCursor: request.cursor,
             cursor: result.cursor,
-            items: result.items ?? [],
+            items: filterDeletedVideos(result.items ?? []),
             total: result.total ?? 0,
             exhausted: result.exhausted,
             receivedAt: Date.now(),
@@ -201,7 +228,7 @@ export function useInfiniteListing(
             });
             executeRequest(restartID, feed, {
               cursor: EMPTY_CURSOR,
-              size: initialBatchSize(restoreCount, feed.batchSize),
+              size: initialRequestSize(restoreCount, feed.batchSize),
             });
             return;
           }
@@ -264,7 +291,7 @@ export function useInfiniteListing(
     });
     sendRequest(requestID, sourceRef.current, {
       cursor: restoreCursor,
-      size: initialBatchSize(restoreCount, batchSize),
+      size: initialRequestSize(restoreCount, batchSize),
     });
 
     return () => {
@@ -325,10 +352,26 @@ export function useInfiniteListing(
   }, [reload, requestBatch]);
 
   const matchesQuery = state.key === key;
-  const items = matchesQuery ? state.items : [];
+  const items = useMemo(
+    () => matchesQuery ? filterDeletedVideos(state.items, deletedVideoIDs) : [],
+    [matchesQuery, state.items, deletedVideoIDs]
+  );
   const initialLoading =
     enabled &&
     (!matchesQuery || (state.status === "initial-loading" && items.length === 0));
+
+  // Removing the last loaded card must not strand a feed that still has pages.
+  useEffect(() => {
+    if (
+      enabled && !pausePagination && matchesQuery && items.length === 0 &&
+      state.status === "ready" && !state.exhausted
+    ) {
+      requestBatch();
+    }
+  }, [
+    enabled, pausePagination, matchesQuery, items.length,
+    state.status, state.exhausted, state.requestedCount, requestBatch,
+  ]);
 
   return {
     items,

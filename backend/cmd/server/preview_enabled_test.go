@@ -79,14 +79,3 @@ func TestGlobalPreviewHotReloadBackfillsEverySource(t *testing.T) {
 		t.Fatal("late attached worker ignored global switch")
 	}
 }
-
-func TestCrawlerUploadUsesGlobalPreviewRequirement(t *testing.T) {
-	assets := catalog.CrawlerAssetCounts{Local: 1}
-	assets.Teaser.Pending = 1
-	if reason := crawlerUploadAssetBlockReason(false, assets); reason != "" {
-		t.Fatalf("disabled previews blocked upload: %s", reason)
-	}
-	if reason := crawlerUploadAssetBlockReason(true, assets); reason == "" {
-		t.Fatal("enabled previews did not block incomplete upload")
-	}
-}

@@ -18,6 +18,7 @@ import (
 	sdk "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/readretry"
 	"github.com/video-site/backend/internal/streamhttp"
 )
 
@@ -59,9 +60,11 @@ func (e *hlsBusinessError) Error() string {
 func (e *hlsBusinessError) Unwrap() error { return drives.ErrGenerationStreamUnavailable }
 
 type Driver struct {
-	id               string
-	cookie           string
-	rootID           string
+	id     string
+	cookie string
+	rootID string
+	// client holds the shared HTTP configuration and upload auth state.
+	// After Init, invoke SDK request methods through newSDKClient(ctx).
 	client           *sdk.Pan115Client
 	apiHTTPClient    *http.Client
 	streamHTTPClient *http.Client
@@ -286,7 +289,8 @@ func (d *Driver) getFilesContext(ctx context.Context, dirID string, options ...s
 			return nil, ctxErr
 		}
 		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("115 list request timed out after %s: %v", d.listTimeout, err)
+			// Preserve the timeout cause for the scanner's bounded directory retries.
+			return nil, fmt.Errorf("115 list request timed out after %s: %w", d.listTimeout, err)
 		}
 		return nil, err
 	}
@@ -441,7 +445,7 @@ func (d *Driver) ListDirsOnly(ctx context.Context, dirID string) ([]drives.Entry
 }
 
 func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error) {
-	f, err := d.newSDKClient().GetFile(fileID)
+	f, err := d.getFile(ctx, fileID)
 	if err != nil {
 		return nil, fmt.Errorf("115 stat: %w", err)
 	}
@@ -453,6 +457,22 @@ func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error)
 	return &e, nil
 }
 
+// DirectoryName resolves the scan root name through a direct metadata lookup.
+func (d *Driver) DirectoryName(ctx context.Context, dirID string) (string, error) {
+	// The account root is virtual and has no file metadata or directory name.
+	if dirID == "" || dirID == "0" {
+		return "", nil
+	}
+	entry, err := d.Stat(ctx, dirID)
+	if err != nil {
+		return "", err
+	}
+	if entry == nil || !entry.IsDir {
+		return "", drives.ErrNotSupported
+	}
+	return entry.Name, nil
+}
+
 func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLink, error) {
 	return d.streamURLWithUA(ctx, fileID, d.ua)
 }
@@ -462,14 +482,32 @@ func (d *Driver) StreamURLWithHeader(ctx context.Context, fileID string, header 
 }
 
 func (d *Driver) streamURLWithUA(ctx context.Context, fileID string, ua string) (*drives.StreamLink, error) {
-	// 需要先拿到 pickCode
-	client := d.newSDKClient()
-	f, err := client.GetFile(fileID)
-	if err != nil {
-		return nil, wrap115StreamTransientError("115 get file", err)
+	ctx, cancel := context.WithTimeout(ctx, p115ReadTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	d.rememberPickCode(fileID, f.PickCode)
-	info, ua, err := d.downloadInfo(f.PickCode, ua)
+	// Scanning and previous resolutions already remember pick codes. Reuse them
+	// when refreshing a signed URL to avoid an unnecessary get_info dependency.
+	pickCode := d.rememberedPickCode(fileID)
+	cachedPickCode := pickCode != ""
+	if pickCode == "" {
+		var err error
+		pickCode, err = d.lookupPickCode(ctx, fileID)
+		if err != nil {
+			return nil, wrap115StreamTransientError("115 get file", err)
+		}
+	}
+	info, ua, err := d.downloadInfo(ctx, pickCode, ua)
+	if cachedPickCode && errors.Is(err, sdk.ErrPickCodeNotExist) {
+		// Refresh only an explicitly rejected cached pick code. Authentication,
+		// throttling and transport failures must not cause extra file lookups.
+		pickCode, err = d.lookupPickCode(ctx, fileID)
+		if err != nil {
+			return nil, wrap115StreamTransientError("115 get file", err)
+		}
+		info, ua, err = d.downloadInfo(ctx, pickCode, ua)
+	}
 	if err != nil {
 		return nil, wrap115StreamTransientError("115 download url", err)
 	}
@@ -590,7 +628,7 @@ func (d *Driver) resolveGenerationStream(ctx context.Context, fileID string) (*d
 		if d.client == nil {
 			return nil, fmt.Errorf("115 hls get file: %w", drives.ErrGenerationStreamUnavailable)
 		}
-		f, err := d.newSDKClient().GetFile(fileID)
+		f, err := d.getFile(ctx, fileID)
 		if err != nil {
 			return nil, wrap115StreamTransientError("115 hls get file", err)
 		}
@@ -818,14 +856,36 @@ func cloneStreamLink(link *drives.StreamLink) *drives.StreamLink {
 	return &clone
 }
 
-func (d *Driver) downloadInfo(pickCode string, ua string) (*sdk.DownloadInfo, string, error) {
+func (d *Driver) lookupPickCode(ctx context.Context, fileID string) (string, error) {
+	f, err := d.getFile(ctx, fileID)
+	if err != nil {
+		return "", err
+	}
+	if f == nil || strings.TrimSpace(f.PickCode) == "" {
+		return "", sdk.ErrPickCodeIsEmpty
+	}
+	pickCode := strings.TrimSpace(f.PickCode)
+	d.rememberPickCode(fileID, pickCode)
+	return pickCode, nil
+}
+
+func (d *Driver) downloadInfo(ctx context.Context, pickCode string, ua string) (*sdk.DownloadInfo, string, error) {
+	if d.client == nil || d.client.Client == nil {
+		return nil, ua, errors.New("115 client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(ctx, p115ReadTimeout)
+	defer cancel()
 	ua = strings.TrimSpace(ua)
 	if ua == "" {
 		ua = d.ua
 	}
-	info, err := d.newSDKClient().DownloadWithUA(pickCode, ua)
+	// This POST only resolves a download link, so transport failures can safely
+	// use the same read retry policy as metadata lookups.
+	info, err := readretry.Do(ctx, func() (*sdk.DownloadInfo, error) {
+		return d.newSDKClient(ctx).DownloadWithUA(pickCode, ua)
+	}, readretry.Options{})
 	if err != nil {
-		return nil, "", err
+		return nil, ua, err
 	}
 	return info, ua, nil
 }
@@ -869,7 +929,7 @@ func (d *Driver) Rename(ctx context.Context, fileID, newName string) error {
 	if newName == "" {
 		return errors.New("p115 rename: empty newName")
 	}
-	if err := d.newSDKClient().Rename(fileID, newName); err != nil {
+	if err := d.newSDKClient(ctx).Rename(fileID, newName); err != nil {
 		return fmt.Errorf("p115 rename: %w", err)
 	}
 	return nil
@@ -886,7 +946,7 @@ func (d *Driver) Remove(ctx context.Context, fileID string) error {
 	if fileID == "" {
 		return errors.New("p115 remove: empty fileID")
 	}
-	if err := d.newSDKClient().Delete(fileID); err != nil {
+	if err := d.newSDKClient(ctx).Delete(fileID); err != nil {
 		return fmt.Errorf("p115 remove: %w", err)
 	}
 	return nil

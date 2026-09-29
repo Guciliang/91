@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { clamp } from "./mediaBuffer";
-import { classifyTouchSeekIntent } from "./useShortsSlideGestures";
+import { classifyTouchSeekIntent } from "./slideGestures";
 
 /**
  * 移动端上下翻页手势控制器。
@@ -696,6 +696,7 @@ export function createShortsSwipePager(host: ShortsSwipePagerHost) {
     const interrupted = cancelSettle() || Boolean(previous?.committed);
 
     const bail = () => {
+      setGestureActive(false);
       if (interrupted) settleToNearest();
     };
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useLocation } from "react-router";
 import linkUsedImage from "@/assets/share-link-used.webp";
+import { Footer } from "@/components/Footer";
 import { VideoInfoPanel } from "@/components/VideoInfoPanel";
 import { VideoMetaHeader } from "@/components/VideoMetaHeader";
 import { VideoPlayer } from "@/components/VideoPlayer";
@@ -156,15 +157,7 @@ export default function SharedVideoPage() {
         )}
       </main>
 
-      <footer className="share-page__footer">
-        <a
-          href="https://github.com/nianzhibai/91"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          © {new Date().getFullYear()} 91
-        </a>
-      </footer>
+      <Footer />
     </div>
   );
 }

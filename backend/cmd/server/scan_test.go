@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,6 +98,81 @@ func TestScanReportsAndPersistsPartialDiscovery(t *testing.T) {
 	}
 	if app.driveHasActiveWork(drv.ID()) {
 		t.Fatal("finished results must not keep the drive busy")
+	}
+}
+
+type finalPassScanDrive struct {
+	*serverTreeScanDrive
+	failures int
+	calls    int
+}
+
+func (d *finalPassScanDrive) List(ctx context.Context, dirID string) ([]drives.Entry, error) {
+	if dirID == "retry-dir" {
+		d.calls++
+		if d.calls <= d.failures {
+			return nil, io.ErrUnexpectedEOF
+		}
+	}
+	return d.serverTreeScanDrive.List(ctx, dirID)
+}
+
+func TestScanPersistsFinalRetryOutcomeAndProtectsUnreadableFiles(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		failures   int
+		calls      int
+		state      scanjob.State
+		errors     int
+		scanned    int
+		firstAdded int
+	}{
+		{"recovered", 3, 4, scanjob.Succeeded, 0, 3, 2},
+		{"still unavailable", 6, 6, scanjob.Partial, 1, 1, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			app, base := scanResultTestApp(t)
+			ctx := context.Background()
+			base.entries["root"] = []drives.Entry{
+				{ID: "retry-dir", Name: "Retry", IsDir: true},
+				{ID: "live-file", Name: "live.mp4", Size: 123},
+			}
+			base.entries["retry-dir"] = []drives.Entry{
+				{ID: "existing-file", Name: "existing.mp4", Size: 234},
+				{ID: "recovered-file", Name: "recovered.mp4", Size: 345},
+			}
+			now := time.Now()
+			if err := app.cat.UpsertVideo(ctx, &catalog.Video{
+				ID: "existing-row", DriveID: base.ID(), FileID: "existing-file", FileName: "existing.mp4",
+				Title: "Existing", Size: 234, ParentID: "retry-dir", AncestorDirIDs: []string{"root", "retry-dir"},
+				CreatedAt: now, UpdatedAt: now, PublishedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			drv := &finalPassScanDrive{serverTreeScanDrive: base, failures: tt.failures}
+			app.registry.Set(drv.ID(), drv)
+			// Two scans also exercise the guarded cleanup confirmation threshold:
+			// an unreadable subtree must never count as a missing source.
+			for round := 0; round < 2; round++ {
+				drv.calls = 0
+				result := app.runScan(ctx, drv.ID())
+				wantAdded := 0
+				if round == 0 {
+					wantAdded = tt.firstAdded
+				}
+				if result.State != tt.state || result.ErrorCount != tt.errors || len(result.Issues) != tt.errors ||
+					result.ScannedCount != tt.scanned || result.AddedCount != wantAdded || drv.calls != tt.calls {
+					t.Fatalf("round %d: result=%+v directory calls=%d", round, result, drv.calls)
+				}
+				stored, err := app.cat.LatestScanResults(ctx)
+				if err != nil || stored[drv.ID()].State != tt.state || stored[drv.ID()].ErrorCount != tt.errors {
+					t.Fatalf("stored result=%+v err=%v", stored, err)
+				}
+				if _, err := app.cat.GetVideo(ctx, "existing-row"); err != nil {
+					t.Fatalf("existing file was removed after directory retries: %v", err)
+				}
+			}
+		})
 	}
 }
 

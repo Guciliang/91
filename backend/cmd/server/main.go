@@ -27,11 +27,12 @@ import (
 	"github.com/video-site/backend/internal/crawlerupload"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/fingerprint"
+	"github.com/video-site/backend/internal/mediaimport"
 	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
-	"github.com/video-site/backend/internal/remoteupload"
 	"github.com/video-site/backend/internal/subtitles"
+	"github.com/video-site/backend/internal/telegram"
 )
 
 const (
@@ -71,7 +72,7 @@ func main() {
 	// uses same-directory renames; opening and migrating the restored catalog
 	// below is the commit check. If that check fails, every switched path is
 	// returned to its pre-restore value.
-	dataRoot := filepath.Dir(cfg.Storage.DBPath)
+	dataRoot := cfg.Storage.DataDir
 	_, pendingRestoreStatErr := os.Stat(backup.PendingMarkerPath(dataRoot))
 	pendingRestoreAtStartup := pendingRestoreStatErr == nil
 	appliedRestore, err := backup.ApplyPendingRestore(dataRoot)
@@ -118,7 +119,7 @@ func main() {
 		}
 	}()
 
-	cat, err := catalog.Open(cfg.Storage.DBPath)
+	cat, err := openApplicationCatalog(cfg.Storage)
 	if err != nil {
 		if appliedRestore != nil {
 			if rollbackErr := backup.RollbackAppliedRestore(appliedRestore, err); rollbackErr != nil {
@@ -143,30 +144,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure config manager: %v", err)
 	}
-	if _, err := migrateLegacyAdmin(context.Background(), cat, configManager); err != nil {
-		log.Fatalf("migrate administrator configuration: %v", err)
+	if composeFile := strings.TrimSpace(os.Getenv("VIDEO_TELEGRAM_COMPOSE")); composeFile != "" {
+		// The deployment endpoint and paths are resolved once, separately from panel settings.
+		// A missing/invalid file is reported by the Telegram status and probe.
+		_ = configManager.LoadTelegramCompose(composeFile)
 	}
-	legacyRuntimeSettings, err := loadLegacyRuntimeSettings(context.Background(), cat)
+	if err := migrateApplicationConfig(context.Background(), cat, configManager); err != nil {
+		log.Fatalf("migrate config.yaml: %v", err)
+	}
+	fileConfig, cfg, err = loadApplicationConfig(cfgPath, workingDir)
 	if err != nil {
-		log.Fatalf("load legacy runtime settings: %v", err)
-	}
-	configMigrated, err := configManager.MigrateLegacyRuntimeSettings(legacyRuntimeSettings)
-	if err != nil {
-		log.Fatalf("migrate config.yaml runtime settings: %v", err)
-	}
-	if err := cat.DeleteSettings(
-		context.Background(),
-		legacyNightlyStartTimeSetting,
-		legacyBuiltinTagsEnabledSetting,
-	); err != nil {
-		log.Fatalf("remove migrated SQLite configuration: %v", err)
-	}
-	if configMigrated {
-		fileConfig, cfg, err = loadApplicationConfig(cfgPath, workingDir)
-		if err != nil {
-			log.Fatalf("reload migrated config: %v", err)
-		}
-		log.Printf("[config] migrated runtime settings into config.yaml")
+		log.Fatalf("reload migrated config: %v", err)
 	}
 
 	app := &App{
@@ -230,12 +218,20 @@ func main() {
 	}
 	go app.runFingerprintReconciler(ctx)
 
-	remoteUploader, err := remoteupload.New(remoteupload.Config{
-		Catalog:     cat,
-		UploadDir:   app.localUploadDir(),
-		FFprobePath: cfg.Preview.FFprobePath,
-		DiskReserve: cfg.RemoteUpload.DiskReserveBytes,
-		IdleTimeout: time.Duration(cfg.RemoteUpload.IdleTimeoutSeconds) * time.Second,
+	telegramService := telegram.NewIntegration(cat, configManager, app.localUploadDir(), cfg.RemoteUpload.DiskReserveBytes)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = telegramService.Shutdown(shutdownCtx)
+	}()
+
+	remoteUploader, err := mediaimport.New(mediaimport.Config{
+		TelegramSource: telegramService,
+		Catalog:        cat,
+		UploadDir:      app.localUploadDir(),
+		FFprobePath:    cfg.Preview.FFprobePath,
+		DiskReserve:    cfg.RemoteUpload.DiskReserveBytes,
+		IdleTimeout:    time.Duration(cfg.RemoteUpload.IdleTimeoutSeconds) * time.Second,
 		OnVideoUploaded: func(v *catalog.Video) {
 			app.enqueueUploadedVideo(ctx, v)
 		},
@@ -246,6 +242,8 @@ func main() {
 	if err := remoteUploader.Start(ctx); err != nil {
 		log.Fatalf("start remote upload: %v", err)
 	}
+	telegramService.SetWake(remoteUploader.Wake)
+	telegramService.Start(ctx)
 
 	authr := &auth.Authenticator{Catalog: cat}
 	versionFilePath := strings.TrimSpace(os.Getenv("VIDEO_VERSION_FILE"))
@@ -262,12 +260,13 @@ func main() {
 		githubRepo = strings.TrimSpace(os.Getenv("GITHUB_REPO"))
 	}
 	backupManager, err := backup.NewManager(backup.Config{
-		Catalog:        cat,
-		AppConfig:      fileConfig,
-		RuntimeStorage: cfg.Storage,
-		ConfigPath:     cfgPath,
-		AppVersion:     appVersion,
-		RestartManaged: restartIsManaged(),
+		Catalog:           cat,
+		TelegramFilesRoot: func() string { return configManager.TelegramSettings().LocalFilesRoot },
+		AppConfig:         fileConfig,
+		RuntimeStorage:    cfg.Storage,
+		ConfigPath:        cfgPath,
+		AppVersion:        appVersion,
+		RestartManaged:    restartIsManaged(),
 	})
 	if err != nil {
 		log.Fatalf("configure backup service: %v", err)
@@ -276,7 +275,7 @@ func main() {
 	defer backupManager.Close()
 	backupTransferManager, err := backuptransfer.New(backuptransfer.Config{
 		Backups: backupManager,
-		RootDir: filepath.Join(filepath.Dir(cfg.Storage.DBPath), "backups", ".peer-transfer"),
+		RootDir: filepath.Join(cfg.Storage.DataDir, "backups", ".peer-transfer"),
 	})
 	if err != nil {
 		log.Fatalf("configure backup transfer service: %v", err)
@@ -313,6 +312,8 @@ func main() {
 	app.onTagsChanged = apiServer.InvalidateTagCache
 
 	adminServer := &api.AdminServer{
+		Telegram:               telegramService,
+		Imports:                remoteUploader,
 		Catalog:                cat,
 		Auth:                   authr,
 		Backups:                backupManager,
@@ -454,6 +455,7 @@ func main() {
 		WaitPreviewQueuesIdle:       app.waitAllPreviewQueuesIdle,
 		RunLocalAssetReconciliation: app.reconcileLocalGeneratedAssets,
 		RunMigration:                app.runCrawlerUploadMigration,
+		RunTelegramUpload:           app.runTelegramUploadMigration,
 		RestoreCrawlerVideos:        app.restoreScriptCrawlerVideos,
 		RunDedupeAssetCleanup:       app.cleanupDuplicateVideoAssets,
 	})
@@ -543,6 +545,24 @@ func loadApplicationConfig(path, workingDir string) (*config.Config, *config.Con
 	}
 	runtimeConfig.Logging = runtimeLogging
 	return fileConfig, &runtimeConfig, nil
+}
+
+// Convert legacy file references before workers, asset maintenance or HTTP
+// handlers can observe paths tied to the previous deployment directory.
+func openApplicationCatalog(storage config.Storage) (*catalog.Catalog, error) {
+	cat, err := catalog.Open(storage.DBPath)
+	if err != nil {
+		return nil, err
+	}
+	changed, err := cat.MigrateManagedPaths(context.Background(), storage.LocalPreviewDir)
+	if err != nil {
+		_ = cat.Close()
+		return nil, fmt.Errorf("convert managed file references: %w", err)
+	}
+	if changed > 0 {
+		log.Printf("[storage] converted %d catalog records to portable file references", changed)
+	}
+	return cat, nil
 }
 
 func readVersionFile(path string) string {

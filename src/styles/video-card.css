@@ -110,17 +110,17 @@
     box-shadow var(--transition-normal), background var(--transition-normal);
 }
 
-.video-card:hover,
-.video-card:focus-within {
-  background: var(--bg-elevated);
-  border-color: var(--border-default);
-  box-shadow: var(--shadow-lg);
+@media (hover: hover) and (pointer: fine) {
+  .video-card:hover {
+    background: var(--bg-elevated);
+    border-color: var(--border-default);
+    box-shadow: var(--shadow-lg);
+  }
 }
 
 .video-card__link {
   display: block;
   color: inherit;
-  -webkit-tap-highlight-color: transparent;
 }
 
 .video-card__link:hover {
@@ -187,8 +187,10 @@
   opacity: 1;
 }
 
-.video-card[data-preview-enabled="true"]:hover .thumb-image {
-  transform: scale(1.04);
+@media (hover: hover) and (pointer: fine) {
+  .video-card[data-preview-enabled="true"]:hover .thumb-image {
+    transform: scale(1.04);
+  }
 }
 
 .preview-video {
@@ -214,8 +216,10 @@
   transition: opacity var(--transition-fast);
 }
 
-.video-card[data-preview-enabled="true"]:hover .thumb-frame::after {
-  opacity: 1;
+@media (hover: hover) and (pointer: fine) {
+  .video-card[data-preview-enabled="true"]:hover .thumb-frame::after {
+    opacity: 1;
+  }
 }
 
 /* Stop preview decoration while preserving card interaction feedback. */
@@ -286,10 +290,12 @@
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
-.source-badge:hover {
-  transform: scale(1.04);
-  border-color: var(--drive-color);
-  box-shadow: 0 0 12px var(--drive-shadow-strong, var(--accent-glow));
+@media (hover: hover) and (pointer: fine) {
+  .source-badge:hover {
+    transform: scale(1.04);
+    border-color: var(--drive-color);
+    box-shadow: 0 0 12px var(--drive-shadow-strong, var(--accent-glow));
+  }
 }
 
 .source-badge::before {
@@ -460,8 +466,10 @@
   transition: color var(--transition-fast);
 }
 
-.video-card:hover .video-title {
-  color: var(--accent);
+@media (hover: hover) and (pointer: fine) {
+  .video-card:hover .video-title {
+    color: var(--accent);
+  }
 }
 
 .video-meta {
@@ -807,32 +815,6 @@
 @media (max-width: 640px) {
   .video-card {
     padding: 6px;
-  }
-
-  .video-card:hover {
-    transform: none;
-    box-shadow: var(--shadow-sm);
-  }
-
-  .video-card::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    z-index: 5;
-    border-radius: inherit;
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity var(--transition-fast);
-  }
-
-  .video-card:active::after {
-    opacity: 1;
-    transition-duration: 0ms;
-  }
-
-  .video-card[data-preview-enabled="true"]:hover .thumb-image {
-    transform: none;
   }
 
   .video-title {

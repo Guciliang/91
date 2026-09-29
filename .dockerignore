@@ -9,6 +9,7 @@ release
 data
 backend/data
 backend/config.yaml
+backend/telegram.yml
 config.yaml
 
 *.db
@@ -19,3 +20,5 @@ config.yaml
 
 tests
 video-site-implementation-plan.md
+
+.env.telegram

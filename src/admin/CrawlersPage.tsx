@@ -19,7 +19,7 @@ import {
 import * as api from "./api";
 import { Modal } from "./Modal";
 import { ConfirmModal } from "./ConfirmModal";
-import { useToast } from "./ToastContext";
+import { useToast } from "@/components/ToastContext";
 import { generationStateClass, generationStateLabel } from "./drive/constants";
 import { CrawlerUploadTargetField } from "./drive/CrawlerUploadTargetField";
 import { SpiderIcon } from "./icons/SpiderIcon";
@@ -332,7 +332,7 @@ function CrawlerRow({
             {running ? "触发中..." : "立即抓取"}
           </button>
           <button className="admin-btn" type="button" onClick={onUpload}>
-            {uploading ? "上传中..." : "触发上传"}
+            {uploading ? "提交中..." : "触发上传"}
           </button>
           <button className="admin-btn" type="button" onClick={onEdit}>
             编辑
@@ -465,8 +465,8 @@ function crawlerUploadDisplayStatus(crawler: api.AdminCrawler): {
   }
   if (localCount > 0) {
     return {
-      status: { ...base, state: "queued", queueLength: localCount },
-      text: "待上传",
+      status: base,
+      text: "待处理",
     };
   }
   if (totalCount > 0) {

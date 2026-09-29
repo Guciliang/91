@@ -21,7 +21,6 @@ import (
 	"github.com/video-site/backend/internal/atomicfile"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
-	"github.com/video-site/backend/internal/localpath"
 	"github.com/video-site/backend/internal/persistence"
 )
 
@@ -36,6 +35,8 @@ type Config struct {
 	RestartManaged bool
 	Now            func() time.Time
 	AvailableBytes func(path string) (int64, error)
+
+	TelegramFilesRoot func() string
 }
 
 type Manager struct {
@@ -55,6 +56,8 @@ type Manager struct {
 	restartManaged bool
 	now            func() time.Time
 	availableBytes func(string) (int64, error)
+
+	telegramFilesRoot func() string
 
 	mu              sync.Mutex
 	current         *TaskStatus
@@ -91,29 +94,23 @@ func NewManager(cfg Config) (*Manager, error) {
 		return nil, errors.New("backup: application config is required")
 	}
 	runtimeStorage := cfg.RuntimeStorage
-	if strings.TrimSpace(runtimeStorage.DBPath) == "" {
-		runtimeStorage.DBPath = cfg.AppConfig.Storage.DBPath
-	}
-	if strings.TrimSpace(runtimeStorage.LocalPreviewDir) == "" {
-		runtimeStorage.LocalPreviewDir = cfg.AppConfig.Storage.LocalPreviewDir
+	if strings.TrimSpace(runtimeStorage.DataDir) == "" {
+		runtimeStorage = cfg.AppConfig.Storage
 	}
 	workingDir, err := os.Getwd()
 	if err != nil {
 		return nil, fmt.Errorf("backup: resolve working directory: %w", err)
 	}
-	dbPath, err := localpath.Resolve(workingDir, runtimeStorage.DBPath)
+	runtimeStorage, err = config.ResolveStoragePaths(runtimeStorage, workingDir)
 	if err != nil {
-		return nil, errors.New("backup: database path is invalid")
+		return nil, fmt.Errorf("backup: resolve data directory: %w", err)
 	}
-	previewPath, err := localpath.Resolve(workingDir, runtimeStorage.LocalPreviewDir)
-	if err != nil {
-		return nil, errors.New("backup: preview path is invalid")
-	}
+	dbPath, previewPath := runtimeStorage.DBPath, runtimeStorage.LocalPreviewDir
 	configPath, err := filepath.Abs(strings.TrimSpace(cfg.ConfigPath))
 	if err != nil || strings.TrimSpace(cfg.ConfigPath) == "" {
 		return nil, errors.New("backup: config path is invalid")
 	}
-	dataRoot := filepath.Dir(dbPath)
+	dataRoot := runtimeStorage.DataDir
 	assetRoot := filepath.Dir(previewPath)
 	m := &Manager{
 		catalog:         cfg.Catalog,
@@ -137,7 +134,11 @@ func NewManager(cfg Config) (*Manager, error) {
 		uploadProgress:  make(map[string]OperationProgress),
 		restart:         make(chan struct{}, 1),
 	}
+	m.telegramFilesRoot = cfg.TelegramFilesRoot
 	m.uploadRoot = filepath.Join(m.backupDir, ".uploads")
+	if m.telegramFilesRoot == nil {
+		m.telegramFilesRoot = func() string { return cfg.AppConfig.Telegram.LocalFilesRoot }
+	}
 	if m.availableBytes == nil {
 		m.availableBytes = availableDiskBytes
 	}
@@ -312,6 +313,12 @@ func (m *Manager) Estimate(ctx context.Context) (Estimate, error) {
 		estimate.FileCount += count
 		estimate.TotalBytes += size
 	}
+	tgCount, tgSize, err := m.catalog.TelegramLocalStorageSize(ctx)
+	if err != nil {
+		return Estimate{}, err
+	}
+	estimate.FileCount += tgCount
+	estimate.TotalBytes += tgSize
 	count, size, err := m.estimateLocalStorageResources(ctx, false)
 	if err != nil {
 		return Estimate{}, err
@@ -367,6 +374,13 @@ func (m *Manager) EstimateForSelection(ctx context.Context, selection BackupSele
 		}
 	}
 	if selection.UploadStorage {
+		count, size, err := m.catalog.TelegramLocalStorageSize(ctx)
+		if err != nil {
+			return Estimate{}, err
+		}
+		estimate.FileCount += count
+		estimate.TotalBytes += size
+
 		if err := addSource("uploads", filepath.Join(m.assetRoot, "uploads")); err != nil {
 			return Estimate{}, err
 		}
@@ -866,6 +880,11 @@ func (m *Manager) createSnapshot(
 			if err := m.snapshotSelectedLocalStorage(ctx, snapshotRoot, state); err != nil {
 				return snapshotSelectionState{}, err
 			}
+		}
+	}
+	if selection.UploadStorage {
+		if err := m.snapshotTelegramUploads(ctx, snapshotRoot, state); err != nil {
+			return snapshotSelectionState{}, err
 		}
 	}
 	return state, nil

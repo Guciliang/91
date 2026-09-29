@@ -1,19 +1,28 @@
 import {
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
+  type Ref,
 } from "react";
 import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import {
+  matchingVirtualGridSnapshot,
   shouldLoadMore,
   virtualGridColumns,
   virtualRowCount,
   virtualRowRange,
+  type VirtualGridHandle,
+  type VirtualGridSnapshot,
 } from "@/lib/virtualGrid";
 import { useRouteActivity } from "@/lib/routeActivity";
+import {
+  resolveVideoGridAnchor,
+  type VideoGridAnchor,
+} from "@/lib/videoGridAnchor";
 import type { VideoItem } from "@/types";
 import { VideoCard } from "./VideoCard";
 
@@ -46,6 +55,8 @@ type Props = {
   prefetchRows?: number;
   tailContent?: ReactNode;
   onLoadMore?: () => void;
+  initialSnapshot?: VirtualGridSnapshot;
+  snapshotRef?: Ref<VirtualGridHandle>;
 };
 
 function readResponsiveGridColumns(): number {
@@ -88,14 +99,23 @@ export function VirtualVideoGrid({
   prefetchRows = 2,
   tailContent,
   onLoadMore,
+  initialSnapshot,
+  snapshotRef,
 }: Props) {
   const routeActive = useRouteActivity();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const containerWidthRef = useRef(0);
   const responsiveColumns = useResponsiveGridColumns(routeActive);
   const columns = compact ? 1 : responsiveColumns;
+  const restoredSnapshot = matchingVirtualGridSnapshot(initialSnapshot, {
+    viewportWidth: typeof window === "undefined" ? 0 : window.innerWidth,
+    columns,
+    compact: !!compact,
+  });
   // 列表容器距文档顶部的距离：window virtualizer 用它把窗口滚动换算成列表内偏移。
-  const [scrollMargin, setScrollMargin] = useState(0);
+  const [scrollMargin, setScrollMargin] = useState(
+    () => restoredSnapshot?.scrollMargin ?? 0
+  );
   const loadedRowCount = virtualRowCount(videos.length, columns);
   // 未加载内容不提前撑高页面；只保留一个固定尾行承载加载反馈。
   const hasTailRow = hasMore;
@@ -129,9 +149,24 @@ export function VirtualVideoGrid({
     scrollMargin,
     getItemKey,
     getScrollElement,
+    initialMeasurementsCache: restoredSnapshot?.measurements,
     directDomUpdates: true,
     directDomUpdatesMode: "transform",
   });
+
+  useImperativeHandle(
+    snapshotRef,
+    () => ({
+      takeSnapshot: () => ({
+        viewportWidth: window.innerWidth,
+        columns,
+        compact: !!compact,
+        scrollMargin,
+        measurements: virtualizer.takeSnapshot(),
+      }),
+    }),
+    [columns, compact, scrollMargin, virtualizer]
+  );
 
   const updateScrollMargin = useCallback(() => {
     if (!routeActive) return;
@@ -187,6 +222,62 @@ export function VirtualVideoGrid({
 
   const virtualRows = virtualizer.getVirtualItems();
   const lastRow = virtualRows[virtualRows.length - 1]?.index ?? -1;
+
+  const anchorRef = useRef<VideoGridAnchor | null>(null);
+  useLayoutEffect(() => {
+    if (!routeActive) return;
+    const anchor = anchorRef.current;
+    const target = anchor ? resolveVideoGridAnchor(anchor, videos) : null;
+    let restoring = target !== null;
+    let frame = 0;
+    let attempts = 0;
+    let stableFrames = 0;
+
+    const capture = () => {
+      if (restoring) return;
+      const scrollY = window.scrollY;
+      const row = virtualizer.getVirtualItems().find((item) => item.end > scrollY);
+      anchorRef.current = row && scrollY >= scrollMargin && row.index < loadedRowCount
+        ? { videos, index: row.index * columns, viewportOffset: row.start - scrollY }
+        : null;
+    };
+
+    // The document is unlocked before this layout effect runs. Correct using
+    // the rendered row after regrouping, including changes in measured height.
+    const restore = () => {
+      if (!target) return;
+      const rowIndex = Math.floor(target.index / columns);
+      const row = containerRef.current?.querySelector<HTMLElement>(
+        `[data-index="${rowIndex}"]`
+      );
+      const top = row
+        ? window.scrollY + row.getBoundingClientRect().top - target.viewportOffset
+        : virtualizer.getOffsetForIndex(rowIndex, "start")?.[0];
+      if (top !== undefined) {
+        const reachable = Math.max(0, Math.min(
+          top,
+          document.documentElement.scrollHeight - window.innerHeight
+        ));
+        const aligned = Math.abs(window.scrollY - reachable) < 1;
+        stableFrames = row && aligned ? stableFrames + 1 : 0;
+        if (!aligned) window.scrollTo({ top: reachable, behavior: "auto" });
+      }
+      if (++attempts < 30 && stableFrames < 2) {
+        frame = window.requestAnimationFrame(restore);
+      } else {
+        restoring = false;
+        capture();
+      }
+    };
+
+    if (target) restore();
+    else capture();
+    window.addEventListener("scroll", capture, { passive: true });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("scroll", capture);
+    };
+  }, [routeActive, videos, columns, scrollMargin, loadedRowCount, virtualizer]);
 
   useEffect(() => {
     if (!routeActive || !onLoadMore || lastRow < 0) return;

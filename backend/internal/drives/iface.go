@@ -35,6 +35,13 @@ type Drive interface {
 	RootID() string
 }
 
+// DirectoryNameProvider optionally resolves a directory name without walking
+// its subtree. Scans use it once for their starting directory; descendant names
+// come from List. Providers that cannot query directory metadata may omit it.
+type DirectoryNameProvider interface {
+	DirectoryName(ctx context.Context, dirID string) (string, error)
+}
+
 // GenerationStreamProvider is an optional drive capability for a provider-
 // generated playback stream that is cheaper to seek than the original file.
 // Background thumbnail/preview workers prefer this stream, while ordinary
@@ -66,6 +73,11 @@ type Uploader interface {
 // Remove interface: callers must type-assert before deleting a source file.
 type Remover interface {
 	Remove(ctx context.Context, fileID string) error
+}
+
+// LocalFileProvider exposes a local source without assuming its directory layout.
+type LocalFileProvider interface {
+	LocalPath(context.Context, string) (string, error)
 }
 
 // SourceFile carries the catalog metadata available when an administrator
@@ -159,6 +171,24 @@ var ErrNotSupported = errors.New("operation not supported by this drive")
 // stream is unavailable for this file or the current scan. Callers may safely
 // fall back to the original StreamURL without treating the drive as unhealthy.
 var ErrGenerationStreamUnavailable = errors.New("generation stream unavailable")
+
+// ProviderErrorKind lets callers distinguish rejected credentials from an
+// unavailable provider without guessing from words such as "refresh token".
+type ProviderErrorKind string
+
+const (
+	ProviderErrorAuth        ProviderErrorKind = "auth"
+	ProviderErrorUnavailable ProviderErrorKind = "unavailable"
+	ProviderErrorOther       ProviderErrorKind = "other"
+)
+
+type ProviderError struct {
+	Kind ProviderErrorKind
+	Err  error
+}
+
+func (e *ProviderError) Error() string { return e.Err.Error() }
+func (e *ProviderError) Unwrap() error { return e.Err }
 
 // RateLimitError 表示上游服务正在限流。RetryAfter 为 0 时由调用方选择默认冷却时间。
 type RateLimitError struct {

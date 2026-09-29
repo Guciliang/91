@@ -20,10 +20,13 @@ import (
 
 	"github.com/go-resty/resty/v2"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/readretry"
 )
 
 const (
 	maxSmallUploadSize         = 250 * 1024 * 1024
+	defaultSmallUploadSize     = 10 * 1024 * 1024
+	uploadRequestTimeout       = 5 * time.Minute
 	defaultUploadSessionChunk  = 10 * 1024 * 1024
 	uploadSessionRetryAttempts = 3
 	defaultRenewAPIURL         = "https://api.oplist.org/onedrive/renewapi"
@@ -34,7 +37,7 @@ const (
 )
 
 var (
-	smallUploadThreshold = int64(maxSmallUploadSize)
+	smallUploadThreshold = int64(defaultSmallUploadSize)
 	uploadSessionChunk   = int64(defaultUploadSessionChunk)
 )
 
@@ -54,6 +57,7 @@ type Driver struct {
 	oauthURL      string
 	client        *resty.Client
 	httpClient    *http.Client
+	uploadClient  *resty.Client
 	proxyErr      error
 	onTokenUpdate func(access, refresh string)
 
@@ -153,10 +157,17 @@ func New(c Config) *Driver {
 		d.proxyErr = err
 		return d
 	}
+	uploadHTTPClient, err := drives.NewHTTPClientForProxy(c.ProxyURL, uploadRequestTimeout, nil)
+	if err != nil {
+		d.proxyErr = err
+		return d
+	}
 	drives.ConfigureStreamTransport(streamClient.Transport)
 	d.client = resty.NewWithClient(apiClient).
 		SetTimeout(30*time.Second).
 		SetHeader("Accept", "application/json, text/plain, */*")
+	d.uploadClient = resty.NewWithClient(uploadHTTPClient).
+		SetHeader("Accept", "application/json")
 	d.httpClient = streamClient
 	return d
 }
@@ -265,6 +276,18 @@ func (d *Driver) Stat(ctx context.Context, fileID string) (*drives.Entry, error)
 	return &e, nil
 }
 
+// DirectoryName resolves the scan root name through a direct metadata lookup.
+func (d *Driver) DirectoryName(ctx context.Context, dirID string) (string, error) {
+	entry, err := d.Stat(ctx, dirID)
+	if err != nil {
+		return "", err
+	}
+	if entry == nil || !entry.IsDir {
+		return "", drives.ErrNotSupported
+	}
+	return entry.Name, nil
+}
+
 func (d *Driver) StreamURL(ctx context.Context, fileID string) (*drives.StreamLink, error) {
 	var item graphItem
 	if err := d.request(ctx, d.itemURL(fileID), http.MethodGet, nil, &item); err != nil {
@@ -297,7 +320,7 @@ func (d *Driver) UploadAndReportHash(ctx context.Context, parentID, name string,
 	}
 	threshold := smallUploadThreshold
 	if threshold <= 0 {
-		threshold = maxSmallUploadSize
+		threshold = defaultSmallUploadSize
 	}
 	if size <= threshold {
 		return d.uploadSmallAndReportHash(ctx, parentID, name, r, size, threshold)
@@ -329,10 +352,10 @@ func (d *Driver) uploadSmallAndReportHash(ctx context.Context, parentID, name st
 	}
 	u := fmt.Sprintf("%s/items/%s:/%s:/content", d.driveBaseURL(), url.PathEscape(parentID), url.PathEscape(name))
 	var item graphItem
-	err = d.request(ctx, u, http.MethodPut, func(req *resty.Request) {
+	err = d.requestOnce(ctx, d.uploadClient, u, http.MethodPut, func(req *resty.Request) {
 		req.SetBody(bytes.NewReader(data))
 		req.SetContentLength(true)
-	}, &item)
+	}, &item, true)
 	if err != nil {
 		return UploadResult{}, fmt.Errorf("onedrive upload: %w", err)
 	}
@@ -410,9 +433,25 @@ func (d *Driver) createUploadSession(ctx context.Context, parentID, name string)
 func (d *Driver) putUploadSessionChunkWithRetry(ctx context.Context, uploadURL string, start, total int64, data []byte) (*graphItem, error) {
 	var last error
 	for attempt := 0; attempt < uploadSessionRetryAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if attempt > 0 {
 			if err := sleepContext(ctx, time.Duration(attempt)*time.Second); err != nil {
 				return nil, err
+			}
+			// A timed-out PUT may already have stored this range. Ask the
+			// session before replaying bytes; a completed/expired session is
+			// reconciled by the caller against the deterministic destination.
+			next, err := d.uploadSessionOffset(ctx, uploadURL)
+			if err != nil {
+				return nil, fmt.Errorf("inspect upload session: %w", errors.Join(err, last))
+			}
+			if next == start+int64(len(data)) && next < total {
+				return nil, nil
+			}
+			if next != start {
+				return nil, fmt.Errorf("onedrive upload session: unexpected offset %d after %d: %w", next, start, last)
 			}
 		}
 		item, retryable, err := d.putUploadSessionChunk(ctx, uploadURL, start, total, data)
@@ -438,13 +477,12 @@ func (d *Driver) putUploadSessionChunk(ctx context.Context, uploadURL string, st
 	}
 	req.ContentLength = int64(len(data))
 	req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
-	client := d.httpClient
-	if client == nil {
-		client = http.DefaultClient
-	}
+	// Upload URLs are preauthenticated. Use the proxy-aware upload transport
+	// with a bounded timeout, without adding the Graph bearer token.
+	client := d.uploadClient.GetClient()
 	res, err := client.Do(req)
 	if err != nil {
-		return nil, true, err
+		return nil, readretry.Transient(err), err
 	}
 	defer res.Body.Close()
 
@@ -460,9 +498,49 @@ func (d *Driver) putUploadSessionChunk(ctx context.Context, uploadURL string, st
 	default:
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		err := fmt.Errorf("onedrive upload session: status=%d body=%s", res.StatusCode, strings.TrimSpace(string(body)))
-		retryable := res.StatusCode == http.StatusTooManyRequests || (res.StatusCode >= 500 && res.StatusCode <= 504)
+		if res.StatusCode == http.StatusTooManyRequests {
+			delay := retryAfterHeader(res.Header.Get("Retry-After"))
+			if delay == 0 {
+				delay = onedriveListCooldown
+			}
+			return nil, false, &drives.RateLimitError{Provider: "onedrive", RetryAfter: delay, Err: err}
+		}
+		retryable := res.StatusCode == http.StatusRequestedRangeNotSatisfiable || (res.StatusCode >= 500 && res.StatusCode <= 504)
 		return nil, retryable, err
 	}
+}
+
+func (d *Driver) uploadSessionOffset(ctx context.Context, uploadURL string) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uploadURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	res, err := d.uploadClient.GetClient().Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusTooManyRequests {
+		delay := retryAfterHeader(res.Header.Get("Retry-After"))
+		if delay == 0 {
+			delay = onedriveListCooldown
+		}
+		return 0, &drives.RateLimitError{Provider: "onedrive", RetryAfter: delay, Err: errors.New("upload session status request throttled")}
+	}
+	if res.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("status=%d", res.StatusCode)
+	}
+	var state struct {
+		NextExpectedRanges []string `json:"nextExpectedRanges"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&state); err != nil {
+		return 0, err
+	}
+	if len(state.NextExpectedRanges) != 1 {
+		return 0, errors.New("unexpected upload session ranges")
+	}
+	start, _, _ := strings.Cut(state.NextExpectedRanges[0], "-")
+	return strconv.ParseInt(start, 10, 64)
 }
 
 func readSmallUpload(r io.Reader, declaredSize, limit int64) ([]byte, string, int64, error) {
@@ -574,12 +652,12 @@ func (d *Driver) Remove(ctx context.Context, fileID string) error {
 }
 
 func (d *Driver) request(ctx context.Context, rawURL, method string, configure func(*resty.Request), out any) error {
-	return d.requestOnce(ctx, rawURL, method, configure, out, true)
+	return d.requestOnce(ctx, d.client, rawURL, method, configure, out, true)
 }
 
-func (d *Driver) requestOnce(ctx context.Context, rawURL, method string, configure func(*resty.Request), out any, retry bool) error {
+func (d *Driver) requestOnce(ctx context.Context, client *resty.Client, rawURL, method string, configure func(*resty.Request), out any, retry bool) error {
 	tokens := d.tokenSnapshot()
-	req := d.client.R().
+	req := client.R().
 		SetContext(ctx).
 		SetHeader("Authorization", "Bearer "+tokens.access)
 	if configure != nil {
@@ -602,10 +680,10 @@ func (d *Driver) requestOnce(ctx context.Context, rawURL, method string, configu
 			if err := d.refresh(ctx, tokens); err != nil {
 				return err
 			}
-			return d.requestOnce(ctx, rawURL, method, configure, out, false)
+			return d.requestOnce(ctx, client, rawURL, method, configure, out, false)
 		}
 		if graphErr.Error.Message != "" {
-			return errors.New(graphErr.Error.Message)
+			return fmt.Errorf("graph api error: status=%d code=%s: %s", res.StatusCode(), graphErr.Error.Code, graphErr.Error.Message)
 		}
 		return fmt.Errorf("graph api error: %s", graphErr.Error.Code)
 	}
@@ -810,7 +888,11 @@ func parseRetryAfter(res *resty.Response) time.Duration {
 	if res == nil {
 		return 0
 	}
-	raw := strings.TrimSpace(res.Header().Get("Retry-After"))
+	return retryAfterHeader(res.Header().Get("Retry-After"))
+}
+
+func retryAfterHeader(value string) time.Duration {
+	raw := strings.TrimSpace(value)
 	if raw == "" {
 		return 0
 	}

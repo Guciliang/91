@@ -11,6 +11,8 @@ go build -o server ./cmd/server
 
 前端开发在仓库根目录 `npm run dev`，vite 会把 `/api`、`/p`、`/admin/api`、`/peer` 代理到 9192。所有配置项及注释见 [config.example.yaml](config.example.yaml)，正文只在涉及行为时提及个别配置。
 
+每次启动时，服务会先迁移旧版数据库配置，再按随程序打包的 `config.example.yaml` 重建实际配置：保留模板中同名字段的已有值（包括 `false`、`0`、空字符串和空列表），缺失字段使用模板默认值，字段顺序和注释统一采用模板，模板外的字段及自定义注释会被清理。更新完成后原子替换原文件并保留文件权限；配置没有变化时不会重复写入。升级无需手动复制模板，Docker 和原生部署使用同一流程。
+
 ## 目录
 
 仓库根目录是前端（Vite + React），`backend/` 是本文档描述的 Go 服务：
@@ -42,7 +44,8 @@ internal/
   fingerprint/              跨盘去重指纹
   nightly/                  每日维护流水线
   crawlerupload/            把爬虫产物迁移到目标网盘
-  remoteupload/             公网视频直链的安全下载与持久化单 worker
+  mediaimport/              视频导入调度、直链下载和公共入库流程
+  telegram/                 Telegram 私聊接收、Local Bot API 文件获取及结果通知
   …                         转码、标签、字幕、相似度、路径与文件名规则等小包
 data/                       运行时数据：主库、封面、上传、爬虫产物（不在版本库）
 ```
@@ -115,7 +118,8 @@ internal/
   streamhttp/               共享的重定向策略，跳转时不泄漏网盘凭据
   nightly/                  每日一条维护流水线：扫盘 → 爬虫 → 上传迁移 → 去重维护
   crawlerupload/            把爬虫落地的视频迁移到目标网盘并改写 catalog 行
-  remoteupload/             视频直链任务、SSRF 防护、磁盘保护和下载 worker
+  mediaimport/              视频导入任务、SSRF 防护、磁盘保护和下载 worker
+  telegram/                 Telegram 消息幂等、文件去重及机器人通知
   tagging/                  标签匹配规则、番号识别
   fixedtags/                内置标签包及其匹配规则
   mediasim/                 标题相似度 + 封面 SSIM + teaser 帧签名，供近重复判定使用
@@ -135,7 +139,7 @@ vendor/                     依赖已 vendored，可离线构建
 ```
 config.yaml                 首次启动从 config.example.yaml 复制
 data/video-site.db          SQLite 主库
-data/previews/              预览视频及本地媒体资产根目录（storage.local_preview_dir）
+data/previews/              预览视频及本地媒体资产目录（storage.data_dir 下的 previews）
 data/previews/thumbs/       普通封面
 data/previews/thumbs-shorts-bg/
                             Shorts 按需生成的 96px 预模糊背景封面
@@ -225,7 +229,7 @@ flowchart TB
 
 `cmd/server/main.go` 的顺序是刻意安排的：
 
-1. 读 `config.yaml`（缺失则从模板复制）、建 `data/` 目录、打开 SQLite。
+1. 读 `config.yaml`（缺失则从模板复制）、建 `data/` 目录、打开 SQLite；迁移旧设置后按当前模板更新配置，再加载最终配置。
 2. 挂载本地内置盘（`localupload`），启动指纹补扫协程。
 3. 恢复视频直链任务：删除中断的 `.part`，把执行中任务从字节 0 重新排队，并启动唯一下载 worker。
 4. 装配 `api.Server` / `api.AdminServer`，注册 chi 路由，挂前端静态资源。

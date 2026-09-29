@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ var ErrVersionConflict = errors.New("config.yaml changed since it was loaded")
 // LiveSettings is the subset of config.yaml that the running process can
 // safely apply without rebuilding its long-lived dependencies.
 type LiveSettings struct {
+	TelegramEnabled        bool   `json:"telegramEnabled"`
 	PreviewEnabled         bool   `json:"previewEnabled"`
 	ThumbnailConcurrency   int    `json:"thumbnailConcurrency"`
 	FingerprintConcurrency int    `json:"fingerprintConcurrency"`
@@ -61,6 +63,9 @@ type Manager struct {
 	// reports it once instead of logging the same rejected bytes every second.
 	observedVersion string
 	apply           func(LiveSettings) error
+
+	telegramDeployment    telegramDeployment
+	telegramDeploymentErr error
 }
 
 func NewManager(path string) (*Manager, error) {
@@ -73,11 +78,15 @@ func NewManager(path string) (*Manager, error) {
 		return nil, err
 	}
 	version := configVersion(data)
-	return &Manager{
+	m := &Manager{
 		path:            path,
 		current:         parsed,
 		observedVersion: version,
-	}, nil
+	}
+	// Telegram is optional. Keep deployment errors for its status/probe rather
+	// than prevent an otherwise configured website from starting.
+	_ = m.LoadTelegramCompose(filepath.Join(filepath.Dir(path), "telegram.yml"))
+	return m, nil
 }
 
 func DefaultLiveSettings() LiveSettings {
@@ -98,6 +107,7 @@ func liveSettingsFromConfig(cfg *Config) LiveSettings {
 		return DefaultLiveSettings()
 	}
 	return LiveSettings{
+		TelegramEnabled:        cfg.Telegram.Enabled,
 		PreviewEnabled:         cfg.Preview.Enabled,
 		NightlyDisabled:        cfg.Nightly.Disabled,
 		NightlyStartTime:       cfg.Nightly.StartTime,
@@ -163,6 +173,9 @@ func (m *Manager) ReplaceYAML(data []byte, expectedVersion string) (SaveResult, 
 		return SaveResult{}, errors.New("configuration manager is unavailable")
 	}
 	if err := validateAdminConfigRemoved(data); err != nil {
+		return SaveResult{}, err
+	}
+	if err := validateTelegramDeploymentFieldsRemoved(data); err != nil {
 		return SaveResult{}, err
 	}
 	candidate, err := Parse(data)
@@ -456,6 +469,7 @@ func removeLiveDocumentValues(document any) {
 	if !ok {
 		return
 	}
+	delete(root, "telegram")
 	removeNestedValue(root, "nightly", "start_time")
 	removeNestedValue(root, "nightly", "cron_hour")
 	removeNestedValue(root, "nightly", "timezone")

@@ -1,4 +1,5 @@
 import { applyPreviewEnabled } from "../lib/previewSettings";
+import { applyTelegramEnabled } from "./telegram/availability";
 
 // 管理后台 API 客户端
 // 所有请求都带 cookie，401 会抛错让路由守卫跳登录
@@ -649,6 +650,24 @@ export function stopDriveTasks(id: string) {
 
 // ---------- Crawlers ----------
 
+export type CrawlerUploadResult = {
+  taskId: string;
+  driveId: string;
+  targetDriveId: string;
+  state: "succeeded" | "partial" | "blocked" | "failed" | "canceled";
+  startedAt: string;
+  finishedAt: string;
+  candidateCount: number;
+  uploadedCount: number;
+  reusedCount: number;
+  blockedCount: number;
+  failedCount: number;
+  remainingCount: number;
+  issueCount: number;
+  message?: string;
+  issues?: Array<{ videoId?: string; title?: string; stage: string; reason: string; message: string }>;
+};
+
 export type AdminCrawler = {
   id: string;
   name: string;
@@ -668,6 +687,7 @@ export type AdminCrawler = {
   previewGenerationStatus?: DriveGenerationStatus;
   fingerprintGenerationStatus?: DriveGenerationStatus;
   uploadGenerationStatus?: DriveGenerationStatus;
+  lastUploadResult?: CrawlerUploadResult;
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
@@ -943,10 +963,11 @@ export type DriveDirEntry = {
  * 列指定 drive 在 parentId 目录下的直接子目录。
  * parentId 留空 → 走 drive 的 RootID。
  */
-export function listDriveDirChildren(id: string, parentId?: string) {
+export function listDriveDirChildren(id: string, parentId?: string, signal?: AbortSignal) {
   const qs = parentId ? `?parent=${encodeURIComponent(parentId)}` : "";
   return request<DriveDirEntry[]>(
-    `/drives/${encodeURIComponent(id)}/dirtree${qs}`
+    `/drives/${encodeURIComponent(id)}/dirtree${qs}`,
+    { signal }
   );
 }
 
@@ -1028,6 +1049,7 @@ export type AdminVideoList = {
 export type AdminVideoListParams = {
   driveId?: string;
   crawlerId?: string;
+  sourceKind?: "" | "telegram";
   createdFrom?: string;
   createdTo?: string;
   durationMinMinutes?: string;
@@ -1043,6 +1065,7 @@ export function listVideos(
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
   if (params.crawlerId) qs.set("crawlerId", params.crawlerId);
+  if (params.sourceKind) qs.set("sourceKind", params.sourceKind);
   if (params.createdFrom) qs.set("createdFrom", params.createdFrom);
   if (params.createdTo) qs.set("createdTo", params.createdTo);
   if (params.durationMinMinutes) qs.set("durationMinMinutes", params.durationMinMinutes);
@@ -1258,6 +1281,7 @@ export type ConfigSaveResult = {
   version: string;
   restartRequired: boolean;
   settings: {
+    telegramEnabled: boolean;
     nightlyDisabled: boolean;
     nightlyStartTime: string;
     nightlyTimezone: string;
@@ -1327,6 +1351,7 @@ export async function updateConfigYAML(
   if (!res.ok) throw new Error(await configResponseError(res));
   const result = (await res.json()) as ConfigSaveResult;
   applyPreviewEnabled(result.settings.previewEnabled);
+  applyTelegramEnabled(result.settings.telegramEnabled);
   return result;
 }
 
@@ -1443,3 +1468,39 @@ export function unbanIP(ip: string) {
     method: "DELETE",
   });
 }
+
+// Telegram imports use the same authenticated administrator API as settings.
+export type TelegramConfig = {
+  enabled: boolean;
+  apiBaseUrl: string;
+  allowedUserIds: number[];
+  siteBaseUrl: string;
+  maxFileSizeBytes: number;
+  maxPendingJobs: number;
+  fetchTimeoutSeconds: number;
+  uploadDriveId: string;
+  uploadDirectory: string;
+};
+export type TelegramStatus = {
+  enabled: boolean;
+  connection: {
+    enabled: boolean; state: string; botId: string; username: string; error: string;
+    lastPoll: string; lastMessage: string; cacheAvailableBytes: number;
+    notificationFailures: number; config: TelegramConfig;
+  };
+};
+export type ImportJob = {
+  id: string; state: string; title?: string; sourceKind: string; stage: string;
+  bytesDownloaded: number; totalBytes: number; error?: string;
+  createdAt: string; videoHref?: string; canCancel: boolean; canRetry: boolean;
+  cancelRequested?: boolean; sequence: string; senderId?: string;
+  retryCount: number; nextAttempt: number;
+};
+export const getTelegramStatus = (signal?: AbortSignal) => request<TelegramStatus>("/telegram/status", { signal });
+export const testTelegram = () => request<{username: string}>("/telegram/test", {method: "POST"});
+export const prepareTelegramPolling = () => request<void>("/telegram/prepare-polling", {method:"POST"});
+export const resumeTelegram = () => request<void>("/telegram/resume", {method:"POST"});
+// The Telegram page filters and paginates within this recent record window.
+export const listTelegramImports = (limit: number) => request<ImportJob[]>(`/import-jobs?${new URLSearchParams({source: "telegram", limit: String(limit)})}`);
+export const cancelImport = (id: string) => request<ImportJob>(`/import-jobs/${encodeURIComponent(id)}/cancel`, {method:"POST"});
+export const retryImport = (id: string) => request<void>(`/import-jobs/${encodeURIComponent(id)}/retry`, {method:"POST"});

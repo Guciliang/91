@@ -22,6 +22,10 @@ const sharePageSource = readFileSync(
   new URL("../src/pages/SharedVideoPage.tsx", import.meta.url),
   "utf8"
 );
+const footerSource = readFileSync(
+  new URL("../src/components/Footer.tsx", import.meta.url),
+  "utf8"
+);
 const shareStylesSource = readFileSync(
   new URL("../src/styles/video-detail.css", import.meta.url),
   "utf8"
@@ -116,19 +120,14 @@ test("share header logo aligns with the video content and clears the safe area",
   );
 });
 
-test("the share footer text links to the project repository", () => {
+test("the share page uses the shared footer with a project repository link", () => {
+  assert.match(sharePageSource, /import \{ Footer \} from "@\/components\/Footer"/);
+  assert.match(sharePageSource, /<Footer \/>/);
   assert.match(
-    sharePageSource,
+    footerSource,
     /href="https:\/\/github\.com\/nianzhibai\/91"[\s\S]*?>\s*© \{new Date\(\)\.getFullYear\(\)\} 91\s*<\/a>/
   );
-  assert.match(
-    shareStylesSource,
-    /\.share-page__footer a\s*\{[\s\S]*?display:\s*inline-block;/
-  );
-  assert.doesNotMatch(
-    shareStylesSource,
-    /\.share-page__footer a\s*\{[^}]*width:\s*100%;/
-  );
+  assert.doesNotMatch(shareStylesSource, /\.share-page__footer/);
 });
 
 test("share creation copies a newly generated one-time URL", () => {
@@ -143,28 +142,25 @@ test("share creation copies a newly generated one-time URL", () => {
   assert.match(actionsSource, /scheduleShareStateReset\(1500\)/);
 });
 
-test("successful mobile share shows a bottom-right confirmation toast", () => {
+test("share feedback uses the shared toast provider on desktop and mobile", () => {
   assert.match(
     actionsSource,
-    /shareState === "copied" \|\| shareState === "copy-ready"[\s\S]*createPortal\(/
+    /import \{ useToast \} from "\.\/ToastContext"/
   );
   assert.match(
     actionsSource,
-    /shareState === "copied"[\s\S]*?"已复制一次性分享链接"[\s\S]*?"请再次点击分享按钮"/
+    /show\("已复制一次性分享链接", "success"\)/
   );
-  assert.doesNotMatch(
+  assert.match(
     actionsSource,
-    /className="vd-share-toast"[\s\S]*?<Check[\s\S]*?<\/div>/
-  );
-  assert.match(actionsSource, /className="vd-share-toast"[\s\S]*role="status"/);
-  assert.match(
-    shareStylesSource,
-    /\.vd-share-toast\s*\{\s*display:\s*none;/s
+    /show\("请再次点击分享按钮", "info"\)/
   );
   assert.match(
-    shareStylesSource,
-    /@media \(max-width:\s*768px\)\s*\{[\s\S]*?\.vd-share-toast\s*\{[^}]*position:\s*fixed[^}]*right:\s*calc\(16px \+ env\(safe-area-inset-right, 0px\)\)[^}]*bottom:\s*calc\(16px \+ env\(safe-area-inset-bottom, 0px\)\)[^}]*z-index:\s*var\(--z-toast\)[^}]*display:\s*block/s
+    actionsSource,
+    /show\(pendingShareURL\.current \? "复制失败，请重试" : "分享失败，请重试", "error"\)/
   );
+  assert.doesNotMatch(actionsSource, /vd-share-toast|createPortal|matchMedia/);
+  assert.doesNotMatch(shareStylesSource, /vd-share-toast/);
 });
 
 test("iOS starts deferred clipboard writing before awaiting share creation", () => {

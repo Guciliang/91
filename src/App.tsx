@@ -28,6 +28,7 @@ import {
   loadDrivesPage,
   loadLogsPage,
   loadSettingsPage,
+  loadTelegramPage,
   loadTagsPage,
   loadUsersPage,
   loadVideosPage,
@@ -42,6 +43,7 @@ import { previewController } from "@/lib/previewController";
 import { watchPreviewSettings } from "@/lib/previewSettings";
 import { RouteActivityProvider } from "@/lib/routeActivity";
 import { useDocumentScrollLock } from "@/lib/useDocumentScrollLock";
+import { navigationHistory } from "@/lib/navigationHistory";
 import { rememberVideoReturnPath, routeToPath } from "@/lib/videoReturnPath";
 import {
   isVideoListingPath,
@@ -75,6 +77,7 @@ const VideosPage = lazy(() =>
 const TagsPage = lazy(() =>
   loadTagsPage().then((module) => ({ default: module.TagsPage }))
 );
+const TelegramPage = lazy(() => loadTelegramPage().then(module => ({default: module.TelegramPage})));
 const SettingsPage = lazy(() =>
   loadSettingsPage().then((module) => ({ default: module.SettingsPage }))
 );
@@ -100,6 +103,11 @@ function PageSuspense({
 
 function VideoReturnPathRecorder() {
   const location = useLocation();
+  const navigationType = useNavigationType();
+
+  useLayoutEffect(() => {
+    navigationHistory.record(location.key, navigationType);
+  }, [location.key, navigationType]);
 
   useEffect(() => {
     rememberVideoReturnPath(routeToPath(location));
@@ -258,6 +266,7 @@ function OtherRoutes() {
             </PageSuspense>
           }
         />
+        <Route path="telegram" element={<PageSuspense><TelegramPage /></PageSuspense>} />
         <Route
           path="settings"
           element={

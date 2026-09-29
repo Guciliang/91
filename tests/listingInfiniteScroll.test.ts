@@ -169,7 +169,10 @@ test("layout measurement stays off the per-frame scroll path", () => {
   assert.match(virtualGridSource, /const nextMargin = rect\.top \+ window\.scrollY;/);
   assert.match(virtualGridSource, /new ResizeObserver\(\(\[entry\]\) =>/);
   assert.match(virtualGridSource, /observer\?\.disconnect\(\)/);
-  assert.doesNotMatch(virtualGridSource, /window\.getComputedStyle|querySelector<HTMLElement>/);
+  assert.doesNotMatch(virtualGridSource, /window\.getComputedStyle/);
+  const capture = virtualGridSource.match(/const capture = \(\) => \{([\s\S]*?)\n    \};/)?.[1];
+  assert.ok(capture);
+  assert.doesNotMatch(capture, /querySelector|getBoundingClientRect/);
   // 只有断点/视图变化清空测量缓存，追加视频不会重测全部旧行。
   assert.match(
     virtualGridSource,
@@ -216,7 +219,7 @@ test("the infinite listing hook keeps one in-flight batch per query", () => {
   );
   assert.match(
     infiniteListingHookSource,
-    /size: initialBatchSize\(restoreCount, feed\.batchSize\),/
+    /size: initialRequestSize\(restoreCount, feed\.batchSize\),/
   );
   assert.match(
     infiniteListingHookSource,
@@ -240,22 +243,10 @@ test("browser history navigation restores both the loaded batches and the positi
   assert.match(scrollRestoreHookSource, /canRestoreScrollY\(\{/);
   assert.match(scrollRestoreHookSource, /window\.scrollTo\(0, targetScrollY\)/);
   assert.match(scrollRestoreHookSource, /if \(session\.pendingScrollY > 0 \|\| session\.requestedCount <= 0\) return;/);
-  assert.match(
-    scrollRestoreHookSource,
-    /resolveRestoreFeedToken\(entry, input\.queryKey, \{[\s\S]*?scope: feedSnapshotScope,[\s\S]*?documentID: LISTING_DOCUMENT_ID/
-  );
-  assert.match(
-    scrollRestoreHookSource,
-    /resolveRestoreCount\(\{[\s\S]*?documentID: LISTING_DOCUMENT_ID/
-  );
-  assert.match(
-    scrollRestoreHookSource,
-    /resolveRestoreScrollY\([\s\S]*?LISTING_DOCUMENT_ID[\s\S]*?\)/
-  );
-  assert.match(
-    scrollRestoreHookSource,
-    /writeListingScrollEntry\([\s\S]*?documentID: LISTING_DOCUMENT_ID/
-  );
+  assert.match(scrollRestoreHookSource, /resolveRestoreFeedToken\(entry, input\.queryKey\)/);
+  assert.match(scrollRestoreHookSource, /resolveRestoreScrollY\(entry, input\.queryKey\)/);
+  const mainSource = readFileSync(new URL("../src/main.tsx", import.meta.url), "utf8");
+  assert.match(mainSource, /initializeListingScrollRestore\(window\);[\s\S]*?ReactDOM\.createRoot/);
   assert.match(
     scrollRestoreHookSource,
     /window\.history\.scrollRestoration = "manual"/

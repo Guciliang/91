@@ -111,7 +111,7 @@ test("the shorts drive badge is the only video detail link", () => {
   );
   assert.match(
     shortsPageSource,
-    /<Link\s+to=\{detailPath\}\s+className="shorts-drive-badge"[\s\S]*?aria-label=\{`查看视频详情，来源：\$\{item\.sourceLabel \|\| "本地"\}`\}[\s\S]*?onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
+    /<Link\s+to=\{detailPath\}\s+className="shorts-drive-badge"[\s\S]*?aria-label=\{`查看视频详情，来源：\$\{item\.sourceLabel \|\| "本地"\}`\}/
   );
   assert.doesNotMatch(shortsPageSource, /shorts-slide__detail|<Info\b|>查看详情</);
   assert.doesNotMatch(shortsCssSource, /\.shorts-slide__detail/);
@@ -140,62 +140,11 @@ test("low-height landscape shorts keep actions below the header", () => {
   );
 });
 
-test("shorts horizontal video swipe seeks relative to the current playback time", () => {
-  assert.match(slideGesturesSource, /const SHORTS_SEEK_ACTIVATION_PX = 12;/);
-  assert.match(slideGesturesSource, /const SHORTS_SEEK_DIRECTION_LOCK_RATIO = 1\.2;/);
-  assert.match(slideGesturesSource, /type ShortsTouchSeekState = \{/);
-  assert.match(slideGesturesSource, /startTime: video\.currentTime \|\| 0/);
-  assert.match(
-    slideGesturesSource,
-    /const passiveTouchMove = shouldUsePassiveShortsTouchMove\(\);/
-  );
-  assert.match(
-    slideGesturesSource,
-    /video\.addEventListener\("touchmove", handleTouchMove, \{\s*passive: passiveTouchMove,\s*\}\);/
-  );
-  assert.match(
-    slideGesturesSource,
-    /if \(!passiveTouchMove\) event\.preventDefault\(\);/
-  );
-  assert.match(
-    slideGesturesSource,
-    /videoWidth: Math\.max\(1, video\.getBoundingClientRect\(\)\.width\)/
-  );
-  assert.match(
-    slideGesturesSource,
-    /export const SHORTS_MEDIA_SEEK_INTERVAL_MS = 80;/
-  );
+test("shorts media seek is throttled and commits the final position", () => {
+  assert.match(slideGesturesSource, /export const SHORTS_MEDIA_SEEK_INTERVAL_MS = 80;/);
   assert.match(slideGesturesSource, /video\.fastSeek\(time\);/);
-  assert.match(
-    slideGesturesSource,
-    /flushMediaSeek\(video, targetTime\);/
-  );
-  // 相对快进的换算与方向锁的行为用例见 shortsGestures.test.ts
-  assert.match(
-    slideGesturesSource,
-    /input\.startTime \+ \(input\.dx \/ Math\.max\(1, input\.width\)\) \* input\.duration/
-  );
-  assert.match(slideGesturesSource, /suppressNextClickRef\.current = true;/);
-  assert.match(slideGesturesSource, /if \(suppressNextClickRef\.current\) \{/);
-  assert.doesNotMatch(
-    shortsPageSource + slideGesturesSource,
-    /touch\.clientX - rect\.left\) \/ Math\.max\(1,\s*rect\.width\)/
-  );
-});
-
-test("shorts long-press release does not become a click that pauses playback", () => {
-  assert.match(
-    slideGesturesSource,
-    /const handleTouchEnd = \(event: TouchEvent\) => \{[\s\S]*?const wasFastPress = active;[\s\S]*?if \(wasSeeking \|\| wasFastPress\) \{\s*suppressNextSyntheticClick\(\);/
-  );
-  assert.match(
-    slideGesturesSource,
-    /function suppressNextSyntheticClick\(\) \{[\s\S]*?suppressNextClickRef\.current = true;[\s\S]*?SHORTS_SYNTHETIC_CLICK_RESET_MS/
-  );
-  assert.match(
-    slideGesturesSource,
-    /if \(suppressNextClickRef\.current\) \{\s*suppressNextClickRef\.current = false;\s*clearSuppressNextClickResetTimer\(\);[\s\S]*?return;/
-  );
+  assert.match(slideGesturesSource, /flushMediaSeek\(video, time\);/);
+  // 手势序列（单/双击、长按、拖动）的行为覆盖见 shortsSurfaceGestures.test.ts。
 });
 
 test("shorts progress listeners rebind when deferred videos mount", () => {
@@ -279,7 +228,7 @@ test("shorts retries interrupted active playback and exposes rejected autoplay",
   // \u81ea\u52a8\u64ad\u653e\u88ab\u62d2\u540e\u7684\u9996\u6b21\u70b9\u51fb\uff1a\u5224\u5b9a\u4e0e\u6062\u590d\u5728 slide\uff0c\u5206\u53d1\u65f6\u5e8f\u5728\u624b\u52bf hook
   assert.match(
     shortsPageSource,
-    /function shouldResumeImmediatelyOnClick\(\) \{[\s\S]*?video\?\.paused && !isBuffering/
+    /function shouldResumeImmediatelyOnClick\(\) \{[\s\S]*?video\?\.paused && !isBuffering && !playbackFailure &&\s*!isVideoPausedByUser\(index\)/
   );
   assert.match(
     shortsPageSource,
@@ -287,7 +236,7 @@ test("shorts retries interrupted active playback and exposes rejected autoplay",
   );
   assert.match(
     slideGesturesSource,
-    /if \(options\.shouldResumeImmediately\(\)\) \{[\s\S]*?options\.onImmediateResume\(\);[\s\S]*?return;[\s\S]*?\/\/ \u5355\u51fb\u6302\u8d77/
+    /onImmediateResume: \(\) => optionsRef\.current\.onImmediateResume\(\)/
   );
 });
 
@@ -346,11 +295,11 @@ test("shorts exposes media failures separately from pause and retries in place",
   assert.match(retryBlock, /\.play\(\)/);
   assert.match(
     shortsPageSource,
-    /disabled: isMarkedHidden \|\| playbackFailure !== null/
+    /disabled: !isActive \|\| !shouldLoad \|\| isMarkedHidden \|\| playbackFailure !== null/
   );
   assert.match(
     slideGesturesSource,
-    /const start = \(\) => \{\s*if \(optionsRef\.current\.disabled\) return;/
+    /if \(options\.disabled\) return;/
   );
   assert.match(
     shortsCssSource,
@@ -743,7 +692,7 @@ test("shorts empty library reuses the homepage empty visual", () => {
   );
   assert.match(
     shortsPageSource,
-    /className="shorts-header__actions">\s*\{items\.length > 0 && \(/
+    /\{items\.length > 0 && \(\s*<button[\s\S]*?aria-label=\{muted \? "取消静音" : "静音"\}/
   );
   assert.doesNotMatch(shortsPageSource, /当前没有可播放的视频/);
   assert.match(
@@ -1485,41 +1434,28 @@ test("shorts keeps per-swipe work off the queue length", () => {
   );
 });
 
-test("shorts links exit document fullscreen before leaving the immersive page", () => {
-  assert.match(shortsPageSource, /import \{ Link, useNavigate \} from "react-router";/);
-  assert.match(shortsPageSource, /const navigate = useNavigate\(\);/);
-  assert.match(
-    shortsPageSource,
-    /const handleShortsRouteClick = useCallback\([\s\S]*?const exitRequest = exitDocumentFullscreen\(\);[\s\S]*?if \(!exitRequest\) return;[\s\S]*?event\.preventDefault\(\);[\s\S]*?const completeNavigation = \(\) => navigate\(destination\);[\s\S]*?exitRequest\.then\(completeNavigation, completeNavigation\)/
-  );
-  assert.match(
-    shortsPageSource,
-    /function exitDocumentFullscreen\(\): Promise<void> \| null \{[\s\S]*?fullscreenDocument\.fullscreenElement \?\?[\s\S]*?fullscreenDocument\.webkitFullscreenElement[\s\S]*?fullscreenDocument\.exitFullscreen\?\.bind[\s\S]*?fullscreenDocument\.webkitExitFullscreen\?\.bind[\s\S]*?Promise\.resolve\(exitFullscreen\(\)\)/
-  );
+test("shorts navigation requests native fullscreen and exits it before explicit route changes", () => {
+  const mainNavSource = readFileSync(new URL("../src/components/MainNav.tsx", import.meta.url), "utf8");
+  assert.match(mainNavSource, /requestShortsFullscreen\(\)/);
   assert.match(
     shortsPageSource,
     /<Link\s*to="\/"[\s\S]*?className="shorts-header__back"[\s\S]*?onClick=\{handleBackToHomeClick\}/
   );
-  assert.match(
-    shortsPageSource,
-    /onRouteClick=\{handleShortsRouteClick\}/
-  );
   assert.doesNotMatch(shortsPageSource, /shorts-slide__title-link/);
   assert.match(
     shortsPageSource,
-    /className="shorts-drive-badge"[\s\S]*?onClick=\{\(event\) => onRouteClick\(event, detailPath\)\}/
+    /<Link\s+to=\{detailPath\}\s+className="shorts-drive-badge"/
   );
 });
 
-test("shorts page defaults to immersive playback without fullscreen controls", () => {
+test("shorts page offers native fullscreen only when the browser supports it", () => {
   assert.match(shortsPageSource, /const activeIndexRef = useRef\(0\)/);
   assert.match(shortsCssSource, /\.shorts-page \{[\s\S]*height:\s*100svh/);
   assert.match(shortsPageSource, /html\.style\.overflow = "hidden"/);
   assert.match(shortsPageSource, /body\.style\.overflow = "hidden"/);
   assert.match(shortsPageSource, /body\.style\.background = "#000"/);
-  assert.doesNotMatch(shortsPageSource, /Maximize/);
   assert.doesNotMatch(shortsPageSource, /Minimize/);
-  assert.doesNotMatch(shortsPageSource, /aria-label=\{isFullscreen \? "退出全屏" : "进入全屏"\}/);
+  assert.match(shortsPageSource, /fullscreenSupported && !isFullscreen && \(/);
+  assert.match(shortsPageSource, /aria-label="进入全屏"/);
   assert.doesNotMatch(shortsPageSource, /e\.key === "f"/);
-  assert.doesNotMatch(shortsPageSource, /requestFullscreen/);
 });

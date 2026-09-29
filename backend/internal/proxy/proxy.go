@@ -233,7 +233,7 @@ func (p *Proxy) getLink(ctx context.Context, d drives.Drive, driveID, fileID str
 		p.finishLinkCall(key, call, link, err)
 	}()
 
-	// 部分 driver（115 SDK）不会把 ctx 继续传到底层 HTTP 请求。单独的看门狗
+	// 为未遵守 ctx 的 driver 保留兜底。单独的看门狗
 	// 保证即使 provider 一直不返回，超时也会结束 call、移除 inflight 并唤醒
 	// 所有等待者；迟到的 provider 结果由 linkCall.once 丢弃。
 	go func() {
@@ -680,6 +680,17 @@ func classifyStreamError(err error) (code, category string) {
 	if _, ok := drives.RateLimitRetryAfter(err); ok {
 		return "drive_rate_limited", "rate_limit"
 	}
+	var provider *drives.ProviderError
+	if errors.As(err, &provider) {
+		switch provider.Kind {
+		case drives.ProviderErrorAuth:
+			return "drive_auth_failed", "auth"
+		case drives.ProviderErrorUnavailable:
+			return "drive_upstream_unavailable", "unavailable"
+		default:
+			return "drive_stream_failed", "generic"
+		}
+	}
 	if errors.Is(err, os.ErrNotExist) || drives.ErrorMentionsHTTPStatus(err, http.StatusNotFound, http.StatusGone) {
 		return "drive_source_not_found", "not_found"
 	}
@@ -725,7 +736,7 @@ func driveLabel(kind string) string {
 		return "WebDAV"
 	case "quark":
 		return "夸克网盘"
-	case "localstorage", "local-upload":
+	case "localstorage", "local-upload", "telegram-local":
 		return "本地存储"
 	default:
 		return "网盘"

@@ -42,6 +42,8 @@ type Config struct {
 	Nightly      Nightly      `yaml:"nightly"`
 	Tags         Tags         `yaml:"tags"`
 	RemoteUpload RemoteUpload `yaml:"remote_upload"`
+	// Telegram configuration is persisted in YAML and applied without restarting.
+	Telegram Telegram `yaml:"telegram"`
 }
 
 type Server struct {
@@ -140,13 +142,16 @@ func setBooleanValue(parent *yaml.Node, key string, value bool) {
 }
 
 type Storage struct {
-	DBPath          string `yaml:"db_path"`
-	LocalPreviewDir string `yaml:"local_preview_dir"`
+	DataDir string `yaml:"data_dir"`
+	DBDir   string `yaml:"db_dir"` // empty inherits DataDir
+	// Derived paths are runtime details, never independent YAML settings.
+	DBPath          string `yaml:"-"`
+	LocalPreviewDir string `yaml:"-"`
 }
 
 type Logging struct {
 	FileEnabled    *bool  `yaml:"file_enabled"`
-	Directory      string `yaml:"directory"`
+	Directory      string `yaml:"-"` // derived from storage.data_dir
 	MaxFileSizeMB  int    `yaml:"max_file_size_mb"`
 	MaxTotalSizeMB int    `yaml:"max_total_size_mb"`
 }
@@ -159,22 +164,27 @@ func (l Logging) IsFileEnabled() bool {
 // process. Values in config.yaml remain unchanged, while every subsystem gets
 // the same absolute paths resolved from the process startup directory.
 func ResolveStoragePaths(storage Storage, baseDir string) (Storage, error) {
-	dbPath, err := localpath.Resolve(baseDir, storage.DBPath)
+	dataDir, err := localpath.Resolve(baseDir, storage.DataDir)
 	if err != nil {
-		return Storage{}, fmt.Errorf("resolve database path: %w", err)
+		return Storage{}, fmt.Errorf("resolve data directory: %w", err)
 	}
-	previewDir, err := localpath.Resolve(baseDir, storage.LocalPreviewDir)
-	if err != nil {
-		return Storage{}, fmt.Errorf("resolve preview path: %w", err)
+	dbDir := dataDir
+	if strings.TrimSpace(storage.DBDir) != "" {
+		dbDir, err = localpath.Resolve(baseDir, storage.DBDir)
+		if err != nil {
+			return Storage{}, fmt.Errorf("resolve database directory: %w", err)
+		}
 	}
 	return Storage{
-		DBPath:          dbPath,
-		LocalPreviewDir: previewDir,
+		DataDir:         dataDir,
+		DBDir:           dbDir,
+		DBPath:          filepath.Join(dbDir, "video-site.db"),
+		LocalPreviewDir: filepath.Join(dataDir, "previews"),
 	}, nil
 }
 
-// ResolveLoggingPaths returns the runtime logging configuration without
-// rewriting the relative path kept in config.yaml.
+// ResolveLoggingPaths resolves the log directory derived from storage.data_dir
+// against the startup directory without changing the file configuration.
 func ResolveLoggingPaths(logging Logging, baseDir string) (Logging, error) {
 	directory, err := localpath.Resolve(baseDir, logging.Directory)
 	if err != nil {
@@ -301,7 +311,13 @@ func Parse(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	if err := c.importLegacyDataDirectory(data); err != nil {
+		return nil, err
+	}
 	if err := c.applyDefaults(); err != nil {
+		return nil, err
+	}
+	if err := c.Telegram.Validate(); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -309,21 +325,24 @@ func Parse(data []byte) (*Config, error) {
 
 func (c *Config) applyDefaults() error {
 	if c.Server.Listen == "" {
-		c.Server.Listen = ":8080"
+		c.Server.Listen = "0.0.0.0:9191"
 	}
-	if c.Storage.DBPath == "" {
-		c.Storage.DBPath = "./data/video-site.db"
+	c.Storage.DataDir = strings.TrimSpace(c.Storage.DataDir)
+	if c.Storage.DataDir == "" {
+		c.Storage.DataDir = "./data"
 	}
-	if c.Storage.LocalPreviewDir == "" {
-		c.Storage.LocalPreviewDir = "./data/previews"
+	c.Storage.DBDir = strings.TrimSpace(c.Storage.DBDir)
+	dbDir := c.Storage.DBDir
+	if dbDir == "" {
+		dbDir = c.Storage.DataDir
 	}
+	c.Storage.DBPath = filepath.Join(dbDir, "video-site.db")
+	c.Storage.LocalPreviewDir = filepath.Join(c.Storage.DataDir, "previews")
 	if c.Logging.FileEnabled == nil {
 		enabled := true
 		c.Logging.FileEnabled = &enabled
 	}
-	if strings.TrimSpace(c.Logging.Directory) == "" {
-		c.Logging.Directory = "./data/logs"
-	}
+	c.Logging.Directory = filepath.Join(c.Storage.DataDir, "logs")
 	if c.Logging.MaxFileSizeMB == 0 {
 		c.Logging.MaxFileSizeMB = 5
 	}

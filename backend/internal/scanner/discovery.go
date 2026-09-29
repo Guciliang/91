@@ -5,14 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/drives"
+	"github.com/video-site/backend/internal/readretry"
 )
+
+// Traversal state belongs to one discovery, including its single final retry
+// pass. Keep successful/previously visited directories deduplicated in both passes.
+type discoveryTraversal struct {
+	attemptedDirIDs map[string]struct{}
+	pending         []pendingDirectory
+	retrying        bool
+}
+
+type pendingDirectory struct {
+	id               string
+	name             string
+	ancestorDirIDs   []string
+	ancestorDirNames []string
+}
 
 func (s *Scanner) discover(ctx context.Context, startDirID string, stats *Stats, progress progressFunc) (Snapshot, error) {
 	if err := validateSource(s); err != nil {
@@ -24,6 +39,17 @@ func (s *Scanner) discover(ctx context.Context, startDirID string, stats *Stats,
 	if startDirID == "" {
 		startDirID = s.Drive.RootID()
 	}
+	startDirName := ""
+	if provider, ok := s.Drive.(drives.DirectoryNameProvider); ok {
+		name, err := provider.DirectoryName(ctx, startDirID)
+		if err == nil {
+			startDirName = name
+		} else if ctx.Err() != nil {
+			return Snapshot{}, ctx.Err()
+		} else if !errors.Is(err, drives.ErrNotSupported) {
+			log.Printf("[%s] drive=%s start directory name unavailable: %v", s.logPrefix(), s.Drive.ID(), err)
+		}
+	}
 	snapshot := Snapshot{
 		DriveID:          s.Drive.ID(),
 		DriveKind:        s.Drive.Kind(),
@@ -33,11 +59,34 @@ func (s *Scanner) discover(ctx context.Context, startDirID string, stats *Stats,
 		FailedDirIDs:     make(map[string]struct{}),
 		ExcludedDirIDs:   make(map[string]struct{}),
 	}
-	attemptedDirIDs := make(map[string]struct{})
-	if err := s.discoverDir(ctx, startDirID, "", nil, &snapshot, stats, progress, attemptedDirIDs); err != nil {
+	traversal := &discoveryTraversal{attemptedDirIDs: make(map[string]struct{})}
+	if err := s.discoverDir(ctx, startDirID, startDirName, nil, nil, &snapshot, stats, progress, traversal); err != nil {
 		return snapshot, err
 	}
-	return snapshot, nil
+	if len(traversal.pending) > 0 {
+		// Freeze the queue. Directories first discovered during this pass still
+		// get short retries, but cannot extend discovery with another final pass.
+		pending := traversal.pending
+		traversal.pending = nil
+		traversal.retrying = true
+		recovered := 0
+		log.Printf("[%s] drive=%s final directory retry started queued=%d", s.logPrefix(), s.Drive.ID(), len(pending))
+		for _, dir := range pending {
+			// Only release this failed directory; successful directories and
+			// other queued directories retain their cycle/deduplication guard.
+			delete(traversal.attemptedDirIDs, dir.id)
+			if err := s.discoverDir(ctx, dir.id, dir.name, dir.ancestorDirIDs, dir.ancestorDirNames, &snapshot, stats, progress, traversal); err != nil {
+				return snapshot, err
+			}
+			if _, enumerated := snapshot.EnumeratedDirIDs[dir.id]; enumerated {
+				recovered++
+				applog.Info(ctx, "Directory read recovered during final pass: "+dir.name, applog.Fields{Component: s.logPrefix(), DriveID: s.Drive.ID(), FileID: dir.id, Stage: string(IssueDiscovery)})
+			}
+		}
+		log.Printf("[%s] drive=%s final directory retry finished queued=%d recovered=%d failed=%d discovery_issues=%d",
+			s.logPrefix(), s.Drive.ID(), len(pending), recovered, len(pending)-recovered, len(snapshot.Issues))
+	}
+	return snapshot, ctx.Err()
 }
 
 func (s *Scanner) discoverDir(
@@ -45,28 +94,62 @@ func (s *Scanner) discoverDir(
 	dirID string,
 	dirName string,
 	ancestorDirIDs []string,
+	ancestorDirNames []string,
 	snapshot *Snapshot,
 	stats *Stats,
 	progress progressFunc,
-	attemptedDirIDs map[string]struct{},
+	traversal *discoveryTraversal,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, attempted := attemptedDirIDs[dirID]; attempted {
+	if _, attempted := traversal.attemptedDirIDs[dirID]; attempted {
 		return nil
 	}
-	attemptedDirIDs[dirID] = struct{}{}
-	progress("discover", dirName)
+	traversal.attemptedDirIDs[dirID] = struct{}{}
+	phase := "discover"
+	if traversal.retrying {
+		phase = "discover_retry"
+	}
+	progress(phase, dirName)
 
 	entries, err := s.listDirectory(ctx, dirID)
 	if err != nil {
-		return fmt.Errorf("list directory %s: %w", dirID, err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		err = fmt.Errorf("list directory %s: %w", dirID, err)
+		if errors.Is(err, ErrRateLimitBudgetExhausted) {
+			return err
+		}
+		if !traversal.retrying && readretry.Transient(err) {
+			// The attempted-directory guard ensures one queue entry per ID.
+			// Preserve ancestry because the recursion will have unwound by then.
+			traversal.pending = append(traversal.pending, pendingDirectory{
+				id: dirID, name: dirName,
+				ancestorDirIDs:   append([]string(nil), ancestorDirIDs...),
+				ancestorDirNames: append([]string(nil), ancestorDirNames...),
+			})
+			snapshot.FailedDirIDs[dirID] = struct{}{}
+			applog.Warn(ctx, "Directory read deferred to final pass: "+dirName, err, applog.Fields{Component: s.logPrefix(), DriveID: s.Drive.ID(), FileID: dirID, Stage: string(IssueDiscovery)})
+			return nil
+		}
+		// A root that remains unreadable is fatal, as before. Other failures
+		// become final issues only after any deferred retry has been consumed.
+		if dirID == snapshot.StartDirID {
+			return err
+		}
+		snapshot.FailedDirIDs[dirID] = struct{}{}
+		snapshot.Issues = append(snapshot.Issues, Issue{Stage: IssueDiscovery, DirID: dirID, Name: dirName, Err: err})
+		stats.Errors++
+		applog.Error(ctx, "Directory discovery failed: "+dirName, err, applog.Fields{Component: s.logPrefix(), DriveID: s.Drive.ID(), FileID: dirID, Stage: string(IssueDiscovery)})
+		return nil
 	}
 	delete(snapshot.FailedDirIDs, dirID)
 	delete(snapshot.ExcludedDirIDs, dirID)
 	snapshot.EnumeratedDirIDs[dirID] = struct{}{}
 	currentAncestorDirIDs := appendDirID(ancestorDirIDs, dirID)
+	currentAncestorDirNames := append(append([]string(nil), ancestorDirNames...), dirName)
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -80,22 +163,8 @@ func (s *Scanner) discoverDir(
 				}
 				continue
 			}
-			if err := s.discoverDir(ctx, entry.ID, entry.Name, currentAncestorDirIDs, snapshot, stats, progress, attemptedDirIDs); err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return ctxErr
-				}
-				if errors.Is(err, ErrRateLimitBudgetExhausted) {
-					return err
-				}
-				if _, excluded := snapshot.ExcludedDirIDs[entry.ID]; !excluded {
-					if _, enumerated := snapshot.EnumeratedDirIDs[entry.ID]; !enumerated {
-						snapshot.FailedDirIDs[entry.ID] = struct{}{}
-					}
-				}
-				issue := Issue{Stage: IssueDiscovery, DirID: entry.ID, Name: entry.Name, Err: err}
-				snapshot.Issues = append(snapshot.Issues, issue)
-				stats.Errors++
-				applog.Error(ctx, "Directory discovery failed: "+entry.Name, err, applog.Fields{Component: s.logPrefix(), DriveID: s.Drive.ID(), FileID: entry.ID, Stage: string(IssueDiscovery)})
+			if err := s.discoverDir(ctx, entry.ID, entry.Name, currentAncestorDirIDs, currentAncestorDirNames, snapshot, stats, progress, traversal); err != nil {
+				return err
 			}
 			continue
 		}
@@ -105,14 +174,15 @@ func (s *Scanner) discoverDir(
 			continue
 		}
 		snapshot.Files = append(snapshot.Files, File{
-			Entry:          entry,
-			ParentID:       dirID,
-			DirName:        dirName,
-			AncestorDirIDs: append([]string(nil), currentAncestorDirIDs...),
+			Entry:            entry,
+			ParentID:         dirID,
+			DirName:          dirName,
+			AncestorDirIDs:   append([]string(nil), currentAncestorDirIDs...),
+			AncestorDirNames: append([]string(nil), currentAncestorDirNames...),
 		})
 		snapshot.SeenFileIDs[entry.ID] = struct{}{}
 		stats.Scanned++
-		progress("discover", dirName)
+		progress(phase, dirName)
 	}
 	return nil
 }
@@ -128,10 +198,8 @@ func appendDirID(ancestorDirIDs []string, dirID string) []string {
 	return append(out, dirID)
 }
 
-const directoryListTimeoutRetries = 2
-
 func (s *Scanner) listDirectory(ctx context.Context, dirID string) ([]drives.Entry, error) {
-	timeoutRetries := 0
+	transportRetries := 0
 	for {
 		entries, err := s.Drive.List(ctx, dirID)
 		if err == nil {
@@ -166,36 +234,25 @@ func (s *Scanner) listDirectory(ctx context.Context, dirID string) ([]drives.Ent
 			}
 			continue
 		}
-		if isDirectoryRequestTimeout(err) && timeoutRetries < directoryListTimeoutRetries {
-			timeoutRetries++
+		if readretry.Transient(err) && transportRetries < readretry.MaxRetries {
+			transportRetries++
+			delay := readretry.Delay(transportRetries)
 			log.Printf(
-				"[%s] drive=%s directory=%s request timed out; retry=%d/%d",
-				s.logPrefix(), s.Drive.ID(), dirID, timeoutRetries, directoryListTimeoutRetries,
+				"[%s] drive=%s directory=%s read failed; retry=%d/%d delay=%s: %v",
+				s.logPrefix(), s.Drive.ID(), dirID, transportRetries, readretry.MaxRetries, delay, err,
 			)
+			if waitErr := s.waitForRetry(ctx, delay); waitErr != nil {
+				return nil, waitErr
+			}
 			continue
 		}
 		return nil, err
 	}
 }
 
-func isDirectoryRequestTimeout(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var networkError net.Error
-	return errors.As(err, &networkError) && networkError.Timeout()
-}
-
 func (s *Scanner) waitForRetry(ctx context.Context, duration time.Duration) error {
 	if s.RetryWait != nil {
 		return s.RetryWait(ctx, duration)
 	}
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return readretry.Wait(ctx, duration)
 }

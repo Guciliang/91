@@ -19,10 +19,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/video-site/backend/internal/applog"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/persistence"
+	"github.com/video-site/backend/internal/uploadjob"
 )
 
 type crawlerDTO struct {
@@ -57,6 +59,8 @@ type crawlerDTO struct {
 	TotalCrawledCount           int              `json:"totalCrawledCount"`
 	LocalVideoCount             int              `json:"localVideoCount"`
 	MigratedVideoCount          int              `json:"migratedVideoCount"`
+
+	LastUploadResult *uploadjob.Result `json:"lastUploadResult,omitempty"`
 }
 
 type upsertCrawlerReq struct {
@@ -85,6 +89,11 @@ func (a *AdminServer) handleListCrawlers(w http.ResponseWriter, r *http.Request)
 		generationStatuses = a.GetDriveGenerationStatuses()
 	}
 
+	uploadResults, err := a.Catalog.LatestCrawlerUploadResults(r.Context())
+	if err != nil {
+		writeErr(w, r, http.StatusInternalServerError, err)
+		return
+	}
 	out := make([]crawlerDTO, 0, len(all))
 	for _, d := range all {
 		if d == nil || !isConfiguredCrawlerDrive(d) {
@@ -95,7 +104,11 @@ func (a *AdminServer) handleListCrawlers(w http.ResponseWriter, r *http.Request)
 			writeErr(w, r, http.StatusInternalServerError, err)
 			return
 		}
-		out = append(out, a.crawlerDTOForDrive(d, assets, generationStatuses[d.ID]))
+		item := a.crawlerDTOForDrive(d, assets, generationStatuses[d.ID])
+		if result, ok := uploadResults[d.ID]; ok {
+			item.LastUploadResult = &result
+		}
+		out = append(out, item)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -122,7 +135,8 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.Crawle
 			lastCrawlAt = v
 		}
 	}
-	meta := crawlerMetadataForDrive(d)
+	meta := a.crawlerMetadataForDrive(d)
+	scriptPath, _ := a.crawlerScriptPath(d.Credentials)
 	return crawlerDTO{
 		ID:                          d.ID,
 		Name:                        meta.Name,
@@ -130,7 +144,7 @@ func (a *AdminServer) crawlerDTOForDrive(d *catalog.Drive, assets catalog.Crawle
 		Kind:                        d.Kind,
 		Status:                      d.Status,
 		LastError:                   d.LastError,
-		ScriptPath:                  strings.TrimSpace(d.Credentials["script_path"]),
+		ScriptPath:                  scriptPath,
 		ScriptSourceURL:             strings.TrimSpace(d.Credentials["script_source_url"]),
 		Proxy:                       strings.TrimSpace(d.Credentials["proxy"]),
 		UploadProxy:                 strings.TrimSpace(d.Credentials["upload_proxy"]),
@@ -179,17 +193,15 @@ func crawlerVideoIDPrefixes(d *catalog.Drive) []string {
 	}
 }
 
-func crawlerNameForDrive(d *catalog.Drive) string {
-	return crawlerMetadataForDrive(d).Name
-}
-
-func crawlerMetadataForDrive(d *catalog.Drive) scriptcrawler.Metadata {
+func (a *AdminServer) crawlerMetadataForDrive(d *catalog.Drive) scriptcrawler.Metadata {
 	if d == nil {
 		return scriptcrawler.Metadata{Protocol: scriptcrawler.ProtocolV1}
 	}
 	if d.Credentials != nil {
-		if meta, err := scriptcrawler.ReadMetadata(strings.TrimSpace(d.Credentials["script_path"])); err == nil {
-			return meta
+		if path, err := a.crawlerScriptPath(d.Credentials); err == nil {
+			if meta, err := scriptcrawler.ReadMetadata(path); err == nil {
+				return meta
+			}
 		}
 	}
 	return scriptcrawler.Metadata{Name: strings.TrimSpace(d.Name), Protocol: scriptcrawler.ProtocolV1}
@@ -255,6 +267,10 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := a.normalizeCrawlerScriptReference(merged); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	// Existing crawler saves patch only user-owned configuration keys. Runtime
 	// state such as last_crawl_at may be updated by the still-running old task
 	// after this request loaded its snapshot and must never be replaced wholesale.
@@ -262,6 +278,7 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 	if existing != nil {
 		persistedCredentials = map[string]string{
 			"script_path":       merged["script_path"],
+			"script_file":       merged["script_file"],
 			"script_source_url": merged["script_source_url"],
 			"proxy":             merged["proxy"],
 			"target_new":        merged["target_new"],
@@ -271,7 +288,12 @@ func (a *AdminServer) handleUpsertCrawler(w http.ResponseWriter, r *http.Request
 			persistedCredentials["upload_proxy"] = merged["upload_proxy"]
 		}
 	}
-	meta, err := scriptcrawler.ReadMetadata(merged["script_path"])
+	resolvedScript, err := a.crawlerScriptPath(merged)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	meta, err := scriptcrawler.ReadMetadata(resolvedScript)
 	if err != nil {
 		http.Error(w, "脚本元信息无效："+err.Error(), http.StatusBadRequest)
 		return
@@ -650,6 +672,26 @@ func (a *AdminServer) crawlerScriptImportDir() (string, error) {
 	return filepath.Abs(root)
 }
 
+func (a *AdminServer) crawlerScriptPath(credentials map[string]string) (string, error) {
+	root, err := a.crawlerScriptImportDir()
+	if err != nil {
+		return "", err
+	}
+	return scriptcrawler.ScriptPath(credentials, root)
+}
+
+func (a *AdminServer) normalizeCrawlerScriptReference(credentials map[string]string) error {
+	root, err := a.crawlerScriptImportDir()
+	if err != nil {
+		return err
+	}
+	path, err := scriptcrawler.ScriptPath(credentials, root)
+	if err != nil {
+		return err
+	}
+	return scriptcrawler.SetScriptPath(credentials, root, path)
+}
+
 func safeCrawlerScriptFileName(raw string) (string, error) {
 	name := strings.TrimSpace(filepath.Base(raw))
 	if name == "" || name == "." || name == string(os.PathSeparator) {
@@ -741,78 +783,38 @@ func (a *AdminServer) handleUploadCrawlerVideos(w http.ResponseWriter, r *http.R
 		http.Error(w, "crawler not found", http.StatusNotFound)
 		return
 	}
+	reject := func(reason string) {
+		applog.Warn(r.Context(), "手动上传未启动: "+reason, nil, applog.Fields{Component: "crawlerupload", DriveID: id, Stage: "admission"})
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "accepted": false, "message": reason})
+	}
 	status := a.nightlyJobStatus()
 	if status.Running || status.Queued {
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"ok":       true,
-			"accepted": false,
-			"message":  fullScanBusyMessage,
-			"status":   status,
-		})
+		reject(fullScanBusyMessage)
 		return
 	}
-
-	assets, err := a.Catalog.CountCrawlerAssets(r.Context(), d.ID, crawlerVideoIDPrefixes(d))
-	if err != nil {
-		writeErr(w, r, http.StatusInternalServerError, err)
+	if strings.TrimSpace(d.Credentials["upload_drive_id"]) == "" {
+		reject("请先配置上传网盘")
 		return
 	}
-	generation := DriveGenerationStatuses{}
-	if a.GetDriveGenerationStatuses != nil {
-		generation = a.GetDriveGenerationStatuses()[d.ID]
-	}
-	if reason := crawlerUploadBlockedReason(d, assets, generation, a.previewEnabled()); reason != "" {
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"ok":       true,
-			"accepted": false,
-			"message":  reason,
-		})
+	if a.GetDriveGenerationStatuses != nil && driveGenerationBusy(a.GetDriveGenerationStatuses()[d.ID]) {
+		reject("当前爬虫有正在进行的任务，请稍后重试")
 		return
 	}
-
-	accepted := true
-	message := ""
-	if a.OnCrawlerUploadRequested != nil {
-		accepted, message = a.OnCrawlerUploadRequested(id)
+	// Per-video eligibility belongs to the worker. A failed historical asset
+	// or one blocked local video must not reject the entire sweep.
+	if a.OnCrawlerUploadRequested == nil {
+		reject("上传服务未初始化")
+		return
 	}
-	resp := map[string]any{"ok": true, "accepted": accepted}
+	accepted, message := a.OnCrawlerUploadRequested(id)
 	if !accepted {
 		if strings.TrimSpace(message) == "" {
 			message = driveTaskBusyMessage
 		}
-		resp["message"] = message
+		reject(message)
+		return
 	}
-	writeJSON(w, http.StatusAccepted, resp)
-}
-
-func crawlerUploadBlockedReason(d *catalog.Drive, assets catalog.CrawlerAssetCounts, generation DriveGenerationStatuses, previewEnabled bool) string {
-	if d == nil || !isConfiguredCrawlerDrive(d) {
-		return "爬虫不存在"
-	}
-	if strings.TrimSpace(d.Credentials["upload_drive_id"]) == "" {
-		return "请先配置上传网盘"
-	}
-	if assets.Local <= 0 {
-		return "没有待上传的本地视频"
-	}
-	if driveGenerationBusy(generation) {
-		return "当前爬虫有正在进行的任务，请稍后重试"
-	}
-	if assets.Fingerprint.Pending > 0 {
-		return "还有待生成的视频指纹"
-	}
-	if assets.Fingerprint.Failed > 0 {
-		return "存在指纹生成失败的视频，请先重试或处理失败项"
-	}
-	if previewEnabled {
-		if assets.Teaser.Pending > 0 {
-			return "还有待生成的预览视频"
-		}
-		if assets.Teaser.Failed > 0 {
-			return "存在预览视频生成失败的视频，请先重试或处理失败项"
-		}
-	}
-	return ""
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "accepted": true})
 }
 
 func driveGenerationBusy(g DriveGenerationStatuses) bool {

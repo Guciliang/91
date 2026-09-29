@@ -2611,9 +2611,6 @@ func TestHandleImportCrawlerScriptFileDoesNotCreateCrawlerTagWithoutVideos(t *te
 			t.Fatalf("close catalog: %v", err)
 		}
 	})
-	if err := cat.SetAutoGenerateTagsEnabled(ctx, false); err != nil {
-		t.Fatalf("disable auto-generate tags: %v", err)
-	}
 
 	script := "CRAWLER_NAME = \"Imported Crawler\"\nprint('crawler')\n"
 	var body bytes.Buffer
@@ -2645,13 +2642,6 @@ func TestHandleImportCrawlerScriptFileDoesNotCreateCrawlerTagWithoutVideos(t *te
 	}
 	if ok {
 		t.Fatalf("lookup tag = %q/%v, want no crawler tag before any video exists", label, ok)
-	}
-	enabled, err := cat.AutoGenerateTagsEnabled(ctx)
-	if err != nil {
-		t.Fatalf("read auto-generate setting: %v", err)
-	}
-	if enabled {
-		t.Fatal("import changed auto-generate setting to enabled")
 	}
 }
 
@@ -3839,7 +3829,7 @@ func TestHandleUpdateTagSavesMatchRulesAndClassifies(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
-	if _, err := cat.CreateTagAndClassify(ctx, "展示标签", nil, "user"); err != nil {
+	if _, err := cat.CreateTagAndClassify(ctx, "展示标签", "user"); err != nil {
 		t.Fatalf("create tag: %v", err)
 	}
 	tags, err := cat.ListTags(ctx)
@@ -3870,7 +3860,7 @@ func TestHandleUpdateTagSavesMatchRulesAndClassifies(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(got.Tag.MatchRules.Keywords) != 1 || len(got.Tag.Aliases) != 0 {
+	if len(got.Tag.MatchRules.Keywords) != 1 {
 		t.Fatalf("response = %#v", got)
 	}
 	video, err := cat.GetVideo(ctx, "rule-video")
@@ -3943,7 +3933,7 @@ func TestHandleDeleteTagRemovesTagFromVideos(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed video: %v", err)
 	}
-	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", "user"); err != nil {
 		t.Fatalf("create tag: %v", err)
 	}
 	tags, err := cat.ListTags(ctx)

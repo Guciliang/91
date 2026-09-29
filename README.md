@@ -14,6 +14,7 @@
 - **短视频模式** — 一键切换抖音风格，沉浸刷片
 - **视频分享** — 视频支持一次性分享，"看完即焚"
 - **爬虫脚本** — 支持导入自定义脚本，但是有一些规范，具体可以参考 [SpiderFor91](https://github.com/Just-Spider/SpiderFor91)
+- **接入TG** — 支持通过机器人接入 Telegram，具体可查看 [接入指南](backend/docs/Enable_Telegram.md)
 
 ## 云盘 Crypt 与代理
 
@@ -93,24 +94,30 @@ docker compose logs -f                                  # 查看日志
 
 部署完成后访问：`http://服务器IP:9191/`
 
-> 所有配置、数据库、封面、预览及上传文件均保存在 `./data/` 目录下。
+> Docker Compose 部署的配置、数据库、封面、预览及上传文件均保存在 `./data/` 目录下。
 > 更新源码后执行 `git pull && docker compose up -d --build`；`./data/` 不会被构建或容器更新覆盖。
 
-## 数据存放位置
+## 数据默认存放位置
 
-以下路径均相对于部署目录：
+**一键脚本部署**
 
-- 一键脚本部署目录：默认 `/opt/video-site-91/`
-- Docker Compose 部署目录：默认 `docker-compose.yml` 所在目录
+- 运行配置 `/opt/video-site-91/config.yaml`
+- 数据库 `/opt/video-site-91/data/video-site.db`
+- Telegram视频 `/opt/video-site-91/data/telegram/library/`
+- 其他数据 `/opt/video-site-91/data/`
 
-| 内容 | 一键脚本部署 | Docker Compose 部署 |
-|------|------------|---------------------|
-| 运行配置 | `config.yaml` | `data/config.yaml` |
-| 数据库（视频信息、用户账号、密码哈希、网盘凭证等） | `data/video-site.db` | `data/video-site.db` |
-| 封面图和预览片段 | `data/previews/` | `data/previews/` |
-| 站内上传的视频 | `data/uploads/` | `data/uploads/` |
-| 爬虫下载的视频 | `data/scriptcrawlers/` | `data/scriptcrawlers/` |
-| 导入的爬虫脚本 | `data/crawler-scripts/` | `data/crawler-scripts/` |
+**Docker Compose部署**
+
+- 宿主机数据目录为 `./data/`（相对于 `docker-compose.yml` 所在目录；例如项目位于 `/root/video-site-91` 时，对应 `/root/video-site-91/data/`）
+- 容器内数据目录为 `/opt/video-site-91/data/`
+- 运行配置：宿主机 `./data/config.yaml`（容器内 `/opt/video-site-91/data/config.yaml`）
+- 数据库：宿主机 `./data/video-site.db`
+- Telegram视频：宿主机 `./data/telegram/library/`
+- 其他数据：宿主机 `./data/`
+
+数据库：存放视频信息、账号、密码、网盘凭证、视频的播放/点赞统计等
+
+其他数据：包含封面图和预览片段、手动上传的视频、爬虫下载的视频、备份包等
 
 ## 其他说明
 
@@ -161,5 +168,18 @@ docker compose logs -f                                  # 查看日志
   <tr>
     <td align="center">微信</td>
     <td align="center">支付宝</td>
+  </tr>
+</table>
+
+## 赞助者
+
+感谢支持，你的支持是我前进的动力💗
+
+<table>
+  <tr>
+    <td align="center" width="120">
+      <img src="ReadMeImage/sponsors/sponsor001.png" alt="*帅的头像" width="80" height="80" /><br />
+      <sub>*帅</sub>
+    </td>
   </tr>
 </table>

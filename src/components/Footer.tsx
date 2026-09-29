@@ -2,9 +2,14 @@ export function Footer() {
   return (
     <footer className="footer">
       <div className="container footer__inner">
-        <div className="footer__copy">
+        <a
+          className="footer__copy"
+          href="https://github.com/nianzhibai/91"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
           © {new Date().getFullYear()} 91
-        </div>
+        </a>
       </div>
     </footer>
   );

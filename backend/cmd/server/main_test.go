@@ -47,10 +47,7 @@ func TestLoadApplicationConfigSeparatesFileAndRuntimeStoragePaths(t *testing.T) 
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(configPath, []byte(`
 storage:
-  db_path: "./data/video-site.db"
-  local_preview_dir: "./data/previews"
-logging:
-  directory: "./data/logs"
+  data_dir: "./data"
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -60,11 +57,12 @@ logging:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fileConfig.Storage.DBPath != "./data/video-site.db" ||
-		fileConfig.Storage.LocalPreviewDir != "./data/previews" {
+	if fileConfig.Storage.DataDir != "./data" ||
+		fileConfig.Storage.DBPath != filepath.Join("data", "video-site.db") ||
+		fileConfig.Storage.LocalPreviewDir != filepath.Join("data", "previews") {
 		t.Fatalf("file storage paths changed: %+v", fileConfig.Storage)
 	}
-	if fileConfig.Logging.Directory != "./data/logs" {
+	if fileConfig.Logging.Directory != filepath.Join("data", "logs") {
 		t.Fatalf("file logging path changed: %+v", fileConfig.Logging)
 	}
 	if runtimeConfig.Storage.DBPath != filepath.Join(workingDir, "data", "video-site.db") ||
@@ -390,7 +388,7 @@ func TestRegisterPreviewWorkerBackfillsPendingWhenGlobalPreviewEnabled(t *testin
 			t.Fatalf("get video: %v", err)
 		}
 		if got.PreviewStatus == "ready" {
-			if got.PreviewLocal != "/tmp/video-1.mp4" {
+			if got.PreviewLocal != "video-1.mp4" {
 				t.Fatalf("preview local = %q, want generated local teaser path", got.PreviewLocal)
 			}
 			return
@@ -1575,7 +1573,7 @@ func TestScheduleManualCrawlerUploadMigrationRunsWhenAssetsReady(t *testing.T) {
 	}
 }
 
-func TestScheduleManualCrawlerUploadMigrationRejectsPendingFingerprint(t *testing.T) {
+func TestScheduleManualCrawlerUploadMigrationAdmitsPendingFingerprintForPerVideoEvaluation(t *testing.T) {
 	ctx := context.Background()
 	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
 	if err != nil {
@@ -1614,17 +1612,21 @@ func TestScheduleManualCrawlerUploadMigrationRejectsPendingFingerprint(t *testin
 		t.Fatalf("seed video: %v", err)
 	}
 	migrator := &serverFakeCrawlerUploadRunner{}
-	app := &App{cat: cat, registry: proxy.NewRegistry(), crawlerUploader: migrator}
+	registry := proxy.NewRegistry()
+	registry.Set("crawler-pending", &serverFakeKindDrive{id: "crawler-pending", kind: scriptcrawler.Kind})
+	registry.Set("pikpak-target", &serverFakeKindDrive{id: "pikpak-target", kind: "pikpak"})
+	app := &App{cat: cat, registry: registry, crawlerUploader: migrator}
 
 	accepted, message := app.scheduleManualCrawlerUploadMigration(ctx, "crawler-pending")
-	if accepted {
-		t.Fatal("accepted = true, want false")
+	if !accepted {
+		t.Fatalf("pending assets rejected the entire upload: %s", message)
 	}
-	if !strings.Contains(message, "指纹") {
-		t.Fatalf("message = %q, want fingerprint reason", message)
+	deadline := time.Now().Add(time.Second)
+	for migrator.called.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if migrator.called.Load() != 0 {
-		t.Fatalf("migration calls = %d, want 0", migrator.called.Load())
+	if migrator.called.Load() != 1 {
+		t.Fatal("upload worker was not invoked")
 	}
 }
 
@@ -2095,7 +2097,7 @@ func TestRegenFailedPreviewsQueuesOnlyFailedVideosForDrive(t *testing.T) {
 			t.Fatalf("get target failed: %v", err)
 		}
 		if got.PreviewStatus == "ready" {
-			if got.PreviewLocal != "/tmp/target-failed.mp4" {
+			if got.PreviewLocal != "target-failed.mp4" {
 				t.Fatalf("target preview local = %q, want regenerated local teaser path", got.PreviewLocal)
 			}
 			break
@@ -2179,7 +2181,7 @@ func TestEnqueueUploadedVideoQueuesLocalGenerationByDefault(t *testing.T) {
 			t.Fatalf("get video: %v", err)
 		}
 		if got.PreviewStatus == "ready" && got.ThumbnailURL != "" {
-			if got.PreviewLocal != "/tmp/local-upload-video.mp4" {
+			if got.PreviewLocal != "local-upload-video.mp4" {
 				t.Fatalf("preview local = %q, want generated local teaser path", got.PreviewLocal)
 			}
 			if got.ThumbnailURL != "/p/thumb/local-upload-video" {
