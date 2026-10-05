@@ -37,7 +37,7 @@ Storage is an enhancement, not the source of truth for server authorization or v
 
 ## Server state
 
-Server state is fetched manually through typed functions in `src/data/videos.ts` and `src/admin/api.ts`. Hooks/pages own loading, empty, error, retry, and cancellation behavior. Responses are checked for expected shape before being exposed to UI; for example `fetchListing` checks that `items` is an array and `total` is a number, while `fetchVideoFeed` validates token/cursor invariants.
+Server state is fetched through typed functions in `src/data/videos.ts` and `src/admin/api.ts`. Public video-data functions validate important response invariants (for example, `fetchListing` checks `items` and `total`, while `fetchVideoFeed` validates token/cursor relationships); the generic admin `request<T>` helper is not a runtime validator, so feature boundaries must validate any required shape.
 
 Use a hook appropriate to the data lifetime:
 
@@ -45,6 +45,7 @@ Use a hook appropriate to the data lifetime:
 - `src/lib/useInfiniteListing.ts` with `src/lib/infiniteFeedSource.ts` owns append-only feed snapshots, cursors, cancellation, retry, and restoration.
 - `src/pages/VideoDetailPage.tsx` maintains detail/recommendation/tag request state and uses the prefetch helpers in `src/data/videos.ts`.
 - `src/lib/useLazyVideoCollection.ts` fetches a collection only when the UI opens/needs it.
+- Admin resources that need periodic refresh use `src/admin/useAdminResource.ts`; drive detail uses the per-drive snapshot controller and SSE/polling fallback in `src/admin/drive/driveDetailData.ts`. See [Admin Server State](./admin-server-state.md) for their request, revision, and error contracts.
 
 Keep a committed snapshot visible while a new query is pending when the feature supports it. `deriveListingQueryDisplay` distinguishes a blocking query transition from background revalidation, and `VideoGrid`/`VirtualVideoGrid` render those modes separately.
 
@@ -60,4 +61,4 @@ When a server mutation is optimistic, keep rollback/error handling explicit. `sr
 - Do not use URL params for ephemeral animation or modal state unless the route contract requires it; ordinary page-local state is the current pattern.
 - Do not mutate React state, feed arrays, or cached snapshots in place. `src/shorts/shortsFeed.ts` explicitly returns a new queue and tests that the previous queue is unchanged.
 - Do not treat a network failure as an empty result. `useShortsFeed` keeps `loadError` separate from `empty`, and listing components distinguish empty from error-with-content.
-- There is no universal invalidation/refetch mechanism. Invalidate or reload through the owning hook/cache helper, and document any new feature-local cache boundary.
+- There is no app-wide query cache or cross-feature invalidation mechanism. `useAdminResource` exposes `refresh`/`invalidate` for its own instance, while drive detail has a separate per-drive snapshot controller. Invalidate through the owning hook/cache helper and document any additional feature-local cache boundary.

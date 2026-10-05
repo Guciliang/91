@@ -14,6 +14,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/drives/quark"
+	"github.com/video-site/backend/internal/driveview"
 	"github.com/video-site/backend/internal/mediaimport"
 	"github.com/video-site/backend/internal/scanjob"
 	"github.com/video-site/backend/internal/telegram"
@@ -45,12 +46,14 @@ type DriveConfigUpdateLease interface {
 }
 
 type AdminServer struct {
-	Telegram        *telegram.Integration
-	Imports         *mediaimport.Manager
-	Catalog         *catalog.Catalog
-	Auth            *auth.Authenticator
-	Backups         *backup.Manager
-	BackupTransfers *backuptransfer.Manager
+	Telegram           *telegram.Integration
+	Imports            *mediaimport.Manager
+	Catalog            *catalog.Catalog
+	driveSnapshotsOnce sync.Once
+	driveSnapshots     *driveview.Service
+	Auth               *auth.Authenticator
+	Backups            *backup.Manager
+	BackupTransfers    *backuptransfer.Manager
 	// Logs is the durable runtime log store exposed only through the
 	// administrator-authenticated routes below.
 	Logs *applog.Store
@@ -85,14 +88,14 @@ type AdminServer struct {
 	OnDriveDeleteCleanup           func(ctx context.Context, driveID string) (int, error)
 	OnDriveRemoved                 func(driveID string)
 	OnScanRequested                func(context.Context, string) bool
+	OnCrawlerRunRequested          func(context.Context, string) (string, error)
+	OnCrawlerTaskCancel            func(string, string) bool
 	OnCrawlerUploadRequested       func(driveID string) (bool, string)
 	OnStopDriveTasks               func(driveID string) bool
 	OnStopAllTasks                 func() int
 	OnRegenPreview                 func(videoID string)
 	OnRegenAllPreviews             func()
-	OnRegenFailedPreviews          func(driveID string)
-	OnRegenFailedThumbnails        func(driveID string)
-	OnRegenFailedFingerprints      func(driveID string)
+	OnDriveGenerationRequested     func(context.Context, string, DriveGenerationKind) (DriveGenerationResult, error)
 	OnDeleteVideo                  func(ctx context.Context, videoID string, deleteSource bool) (DeleteVideoResult, error)
 	OnStartBlacklistSourceDelete   func(BlacklistSourceDeleteRequest) bool
 	GetBlacklistSourceDeleteStatus func() BlacklistSourceDeleteStatus
@@ -105,6 +108,7 @@ type AdminServer struct {
 	OnTagsChanged                func()
 	GetTagJobStatus              func() TagJobStatus
 	GetDriveGenerationStatuses   func() map[string]DriveGenerationStatuses
+	GetDriveGenerationStatus     func(string) DriveGenerationStatuses
 	GetPreviewGenerationVideoIDs func() map[string]bool
 	// Theme 读写（"dark" | "pink" | "sky"）
 	GetTheme func() string
@@ -251,15 +255,21 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Get("/drives/wopan/qr/{uuid}", a.handleWopanQRStatus)
 			r.Post("/drives/guangyapan/qr", a.handleGuangYaPanQRStart)
 			r.Get("/drives/guangyapan/qr/status", a.handleGuangYaPanQRStatus)
+			r.Get("/drives/{id}", a.handleDriveConfigSnapshot)
+			r.Get("/drives/{id}/config", a.handleDriveConfigSnapshot)
+			r.Get("/drives/{id}/runtime", a.handleDriveRuntimeSnapshot)
+			r.Get("/drives/{id}/stats", a.handleDriveStatsSnapshot)
+			r.Get("/drives/{id}/storage", a.handleDriveStorageSnapshot)
+			r.Get("/drives/{id}/events", a.handleDriveEvents)
 			r.Get("/drives/{id}/credentials", a.handleGetDriveCredentials)
 			r.Delete("/drives/{id}", a.handleDeleteDrive)
 			r.Post("/drives/{id}/rescan", a.handleRescan)
 			r.Post("/drives/{id}/tasks/stop", a.handleStopDriveTasks)
 			r.Post("/drives/{id}/skip-dirs", a.handleSetDriveSkipDirs)
 			r.Get("/drives/{id}/dirtree", a.handleListDriveDirTree)
-			r.Post("/drives/{id}/previews/failed/regenerate", a.handleRegenFailedPreviews)
-			r.Post("/drives/{id}/thumbnails/failed/regenerate", a.handleRegenFailedThumbnails)
-			r.Post("/drives/{id}/fingerprints/failed/regenerate", a.handleRegenFailedFingerprints)
+			r.Post("/drives/{id}/previews/generate", a.handleGenerateDrivePreviews)
+			r.Post("/drives/{id}/thumbnails/generate", a.handleGenerateDriveThumbnails)
+			r.Post("/drives/{id}/fingerprints/generate", a.handleGenerateDriveFingerprints)
 
 			// 爬虫
 			r.Get("/crawlers", a.handleListCrawlers)
@@ -269,6 +279,9 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Post("/crawlers/test-script", a.handleTestCrawlerScript)
 			r.Delete("/crawlers/{id}", a.handleDeleteCrawler)
 			r.Post("/crawlers/{id}/run", a.handleRunCrawler)
+			r.Get("/crawlers/{id}/tasks", a.handleListCrawlerTasks)
+			r.Get("/crawlers/{id}/tasks/{taskID}", a.handleGetCrawlerTask)
+			r.Post("/crawlers/{id}/tasks/{taskID}/cancel", a.handleCancelCrawlerTask)
 			r.Post("/crawlers/{id}/upload", a.handleUploadCrawlerVideos)
 			r.Post("/crawlers/{id}/paused", a.handleSetCrawlerPaused)
 			r.Post("/crawlers/{id}/tasks/stop", a.handleStopCrawlerTasks)
@@ -307,6 +320,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			r.Delete("/banned-ips/{ip}", a.handleUnbanIP)
 
 			// 配置文件与其它独立设置
+			r.Get("/telegram/availability", a.handleTelegramAvailability)
 			r.Get("/telegram/status", a.handleTelegramStatus)
 			r.Post("/telegram/test", a.handleTelegramTest)
 			r.Post("/telegram/prepare-polling", a.handleTelegramPrepare)

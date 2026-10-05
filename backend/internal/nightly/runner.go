@@ -8,6 +8,7 @@
 //	Phase 1: concurrently for each non-crawler cloud drive
 //	           scan + delete-detection + enqueue thumb + enqueue preview video
 //	         wait for all scans, then all thumb / preview-video queues to be idle
+//	         each drive backfills missing durations after its resource queues drain
 //	Phase 1b: reconcile generated thumbnails/previews against local storage
 //	          enqueue repaired pending rows and wait for their queues to drain
 //	Phase 1c: upload Telegram local videos to their configured cloud drive
@@ -95,9 +96,9 @@ type Config struct {
 	// Returns empty slice when no crawler is configured.
 	ListCrawlerDrives func(ctx context.Context) []string
 
-	// RunCrawlerCrawl synchronously runs one crawl cycle (downloads + thumbs +
-	// preview-video enqueue) for a single crawler drive.
-	RunCrawlerCrawl func(ctx context.Context, driveID string)
+	// RunCrawlerCrawl runs the same admitted crawl, generation and upload task
+	// as manual execution and returns its final error.
+	RunCrawlerCrawl func(ctx context.Context, driveID string) error
 
 	// WaitPreviewQueuesIdle blocks until both the thumbnail and preview-video queues
 	// across all drives are drained (queue empty + no in-flight task). It must
@@ -110,21 +111,17 @@ type Config struct {
 	// the number of generated asset references reset across both asset types.
 	RunLocalAssetReconciliation func(ctx context.Context) (int, error)
 
-	// RunMigration runs crawlerupload.Migrator.RunOnce for Phase 3.
-	RunMigration func(ctx context.Context) error
-
 	// RunTelegramUpload is independent of crawler configuration and runs only
 	// in the scheduled/full pipeline, never during a manual scan-all.
 	RunTelegramUpload func(ctx context.Context) error
-
-	// RestoreCrawlerVideos scans one crawler's retained local source directory
-	// after new-video generation and upload have completed.
-	RestoreCrawlerVideos func(ctx context.Context, driveID string) error
 
 	// RunDedupeAssetCleanup runs full-library duplicate video maintenance. It
 	// removes duplicate catalog rows and local generated assets, but never
 	// deletes cloud source files.
 	RunDedupeAssetCleanup func(ctx context.Context) error
+
+	// OnStatusChanged signals an updated maintenance snapshot.
+	OnStatusChanged func()
 
 	// Now is injected for tests; nil → time.Now.
 	Now func() time.Time
@@ -319,6 +316,11 @@ func (r *Runner) TriggerScanAll() bool {
 }
 
 func (r *Runner) queueManualRun() bool {
+	defer func() {
+		if r.cfg.OnStatusChanged != nil {
+			r.cfg.OnStatusChanged()
+		}
+	}()
 	r.stateMu.Lock()
 	if r.running || r.queued {
 		r.stateMu.Unlock()
@@ -341,6 +343,11 @@ func (r *Runner) queueManualRun() bool {
 // StopCurrent cancels the currently running pipeline and drops one queued
 // manual trigger, if present. It returns true when there was something to stop.
 func (r *Runner) StopCurrent() bool {
+	defer func() {
+		if r.cfg.OnStatusChanged != nil {
+			r.cfg.OnStatusChanged()
+		}
+	}()
 	r.stateMu.Lock()
 	wasRunning := r.running
 	wasQueued := r.queued
@@ -500,6 +507,11 @@ func (r *Runner) runModeLockedForDate(ctx context.Context, mode runMode, schedul
 }
 
 func (r *Runner) markStarted(started time.Time, cancel context.CancelFunc) {
+	defer func() {
+		if r.cfg.OnStatusChanged != nil {
+			r.cfg.OnStatusChanged()
+		}
+	}()
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
 	r.running = true
@@ -512,6 +524,11 @@ func (r *Runner) markStarted(started time.Time, cancel context.CancelFunc) {
 }
 
 func (r *Runner) markFinished(finished time.Time, err error) {
+	defer func() {
+		if r.cfg.OnStatusChanged != nil {
+			r.cfg.OnStatusChanged()
+		}
+	}()
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
 	r.running = false
@@ -594,51 +611,26 @@ func (r *Runner) runPipeline(ctx context.Context) {
 		crawlerIDs = r.cfg.ListCrawlerDrives(ctx)
 	}
 	if len(crawlerIDs) == 0 {
-		log.Printf("[nightly] phase 2/3 skipped: no crawler configured")
-		r.runDedupeAssetCleanupPhase(ctx, "nightly", "phase 5")
-		return
-	}
-	log.Printf("[nightly] phase 2: crawling %d crawler drive(s)", len(crawlerIDs))
-	for _, id := range crawlerIDs {
-		if ctx.Err() != nil {
-			log.Printf("[nightly] phase 2 aborted by ctx: %v", ctx.Err())
-			return
-		}
-		log.Printf("[nightly] phase 2: crawling drive=%s", id)
-		r.cfg.RunCrawlerCrawl(ctx, id)
-	}
-	log.Printf("[nightly] phase 2: waiting for teaser queue to drain")
-	if err := r.waitIdle(ctx, "nightly", "phase 2"); err != nil {
-		return
-	}
-
-	// ---------- Phase 3 ----------
-	if r.shouldStop(ctx, "nightly", "phase 3") {
-		return
-	}
-	log.Printf("[nightly] phase 3: crawler upload")
-	if r.cfg.RunMigration != nil {
-		if err := r.cfg.RunMigration(ctx); err != nil {
-			log.Printf("[nightly] phase 3 migration: %v", err)
-			r.recordIssue("migration", err)
-		}
-	}
-
-	// ---------- Phase 4 ----------
-	if r.shouldStop(ctx, "nightly", "phase 4") {
-		return
-	}
-	if r.cfg.RestoreCrawlerVideos != nil {
-		log.Printf("[nightly] phase 4: restoring retained crawler videos")
+		log.Printf("[nightly] crawler phase skipped: no crawler configured")
+	} else {
+		log.Printf("[nightly] phase 2: crawling %d crawler drive(s)", len(crawlerIDs))
 		for _, id := range crawlerIDs {
-			if err := r.cfg.RestoreCrawlerVideos(ctx, id); err != nil {
-				log.Printf("[nightly] phase 4 restore drive=%s: %v", id, err)
-				r.recordIssue("restore", err)
+			if ctx.Err() != nil {
+				log.Printf("[nightly] phase 2 aborted by ctx: %v", ctx.Err())
+				return
+			}
+			log.Printf("[nightly] phase 2: crawling drive=%s", id)
+			if err := r.cfg.RunCrawlerCrawl(ctx, id); err != nil {
+				r.recordIssue("crawl", fmt.Errorf("crawler %s: %w", id, err))
 			}
 		}
 	}
-
-	r.runDedupeAssetCleanupPhase(ctx, "nightly", "phase 5")
+	// Uploads and restoration can admit more resource generation. Its per-drive
+	// duration backfill must also finish before duplicate maintenance reads it.
+	if err := r.waitIdle(ctx, "nightly", "generation completion"); err != nil {
+		return
+	}
+	r.runDedupeAssetCleanupPhase(ctx, "nightly", "dedupe")
 }
 
 // runScanAllPipeline is the manual admin workflow: configured cloud drives are

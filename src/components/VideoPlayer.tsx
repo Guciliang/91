@@ -19,6 +19,7 @@ import {
   type PlayerGesturePoint,
 } from "@/lib/playerGestures";
 import { disablePlayerVolumePersistence } from "@/lib/playerVolume";
+import { bindPlayerNativeBack } from "@/lib/playerNativeBack";
 import {
   escapeHtml,
   formatSubtitleLabel,
@@ -704,6 +705,7 @@ function mountArtPlayer({
     onPreviewHover
   );
   const unbindKeyboardHotkeys = bindPlayerKeyboardHotkeys(art);
+  const unbindNativeBack = bindPlayerNativeBack(art);
   const unbindMobileFullscreenControlAutoHide =
     bindMobileFullscreenControlAutoHide(art);
   const unbindFullscreenSubtitleLayout = bindFullscreenSubtitleLayout(
@@ -754,6 +756,7 @@ function mountArtPlayer({
     unbindMobileGestures();
     unbindProgressPreview();
     unbindKeyboardHotkeys();
+    unbindNativeBack();
     unbindMobileFullscreenControlAutoHide();
     unbindFullscreenSubtitleLayout();
     unbindTripleScreen();

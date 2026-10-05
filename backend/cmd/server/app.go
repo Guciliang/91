@@ -27,6 +27,8 @@ type App struct {
 	workers            map[string]*preview.Worker
 	thumbWorkers       map[string]*preview.ThumbWorker
 	fingerprintWorkers map[string]*fingerprint.Worker
+	// Each drive completes missing metadata after its own generation queues drain.
+	durationBackfills map[string]*driveDurationBackfill
 	// Shared for the lifetime of the app, including drive remounts.
 	generationLimitsOnce sync.Once
 	thumbnailLimiter     *tasklimit.Limiter
@@ -160,6 +162,7 @@ type driveUploadProgress struct {
 }
 
 type crawlerUploadRunner interface {
+	RunDrive(context.Context, string) error
 	RunOnce(ctx context.Context) error
 	RunDrives(ctx context.Context, driveIDs []string) error
 	StartDrive(ctx context.Context, driveID string) (<-chan error, bool)

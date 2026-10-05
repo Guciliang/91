@@ -14,6 +14,8 @@ import (
 
 	"github.com/video-site/backend/internal/api"
 	"github.com/video-site/backend/internal/catalog"
+	"github.com/video-site/backend/internal/crawljob"
+	"github.com/video-site/backend/internal/driveevents"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/googledrive"
 	"github.com/video-site/backend/internal/drives/guangyapan"
@@ -92,8 +94,8 @@ func (a *App) reloadDriveRuntime(ctx context.Context, driveID string) error {
 		return err
 	}
 
-	// 本地存储开启 .strm 越root后，之前因 strm 指向目录外而失败的封面/
-	// 预览/指纹应自动重试，省得用户再手动点三个"重试失败"按钮。
+	// Local storage and WebDAV can both generate STRM files outside the root;
+	// retry assets that previously failed because their targets were inaccessible.
 	if (d.Kind == localstorage.Kind || d.Kind == webdav.Kind) &&
 		parseBoolDefault(strings.TrimSpace(d.Credentials["strm_allow_outside_root"]), false) {
 		a.scheduleDriveTaskAfterConfig(ctx, driveID, 0, func(taskCtx context.Context) {
@@ -171,7 +173,7 @@ type driveTaskAdmission struct {
 	generation uint64
 }
 
-type driveTaskAdmissionContextKey struct{}
+type driveTaskAdmissionContextKey struct{ gate *driveOperationGate }
 
 type driveOperationGate struct {
 	// configMu serializes HTTP/config writers. It is deliberately not held while
@@ -198,11 +200,12 @@ type driveOperationGate struct {
 	deleting   bool
 	retired    bool
 
-	applyScheduled bool
-	pendingScopes  api.DriveConfigUpdateScope
-	runtimeApply   func() error
-	scanApply      func() error
-	activeConfig   *catalog.Drive
+	applyScheduled     bool
+	pendingScopes      api.DriveConfigUpdateScope
+	runtimeApply       func() error
+	scanApply          func() error
+	activeConfig       *catalog.Drive
+	generationRequests map[api.DriveGenerationKind]bool
 }
 
 func newDriveOperationGate() *driveOperationGate {
@@ -240,7 +243,7 @@ func driveTaskAdmissionFromContext(ctx context.Context, gate *driveOperationGate
 	if ctx == nil || gate == nil {
 		return 0, false
 	}
-	admission, ok := ctx.Value(driveTaskAdmissionContextKey{}).(driveTaskAdmission)
+	admission, ok := ctx.Value(driveTaskAdmissionContextKey{gate}).(driveTaskAdmission)
 	return admission.generation, ok && admission.gate == gate
 }
 
@@ -248,7 +251,7 @@ func withDriveTaskAdmission(ctx context.Context, gate *driveOperationGate, gener
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return context.WithValue(ctx, driveTaskAdmissionContextKey{}, driveTaskAdmission{
+	return context.WithValue(ctx, driveTaskAdmissionContextKey{gate}, driveTaskAdmission{
 		gate:       gate,
 		generation: generation,
 	})
@@ -1248,6 +1251,10 @@ func (a *App) newDriveGenerationWorkers(drv drives.Drive) (*preview.Worker, *pre
 	fingerprintCfg.Limiter = fingerprintLimiter
 	fingerprintWorker := fingerprint.NewWorker(a.cat, drv, fingerprintCfg)
 	driveID := drv.ID()
+	notifyStatus := func(immediate bool) { a.notifyDriveRuntime(driveID, immediate) }
+	previewWorker.OnStatusChanged = notifyStatus
+	thumbWorker.OnStatusChanged = notifyStatus
+	fingerprintWorker.OnStatusChanged = notifyStatus
 	gate := a.driveOperationGate(driveID)
 	generation := gate.currentGeneration()
 	previewWorker.TaskGuard = func() func() {
@@ -1368,10 +1375,6 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 	if scriptPath != "" {
 		workDir = filepath.Dir(scriptPath)
 	}
-	protocol := scriptcrawler.ProtocolV1
-	if meta, err := scriptcrawler.ReadMetadata(scriptPath); err == nil {
-		protocol = meta.Protocol
-	}
 
 	driveID := d.ID
 	_, _, fingerprintLimiter := a.generationLimits()
@@ -1380,7 +1383,6 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		Driver:             drv,
 		Catalog:            a.cat,
 		CrawlerName:        d.Name,
-		Protocol:           protocol,
 		PythonPath:         pythonPath,
 		FFmpegPath:         a.cfg.Preview.FFmpegPath,
 		FFprobePath:        a.cfg.Preview.FFprobePath,
@@ -1390,16 +1392,9 @@ func (a *App) attachScriptCrawler(d *catalog.Drive, drv *scriptcrawler.Driver) {
 		LocalPreviewDir:    a.cfg.Storage.LocalPreviewDir,
 		ProxyURL:           proxyURL,
 		ConfigJSON:         configJSON,
-		OnProgress: func(progress scriptcrawler.CrawlProgress) {
-			scanned := progress.Checked
-			if scanned < progress.TotalEntries {
-				scanned = progress.TotalEntries
-			}
-			added := progress.Emitted
-			if added < progress.NewVideos {
-				added = progress.NewVideos
-			}
-			a.updateDriveScanProgress(driveID, scanned, added)
+		FeedID:             d.Credentials["feed_id"],
+		OnProgress: func(progress crawljob.Result) {
+			a.updateDriveScanProgress(driveID, progress.Checked, progress.NewVideos)
 		},
 	})
 
@@ -1433,6 +1428,8 @@ func (a *App) registerPreviewWorkers(ctx context.Context, driveID string, worker
 }
 
 func (a *App) registerPreviewWorkersWithOptions(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker, fingerprintWorker *fingerprint.Worker, cancel context.CancelFunc, enqueue bool) {
+	gate := a.driveOperationGate(driveID)
+	backfillCtx := withDriveTaskAdmission(ctx, gate, gate.currentGeneration())
 	a.mu.Lock()
 	if a.cancels == nil {
 		a.cancels = make(map[string]context.CancelFunc)
@@ -1446,6 +1443,9 @@ func (a *App) registerPreviewWorkersWithOptions(ctx context.Context, driveID str
 	if a.fingerprintWorkers == nil {
 		a.fingerprintWorkers = make(map[string]*fingerprint.Worker)
 	}
+	if a.durationBackfills == nil {
+		a.durationBackfills = make(map[string]*driveDurationBackfill)
+	}
 	if old, ok := a.cancels[driveID]; ok && old != nil {
 		old()
 	}
@@ -1456,8 +1456,10 @@ func (a *App) registerPreviewWorkersWithOptions(ctx context.Context, driveID str
 	}
 	if thumbWorker != nil {
 		a.thumbWorkers[driveID] = thumbWorker
+		a.durationBackfills[driveID] = &driveDurationBackfill{ctx: backfillCtx, worker: thumbWorker}
 	} else {
 		delete(a.thumbWorkers, driveID)
+		delete(a.durationBackfills, driveID)
 	}
 	if fingerprintWorker != nil {
 		a.fingerprintWorkers[driveID] = fingerprintWorker
@@ -1475,9 +1477,6 @@ func (a *App) registerPreviewWorkersWithOptions(ctx context.Context, driveID str
 		return
 	}
 	a.scheduleDriveGenerationEnqueue(ctx, driveID, worker, thumbWorker)
-	if fingerprintWorker != nil {
-		go a.scheduleFingerprintBackfillWaiting(ctx, driveID, fingerprintWorker)
-	}
 }
 
 func (a *App) registerDriveTaskContext(
@@ -1592,7 +1591,7 @@ func (a *App) beginDriveScanOrCrawl(driveID string) bool {
 		return false
 	}
 	a.scanQueueMu.Lock()
-	defer a.scanQueueMu.Unlock()
+	defer func() { a.scanQueueMu.Unlock(); a.notifyDriveRuntime(driveID, true) }()
 	if a.scanQueued == nil {
 		a.scanQueued = make(map[string]bool)
 	}
@@ -1612,6 +1611,9 @@ func (a *App) endDriveScanOrCrawl(driveID string) {
 	delete(a.scanQueued, driveID)
 	delete(a.scanProgress, driveID)
 	a.scanQueueMu.Unlock()
+	if a.cat != nil {
+		a.cat.DriveEvents().Notify(driveID, true, driveevents.ActivityChanged, driveevents.MediaChanged)
+	}
 }
 
 func (a *App) updateDriveScanProgress(driveID string, scanned, added int) {
@@ -1630,6 +1632,7 @@ func (a *App) updateDriveScanProgress(driveID string, scanned, added int) {
 		a.scanProgress[driveID] = progress
 	}
 	a.scanQueueMu.Unlock()
+	a.notifyDriveRuntime(driveID, false)
 }
 
 func (a *App) updateDriveScanCooldown(driveID string, until time.Time) {
@@ -1647,6 +1650,7 @@ func (a *App) updateDriveScanCooldown(driveID string, until time.Time) {
 		a.scanProgress[driveID] = progress
 	}
 	a.scanQueueMu.Unlock()
+	a.notifyDriveRuntime(driveID, true)
 }
 
 func (a *App) driveHasActiveWork(driveID string) bool {
@@ -1694,8 +1698,12 @@ func (a *App) driveHasActiveWork(driveID string) bool {
 	previewWorker := a.workers[driveID]
 	thumbWorker := a.thumbWorkers[driveID]
 	fingerprintWorker := a.fingerprintWorkers[driveID]
+	durationBackfill := a.durationBackfills[driveID]
 	a.mu.Unlock()
 
+	if durationBackfill.busy() {
+		return true
+	}
 	if previewTaskBusy(thumbWorker.Status()) {
 		return true
 	}
@@ -1782,6 +1790,7 @@ func (a *App) resetDriveGenerationWorkers(ctx context.Context, driveID string) b
 	a.mu.Lock()
 	delete(a.workers, driveID)
 	delete(a.thumbWorkers, driveID)
+	delete(a.durationBackfills, driveID)
 	delete(a.fingerprintWorkers, driveID)
 	delete(a.cancels, driveID)
 	a.mu.Unlock()
@@ -1835,6 +1844,21 @@ func (a *App) restoreDriveGenerationWorkers(driveID string, gate *driveOperation
 
 func (a *App) stopDriveTasks(ctx context.Context, driveID string) bool {
 	driveID = strings.TrimSpace(driveID)
+	a.mu.Lock()
+	crawler := a.scriptCrawlers[driveID]
+	a.mu.Unlock()
+	if crawler != nil && crawler.StopTasks() {
+		// Keep task leases, generation workers and uploads alive until all
+		// completed videos finish. Repeated pauses remain graceful as well.
+		return true
+	}
+	return a.cancelDriveTasks(ctx, driveID)
+}
+
+// cancelDriveTasks forcefully stops all work, including crawler completion.
+// Use it for deletion and the explicit application-wide stop operation.
+func (a *App) cancelDriveTasks(ctx context.Context, driveID string) bool {
+	driveID = strings.TrimSpace(driveID)
 	if driveID == "" {
 		return false
 	}
@@ -1842,14 +1866,14 @@ func (a *App) stopDriveTasks(ctx context.Context, driveID string) bool {
 	// Cancellation must remain available while a configuration change is
 	// waiting for these very tasks to drain. Taking ordinary task admission here
 	// would make "stop" wait behind the pending change and create a deadlock.
+	gate := a.driveOperationGate(driveID)
+	gate.controlMu.Lock()
+	defer gate.controlMu.Unlock()
 	canceled := a.cancelDriveTaskContexts(driveID)
 	queued := a.clearQueuedDriveTask(driveID)
 	fingerprintQueued := a.clearFingerprintQueueing(driveID)
 	uploading := a.clearCrawlerUploadProgress(driveID)
-	gate := a.driveOperationGate(driveID)
-	gate.controlMu.Lock()
 	hadWorkers := a.resetDriveGenerationWorkers(ctx, driveID)
-	gate.controlMu.Unlock()
 	stopped := canceled > 0 || queued || fingerprintQueued || uploading || hadWorkers
 	log.Printf("[tasks] stop drive=%s stopped=%v canceled_tasks=%d queued=%v fingerprint_queue=%v uploading=%v workers=%v",
 		driveID, stopped, canceled, queued, fingerprintQueued, uploading, hadWorkers)
@@ -1862,7 +1886,7 @@ func (a *App) stopAllDriveTasks(ctx context.Context) int {
 	}
 	stopped := 0
 	for _, driveID := range a.driveTaskIDs() {
-		if a.stopDriveTasks(ctx, driveID) {
+		if a.cancelDriveTasks(ctx, driveID) {
 			stopped++
 		}
 	}
@@ -1950,7 +1974,21 @@ func (a *App) scheduleDriveGenerationEnqueue(
 		if err := taskCtx.Err(); err != nil {
 			return
 		}
+		finishEnqueue := a.beginDriveResourceEnqueue(driveID)
+		defer finishEnqueue()
+		a.mu.Lock()
+		fingerprintWorker := a.fingerprintWorkers[driveID]
+		a.mu.Unlock()
+		// Independent queues must not delay one another under backpressure.
+		// Keep the shared task and duration handoff open until both producers exit.
+		var producers sync.WaitGroup
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			a.enqueueFingerprintBackfill(taskCtx, driveID, fingerprintWorker)
+		}()
 		a.enqueueDriveGeneration(taskCtx, driveID, worker, thumbWorker)
+		producers.Wait()
 	}()
 }
 
@@ -2035,6 +2073,8 @@ func (a *App) enqueuePending(ctx context.Context, driveID string, w *preview.Wor
 }
 
 func (a *App) enqueueDriveGeneration(ctx context.Context, driveID string, worker *preview.Worker, thumbWorker *preview.ThumbWorker) {
+	finishEnqueue := a.beginDriveResourceEnqueue(driveID)
+	defer finishEnqueue()
 	// Thumbnail generation is independent of the global preview switch.
 	if thumbWorker != nil {
 		a.enqueueThumbnails(ctx, driveID, thumbWorker)
@@ -2059,10 +2099,10 @@ func (a *App) enqueueThumbnails(ctx context.Context, driveID string, w *preview.
 	if len(pending) == 0 {
 		return
 	}
-	log.Printf("[thumb] enqueue %d thumbnail/duration tasks for drive=%s", len(pending), driveID)
+	log.Printf("[thumb] enqueue %d thumbnail tasks for drive=%s", len(pending), driveID)
 	for _, v := range pending {
 		if !w.EnqueueBlocking(ctx, v) {
-			log.Printf("[thumb] enqueue thumbnail/duration tasks canceled for drive=%s", driveID)
+			log.Printf("[thumb] enqueue thumbnail tasks canceled for drive=%s", driveID)
 			return
 		}
 	}
@@ -2101,14 +2141,6 @@ func (a *App) scheduleFingerprintBackfill(ctx context.Context, driveID string, w
 	if !ok {
 		return
 	}
-	a.startFingerprintBackfill(taskCtx, driveID, w, done)
-}
-
-func (a *App) scheduleFingerprintBackfillWaiting(ctx context.Context, driveID string, w *fingerprint.Worker) {
-	if w == nil {
-		return
-	}
-	taskCtx, done := a.registerDriveTaskContextWaiting(ctx, driveID, 0)
 	a.startFingerprintBackfill(taskCtx, driveID, w, done)
 }
 
@@ -2179,6 +2211,8 @@ func (a *App) enqueueFingerprints(ctx context.Context, driveID string, w *finger
 	if len(pending) == 0 {
 		return
 	}
+	finishEnqueue := a.beginDriveResourceEnqueue(driveID)
+	defer finishEnqueue()
 	log.Printf("[fingerprint] enqueue %d videos for drive=%s", len(pending), driveID)
 	for _, v := range pending {
 		if !w.EnqueueBlocking(ctx, v) {
@@ -2218,6 +2252,7 @@ func (a *App) retireDriveRuntime(id string) {
 	}
 	delete(a.workers, id)
 	delete(a.thumbWorkers, id)
+	delete(a.durationBackfills, id)
 	delete(a.fingerprintWorkers, id)
 	delete(a.scriptCrawlers, id)
 	a.mu.Unlock()

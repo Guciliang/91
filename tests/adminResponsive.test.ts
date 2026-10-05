@@ -280,11 +280,11 @@ test("user management loading keeps fixed controls and leaves both tables blank"
   );
   assert.match(
     usersPageSource,
-    /className="admin-users-toolbar"[\s\S]*?\{!loading && tab === "users" && \(\s*<div className="admin-table-wrap admin-users-table-wrap">\s*<table className="admin-table admin-users-table">/
+    /className="admin-users-toolbar"[\s\S]*?\{!loading && tab === "users" && resource\.ready && \(\s*<div className="admin-table-wrap admin-users-table-wrap">\s*<table className="admin-table admin-users-table">/
   );
   assert.match(
     usersPageSource,
-    /\{!loading && tab === "ips" && \(\s*<div className="admin-table-wrap admin-users-table-wrap">\s*<table className="admin-table admin-banned-ips-table">/
+    /\{!loading && tab === "ips" && resource\.ready && \(\s*<div className="admin-table-wrap admin-users-table-wrap">\s*<table className="admin-table admin-banned-ips-table">/
   );
 });
 
@@ -411,7 +411,7 @@ test("current video bulk actions use ordinary text buttons", () => {
   const base = ruleBody(adminCss, ".admin-videos-bulk-actions__btn");
 
   assert.equal(Array.from(currentVideosSource.matchAll(/className="admin-btn admin-videos-bulk-actions__btn"/g)).length, 3);
-  assert.match(currentVideosSource, /onClick=\{selectPageVideos\}[\s\S]*?disabled=\{listItems\.length === 0 \|\| allPageSelected\}[\s\S]*?>\s*全选本页\s*<\/button>/);
+  assert.match(currentVideosSource, /onClick=\{selectPageVideos\}[\s\S]*?disabled=\{listQueryPending \|\| listItems\.length === 0 \|\| allPageSelected\}[\s\S]*?>\s*全选本页\s*<\/button>/);
   assert.match(currentVideosSource, /onClick=\{\(\) => setSelectedIds\(new Set\(\)\)\}[\s\S]*?disabled=\{selectedIds\.size === 0\}[\s\S]*?>\s*取消选中\s*<\/button>/);
   assert.doesNotMatch(currentVideosSource, />\s*重生预览\s*<\/button>/);
   assert.doesNotMatch(currentVideosSource, /handleBatchRegen|batchRegenOpen|batchRegening|confirmBatchRegen/);
@@ -854,7 +854,7 @@ test("blacklist cancel action uses ordinary button styling", () => {
   const unavailable = ruleBody(adminCss, ".admin-blacklist-unavailable");
 
   assert.doesNotMatch(videosPageSource, /const \[driveId, setDriveId\] = useState\(""\);/);
-  assert.match(videosPageSource, /api\.listBlacklist\(\{ page, size: pageSize, keyword: searchKeyword \}\)/);
+  assert.match(videosPageSource, /api\.listBlacklist\(\{ page, size: pageSize, keyword: searchKeyword \}, signal\)/);
   assert.match(videosPageSource, /admin-videos-filter admin-videos-filter--blacklist/);
   assert.doesNotMatch(videosPageSource, /<DriveFilter/);
   assert.match(apiSource, /listBlacklist\(\s*params: \{ driveId\?: string; page\?: number; size\?: number; keyword\?: string \}/);
@@ -1481,7 +1481,7 @@ test("admin modals and action footers adapt on mobile", () => {
   // .admin-modal 桌面段已用 `width: min(620px, 100%)`，窄屏自然 100%；mobile 段
   // 只重写 max-height，所以这里断桌面规则即可。
   assert.match(ruleBody(adminCss, ".admin-modal"), /width\s*:\s*min\(\d+px,\s*100%\)/);
-  assert.match(ruleBody(adminCss, ".admin-modal.admin-modal--crawler"), /width\s*:\s*min\(1080px,\s*100%\)/);
+  assert.match(ruleBody(adminCss, ".admin-modal.admin-modal--crawler"), /width\s*:\s*min\(960px,\s*100%\)/);
   assert.match(allRuleBodies(css, ".admin-modal"), /display\s*:\s*flex/);
   assert.match(allRuleBodies(css, ".admin-modal"), /overflow\s*:\s*hidden/);
   assert.match(allRuleBodies(css, ".admin-modal__body"), /overflow-y\s*:\s*auto/);

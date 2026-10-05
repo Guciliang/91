@@ -549,13 +549,14 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, link *drives.Strea
 			} else {
 				client = p.relay
 			}
-		} else if link.HTTPClient != nil && link.HTTPClient.CheckRedirect != nil {
+		} else {
 			// Some drives deliberately use ErrUseLastResponse for normal browser
-			// playback. Forced same-origin relay must instead consume the redirect
-			// and copy the final response, while retaining that drive's Transport,
-			// proxy, timeout, and cookie settings.
-			clone := *link.HTTPClient
-			clone.CheckRedirect = nil
+			// playback. Forced same-origin relay follows provider redirects on the
+			// server while preserving drive-specific transport, proxy, timeout, and
+			// cookie settings. Keep the shared redirect policy to avoid forwarding
+			// credentials or an implicit Referer across origins.
+			clone := *client
+			clone.CheckRedirect = streamhttp.CheckRedirect
 			client = &clone
 		}
 	}

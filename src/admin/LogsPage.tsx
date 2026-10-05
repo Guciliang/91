@@ -25,6 +25,7 @@ import {
 import * as api from "./api";
 import { ConfirmModal } from "./ConfirmModal";
 import { useToast } from "@/components/ToastContext";
+import { useNativeBackHandler } from "@/lib/useNativeBack";
 import { useLogScroller } from "./useLogScroller";
 import { useRuntimeLogs } from "./useRuntimeLogs";
 import {
@@ -63,8 +64,8 @@ const sourceOptions: Array<{
   label: string;
 }> = [
   { value: "", label: "ALL" },
-  { value: "application", label: "应用日志" },
-  { value: "http", label: "访问日志" },
+  { value: "application", label: "应用" },
+  { value: "http", label: "访问" },
 ];
 
 const levelOptions: Array<{
@@ -356,6 +357,10 @@ export function LogsPage() {
     showRawLogs,
     fullscreen: fullscreenActive,
   });
+  useNativeBackHandler(fullscreenActive, () => {
+    prepareViewportTransition();
+    setFullscreen(false);
+  }, "fullscreen");
 
   useEffect(() => {
     try {

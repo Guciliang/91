@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/video-site/backend/internal/dedupe"
+	"github.com/video-site/backend/internal/driveevents"
 )
 
 // InsertScannedVideo admits a new scan row only if neither its source identity
@@ -17,7 +18,9 @@ func (c *Catalog) InsertScannedVideo(ctx context.Context, v *Video, seenFileIDs 
 	if v == nil || v.ID == "" || v.DriveID == "" || v.FileID == "" {
 		return false, errors.New("catalog: scanned video requires video, drive, and file IDs")
 	}
-	return withImmediateWriteRetry(ctx, c.db, defaultBusyRetryPolicy, func(conn *sql.Conn) (bool, error) {
+	var changed bool
+	inserted, err := withImmediateWriteRetry(ctx, c.db, defaultBusyRetryPolicy, func(conn *sql.Conn) (bool, error) {
+		changed = false
 		var exists bool
 		if err := conn.QueryRowContext(ctx, `SELECT EXISTS (
 SELECT 1 FROM videos WHERE id = ? OR (drive_id = ? AND file_id = ?)
@@ -35,13 +38,19 @@ SELECT 1 FROM videos WHERE id = ? OR (drive_id = ? AND file_id = ?)
 			if err := recordScannedDuplicate(ctx, conn, v, duplicate, DuplicateOutcomeSkipped); err != nil {
 				return false, err
 			}
+			changed = true
 			return false, nil
 		}
 		if _, err := upsertVideoRow(ctx, conn, v); err != nil {
 			return false, err
 		}
+		changed = true
 		return true, nil
 	})
+	if err == nil && changed {
+		c.driveEvents.Notify("", false, driveevents.MediaChanged)
+	}
+	return inserted, err
 }
 
 // FindScannedVideoDuplicate applies the same duplicate policy to an existing
@@ -53,7 +62,8 @@ func (c *Catalog) FindScannedVideoDuplicate(ctx context.Context, v *Video, seenF
 
 // RecordScannedDuplicate records the observed match for an already admitted
 // row. It does not tombstone the file or change later admission decisions.
-func (c *Catalog) RecordScannedDuplicate(ctx context.Context, source, duplicate *Video) error {
+func (c *Catalog) RecordScannedDuplicate(ctx context.Context, source, duplicate *Video) (resultErr error) {
+	defer c.notifyDriveWrite(&resultErr, "", driveevents.MediaChanged)
 	return recordScannedDuplicate(ctx, c.db, source, duplicate, DuplicateOutcomeExisting)
 }
 

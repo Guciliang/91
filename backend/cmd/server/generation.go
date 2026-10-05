@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/video-site/backend/internal/api"
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/drives"
 	"github.com/video-site/backend/internal/drives/localupload"
@@ -24,6 +25,8 @@ func (a *App) enqueueUploadedVideo(ctx context.Context, v *catalog.Video) {
 		return
 	}
 	defer release()
+	finishEnqueue := a.beginDriveResourceEnqueue(v.DriveID)
+	defer finishEnqueue()
 	a.mu.Lock()
 	worker := a.workers[v.DriveID]
 	thumbWorker := a.thumbWorkers[v.DriveID]
@@ -54,6 +57,8 @@ func (a *App) regenPreview(ctx context.Context, videoID string) {
 		return
 	}
 	defer done()
+	finishEnqueue := a.beginDriveResourceEnqueue(v.DriveID)
+	defer finishEnqueue()
 	a.mu.Lock()
 	worker := a.workers[v.DriveID]
 	a.mu.Unlock()
@@ -99,7 +104,8 @@ func (a *App) regenAllPreviews(ctx context.Context) {
 				rejected[v.DriveID] = true
 				continue
 			}
-			admission = driveAdmission{ctx: taskCtx, done: done}
+			finishEnqueue := a.beginDriveResourceEnqueue(v.DriveID)
+			admission = driveAdmission{ctx: taskCtx, done: func() { finishEnqueue(); done() }}
 			admissions[v.DriveID] = admission
 		}
 		a.mu.Lock()
@@ -136,128 +142,17 @@ func (a *App) regenFailedPreviews(ctx context.Context, driveID string) {
 	if !a.previewEnabled() {
 		return
 	}
-	taskCtx, done, admitted := a.registerDriveTaskContext(ctx, driveID, driveTaskScopePreview)
-	if !admitted {
-		return
-	}
-	defer done()
-	a.mu.Lock()
-	worker := a.workers[driveID]
-	a.mu.Unlock()
-	if worker == nil {
-		log.Printf("[preview] regen failed drive=%s skipped: worker not found", driveID)
-		return
-	}
-	counts, err := a.resetFailedGeneration(taskCtx, driveID, catalog.GenerationKinds{Previews: true})
-	if err != nil {
-		log.Printf("[preview] reset failed videos drive=%s: %v", driveID, err)
-		return
-	}
-	reset := counts.Previews
-	items, err := a.cat.ListVideosByPreviewStatus(taskCtx, driveID, "pending", 0)
-	if err != nil {
-		log.Printf("[preview] list pending videos for regen drive=%s: %v", driveID, err)
-		return
-	}
-	log.Printf("[preview] enqueue pending videos for regen drive=%s count=%d reset_failed=%d", driveID, len(items), reset)
-	queued := 0
-	for _, v := range items {
-		if err := taskCtx.Err(); err != nil {
-			log.Printf("[preview] enqueue pending canceled drive=%s queued=%d: %v", driveID, queued, err)
-			return
-		}
-		if !worker.EnqueueBlocking(taskCtx, v) {
-			log.Printf("[preview] enqueue pending canceled drive=%s queued=%d", driveID, queued)
-			return
-		}
-		queued++
-	}
-	log.Printf("[preview] enqueued pending videos for regen drive=%s queued=%d reset_failed=%d", driveID, queued, reset)
+	a.regenerateDriveResources(ctx, driveID, api.DriveGenerationPreviews)
 }
 
-// regenFailedThumbnails 把某 drive 下 thumbnail_status=failed 的视频全部重置为
-// pending 并重新入队封面 worker。与 regenFailedPreviews 行为对称：那条管预览视频，
-// 这条管封面图（两个 worker 是独立队列）。
-//
-// 状态重置保留已有封面以便只补全缺失的时长；取链 / ffmpeg 在 thumb worker 里执行。
+// regenFailedThumbnails retries missing failed covers. Duration-only work belongs
+// after this drive's resource generation and never changes existing thumbnail state.
 func (a *App) regenFailedThumbnails(ctx context.Context, driveID string) {
-	taskCtx, done, admitted := a.registerDriveTaskContext(ctx, driveID, 0)
-	if !admitted {
-		return
-	}
-	defer done()
-	a.mu.Lock()
-	thumbWorker := a.thumbWorkers[driveID]
-	a.mu.Unlock()
-	if thumbWorker == nil {
-		log.Printf("[thumb] regen failed drive=%s skipped: thumb worker not found", driveID)
-		return
-	}
-	counts, err := a.resetFailedGeneration(taskCtx, driveID, catalog.GenerationKinds{Thumbnails: true})
-	if err != nil {
-		log.Printf("[thumb] reset failed thumbnails drive=%s: %v", driveID, err)
-		return
-	}
-	reset := counts.Thumbnails
-	items, err := a.cat.ListVideosNeedingThumbnail(taskCtx, driveID, 0)
-	if err != nil {
-		log.Printf("[thumb] list pending thumbnails for regen drive=%s: %v", driveID, err)
-		return
-	}
-	log.Printf("[thumb] enqueue pending thumbnails for regen drive=%s count=%d reset_failed=%d", driveID, len(items), reset)
-	queued := 0
-	for _, v := range items {
-		if err := taskCtx.Err(); err != nil {
-			log.Printf("[thumb] enqueue pending canceled drive=%s queued=%d: %v", driveID, queued, err)
-			return
-		}
-		if !thumbWorker.EnqueueBlocking(taskCtx, v) {
-			log.Printf("[thumb] enqueue pending canceled drive=%s queued=%d", driveID, queued)
-			return
-		}
-		queued++
-	}
-	log.Printf("[thumb] enqueued pending thumbnails for regen drive=%s queued=%d reset_failed=%d", driveID, queued, reset)
+	a.regenerateDriveResources(ctx, driveID, api.DriveGenerationThumbnails)
 }
 
 func (a *App) regenFailedFingerprints(ctx context.Context, driveID string) {
-	taskCtx, done, admitted := a.registerDriveTaskContext(ctx, driveID, 0)
-	if !admitted {
-		return
-	}
-	defer done()
-	a.mu.Lock()
-	fingerprintWorker := a.fingerprintWorkers[driveID]
-	a.mu.Unlock()
-	if fingerprintWorker == nil {
-		log.Printf("[fingerprint] regen failed drive=%s skipped: fingerprint worker not found", driveID)
-		return
-	}
-	counts, err := a.resetFailedGeneration(taskCtx, driveID, catalog.GenerationKinds{Fingerprints: true})
-	if err != nil {
-		log.Printf("[fingerprint] reset failed fingerprints drive=%s: %v", driveID, err)
-		return
-	}
-	reset := counts.Fingerprints
-	items, err := a.cat.ListVideosNeedingFingerprint(taskCtx, driveID, 0)
-	if err != nil {
-		log.Printf("[fingerprint] list pending videos for regen drive=%s: %v", driveID, err)
-		return
-	}
-	log.Printf("[fingerprint] enqueue pending videos for regen drive=%s count=%d reset_failed=%d", driveID, len(items), reset)
-	queued := 0
-	for _, v := range items {
-		if err := taskCtx.Err(); err != nil {
-			log.Printf("[fingerprint] enqueue pending canceled drive=%s queued=%d: %v", driveID, queued, err)
-			return
-		}
-		if !fingerprintWorker.EnqueueBlocking(taskCtx, v) {
-			log.Printf("[fingerprint] enqueue pending canceled drive=%s queued=%d", driveID, queued)
-			return
-		}
-		queued++
-	}
-	log.Printf("[fingerprint] enqueued pending videos for regen drive=%s queued=%d reset_failed=%d", driveID, queued, reset)
+	a.regenerateDriveResources(ctx, driveID, api.DriveGenerationFingerprints)
 }
 
 // listScanTargetIDs 返回 nightly Phase 1 应扫描的所有 drive ID
@@ -302,7 +197,7 @@ func (a *App) listCrawlerDriveIDs(ctx context.Context) []string {
 // waitAllPreviewQueuesIdle 阻塞直到所有 drive 的封面、预览视频和指纹 worker
 // 队列都为空且无 in-flight 任务。
 //
-// 顺序：先等所有 thumb worker，再等预览视频，最后等指纹。队列生成时互不等待；
+// 顺序：先等预览视频，再等封面（预览完成会追加封面任务），最后等指纹。队列生成时互不等待；
 // nightly 只在 phase 边界统一等待它们都 drain，保证爬虫视频迁移前本地资产已产出。
 // 若 ctx 在等待中被取消（shutdown / 管理员停止），立即返回 ctx.Err。
 func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
@@ -321,12 +216,12 @@ func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
 	}
 	a.mu.Unlock()
 
-	for _, w := range thumbWorkers {
+	for _, w := range previewWorkers {
 		if err := w.WaitIdle(ctx); err != nil {
 			return err
 		}
 	}
-	for _, w := range previewWorkers {
+	for _, w := range thumbWorkers {
 		if err := w.WaitIdle(ctx); err != nil {
 			return err
 		}
@@ -339,7 +234,7 @@ func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	return a.waitDurationBackfillsIdle(ctx, "")
 }
 
 func (a *App) waitDriveGenerationQueuesIdle(ctx context.Context, driveID string) error {
@@ -348,10 +243,10 @@ func (a *App) waitDriveGenerationQueuesIdle(ctx context.Context, driveID string)
 	previewWorker := a.workers[driveID]
 	fingerprintWorker := a.fingerprintWorkers[driveID]
 	a.mu.Unlock()
-	if err := thumbWorker.WaitIdle(ctx); err != nil {
+	if err := previewWorker.WaitIdle(ctx); err != nil {
 		return err
 	}
-	if err := previewWorker.WaitIdle(ctx); err != nil {
+	if err := thumbWorker.WaitIdle(ctx); err != nil {
 		return err
 	}
 	if err := a.waitFingerprintQueueingIdle(ctx, driveID); err != nil {

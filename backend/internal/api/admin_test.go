@@ -2067,7 +2067,7 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 		}
 	})
 	scriptPath := filepath.Join(tmp, "demo_crawler.py")
-	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = \"crawler.v2\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = \"crawler.v3\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n"), 0o644); err != nil {
 		t.Fatalf("write crawler script: %v", err)
 	}
 
@@ -2226,8 +2226,8 @@ func TestHandleListCrawlersOnlyIncludesCrawlerPageScripts(t *testing.T) {
 	if byID["crawler-main"].Name != "Demo Crawler" {
 		t.Fatalf("crawler name = %q, want script metadata name", byID["crawler-main"].Name)
 	}
-	if byID["crawler-main"].Protocol != scriptcrawler.ProtocolV2 {
-		t.Fatalf("crawler protocol = %q, want %q", byID["crawler-main"].Protocol, scriptcrawler.ProtocolV2)
+	if byID["crawler-main"].Protocol != scriptcrawler.ProtocolV3 {
+		t.Fatalf("crawler protocol = %q, want %q", byID["crawler-main"].Protocol, scriptcrawler.ProtocolV3)
 	}
 	if byID["crawler-main"].Proxy != "http://127.0.0.1:7890" {
 		t.Fatalf("crawler proxy = %q, want trimmed proxy", byID["crawler-main"].Proxy)
@@ -2290,7 +2290,7 @@ func TestHandleUpsertCrawlerRequiresScriptPath(t *testing.T) {
 
 	srv := &AdminServer{Catalog: cat}
 	scriptPath := filepath.Join(tmp, "custom.py")
-	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Demo Crawler\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n"), 0o644); err != nil {
 		t.Fatalf("write crawler script: %v", err)
 	}
 
@@ -2361,7 +2361,7 @@ func TestHandleUpsertCrawlerGeneratesIDFromScriptName(t *testing.T) {
 		t.Fatalf("seed crawler: %v", err)
 	}
 	scriptPath := filepath.Join(tmp, "custom.py")
-	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"My Spider\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"My Spider\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n"), 0o644); err != nil {
 		t.Fatalf("write crawler script: %v", err)
 	}
 
@@ -2407,7 +2407,7 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 		}
 	})
 	scriptPath := filepath.Join(tmp, "custom.py")
-	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Upload Spider\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Upload Spider\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n"), 0o644); err != nil {
 		t.Fatalf("write crawler script: %v", err)
 	}
 	for _, d := range []*catalog.Drive{
@@ -2545,7 +2545,7 @@ func TestHandleUpsertCrawlerPersistsAndValidatesUploadDrive(t *testing.T) {
 
 func TestHandleImportCrawlerScriptFile(t *testing.T) {
 	tmp := t.TempDir()
-	script := "CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = \"crawler.v2\"\nprint('crawler')\n"
+	script := "CRAWLER_NAME = \"Demo Crawler\"\nCRAWLER_PROTOCOL = \"crawler.v3\"\nCRAWLER_PROTOCOL = 'crawler.v3'\nprint('crawler')\n"
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	part, err := mw.CreateFormFile("file", "../demo crawler.py")
@@ -2591,8 +2591,8 @@ func TestHandleImportCrawlerScriptFile(t *testing.T) {
 	if got.Name != "Demo Crawler" {
 		t.Fatalf("name = %q, want script metadata name", got.Name)
 	}
-	if got.Protocol != scriptcrawler.ProtocolV2 {
-		t.Fatalf("protocol = %q, want %q", got.Protocol, scriptcrawler.ProtocolV2)
+	if got.Protocol != scriptcrawler.ProtocolV3 {
+		t.Fatalf("protocol = %q, want %q", got.Protocol, scriptcrawler.ProtocolV3)
 	}
 	if string(data) != script {
 		t.Fatalf("script content = %q", string(data))
@@ -2612,7 +2612,7 @@ func TestHandleImportCrawlerScriptFileDoesNotCreateCrawlerTagWithoutVideos(t *te
 		}
 	})
 
-	script := "CRAWLER_NAME = \"Imported Crawler\"\nprint('crawler')\n"
+	script := "CRAWLER_NAME = \"Imported Crawler\"\nCRAWLER_PROTOCOL = 'crawler.v3'\nprint('crawler')\n"
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	part, err := mw.CreateFormFile("file", "imported.py")
@@ -2706,7 +2706,7 @@ func TestHandleImportCrawlerScriptURL(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = w.Write([]byte("CRAWLER_NAME = \"URL Crawler\"\n# crawler from url\n"))
+		_, _ = w.Write([]byte("CRAWLER_NAME = \"URL Crawler\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n# crawler from url\n"))
 	}))
 	defer upstream.Close()
 
@@ -2737,13 +2737,13 @@ func TestHandleImportCrawlerScriptURL(t *testing.T) {
 	if got.Name != "URL Crawler" {
 		t.Fatalf("name = %q, want script metadata name", got.Name)
 	}
-	if got.Protocol != scriptcrawler.ProtocolV1 {
-		t.Fatalf("protocol = %q, want %q", got.Protocol, scriptcrawler.ProtocolV1)
+	if got.Protocol != scriptcrawler.ProtocolV3 {
+		t.Fatalf("protocol = %q, want %q", got.Protocol, scriptcrawler.ProtocolV3)
 	}
 	if filepath.Base(got.ScriptPath) != "crawler.py" {
 		t.Fatalf("script filename = %q, want original filename", filepath.Base(got.ScriptPath))
 	}
-	if string(data) != "CRAWLER_NAME = \"URL Crawler\"\n# crawler from url\n" {
+	if string(data) != "CRAWLER_NAME = \"URL Crawler\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n# crawler from url\n" {
 		t.Fatalf("script content = %q", string(data))
 	}
 }
@@ -2789,7 +2789,7 @@ func TestHandleDeleteCrawlerRemovesScriptLocalVideosAndDrive(t *testing.T) {
 		t.Fatalf("mkdir script dir: %v", err)
 	}
 	scriptPath := filepath.Join(scriptDir, "crawler.py")
-	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Delete Me\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(scriptPath, []byte("CRAWLER_NAME = \"Delete Me\"\nCRAWLER_PROTOCOL = 'crawler.v3'\n"), 0o644); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 	if err := cat.UpsertDrive(ctx, &catalog.Drive{
@@ -3406,9 +3406,18 @@ func TestHandleTestCrawlerScriptRunsImportedScript(t *testing.T) {
 
 	script := filepath.Join(t.TempDir(), "crawler.py")
 	body := `CRAWLER_NAME = "Dry Run Test"
-import json
-print(json.dumps({"title": "Dry Run Video", "source_id": "dry-1", "media_url": "` + media.URL + `/video.mp4", "thumbnail_url": "` + media.URL + `/thumb.jpg", "detail_url": "` + media.URL + `/detail"}))
+CRAWLER_PROTOCOL = "crawler.v3"
+import json,sys
+for line in sys.stdin:
+    c=json.loads(line)
+    r={"request_id":c["request_id"]}
+    if c["type"]=="discover": r.update(type="page",items=[dict(discovery_key="dry",source_id="dry-1",locator={})],next_cursor=None)
+    elif c["type"]=="resolve": r.update(type="item",discovery_key="dry",source_id="dry-1",title="Dry Run Video",media=dict(type="url",url="` + media.URL + `/video.mp4"))
+    else: r.update(type="stopped")
+    print(json.dumps(r),flush=True)
+    if c["type"]=="stop": break
 `
+
 	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
@@ -3630,19 +3639,23 @@ func TestHandleListDrivesIncludesTeaserCounts(t *testing.T) {
 	}
 }
 
-func TestHandleRegenFailedFingerprintsInvokesHook(t *testing.T) {
+func TestHandleGenerateDriveFingerprintsInvokesHook(t *testing.T) {
 	called := ""
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/drive-one/fingerprints/failed/regenerate", nil)
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/drive-one/fingerprints/generate", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "drive-one")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	rr := httptest.NewRecorder()
 
 	(&AdminServer{
-		OnRegenFailedFingerprints: func(driveID string) {
+		OnDriveGenerationRequested: func(_ context.Context, driveID string, kind DriveGenerationKind) (DriveGenerationResult, error) {
+			if kind != DriveGenerationFingerprints {
+				t.Fatalf("kind = %q", kind)
+			}
 			called = driveID
+			return DriveGenerationResult{State: "started", Message: "started"}, nil
 		},
-	}).handleRegenFailedFingerprints(rr, req)
+	}).handleGenerateDriveFingerprints(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
@@ -4450,20 +4463,24 @@ func TestHandleRegenAllPreviewsInvokesHook(t *testing.T) {
 	}
 }
 
-func TestHandleRegenFailedPreviewsInvokesHookWithDriveID(t *testing.T) {
+func TestHandleGenerateDrivePreviewsInvokesHookWithDriveID(t *testing.T) {
 	calledWith := ""
 	server := &AdminServer{
-		OnRegenFailedPreviews: func(driveID string) {
+		OnDriveGenerationRequested: func(_ context.Context, driveID string, kind DriveGenerationKind) (DriveGenerationResult, error) {
+			if kind != DriveGenerationPreviews {
+				t.Fatalf("kind = %q", kind)
+			}
 			calledWith = driveID
+			return DriveGenerationResult{State: "started", Message: "started"}, nil
 		},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/PikPak/previews/failed/regenerate", nil)
+	req := httptest.NewRequest(http.MethodPost, "/admin/api/drives/PikPak/previews/generate", nil)
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", "PikPak")
 	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
 	rr := httptest.NewRecorder()
-	server.handleRegenFailedPreviews(rr, req)
+	server.handleGenerateDrivePreviews(rr, req)
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())

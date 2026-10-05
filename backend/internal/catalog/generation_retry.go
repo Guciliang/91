@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/video-site/backend/internal/driveevents"
 )
 
 // GenerationKinds selects the queues whose failed work may be retried.
@@ -25,7 +27,8 @@ type GenerationRetryCounts struct {
 // from a recurring pending-queue poll. Conditional updates preserve work that
 // another worker has already completed; the transaction resets all selected
 // kinds before any of them can fail again.
-func (c *Catalog) ResetFailedGeneration(ctx context.Context, driveID string, kinds GenerationKinds) (GenerationRetryCounts, error) {
+func (c *Catalog) ResetFailedGeneration(ctx context.Context, driveID string, kinds GenerationKinds) (resultValue GenerationRetryCounts, resultErr error) {
+	defer c.notifyDriveWrite(&resultErr, driveID, driveevents.GenerationChanged)
 	counts := GenerationRetryCounts{}
 	if !kinds.Thumbnails && !kinds.Previews && !kinds.Fingerprints {
 		return counts, ctx.Err()
@@ -47,7 +50,7 @@ func (c *Catalog) ResetFailedGeneration(ctx context.Context, driveID string, kin
 			query: `UPDATE videos
 			   SET thumbnail_status = 'pending', thumbnail_failures = 0, updated_at = ?
 			 WHERE drive_id = ? AND thumbnail_status = 'failed'
-			   AND (COALESCE(thumbnail_url, '') = '' OR COALESCE(duration_seconds, 0) <= 0)
+			   AND COALESCE(thumbnail_url, '') = ''
 			   AND COALESCE(hidden, 0) = 0 AND ` + uniqueVideoWhereSQL,
 		},
 		{

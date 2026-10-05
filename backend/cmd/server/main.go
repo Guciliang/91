@@ -25,6 +25,7 @@ import (
 	"github.com/video-site/backend/internal/catalog"
 	"github.com/video-site/backend/internal/config"
 	"github.com/video-site/backend/internal/crawlerupload"
+	"github.com/video-site/backend/internal/driveevents"
 	"github.com/video-site/backend/internal/drives/scriptcrawler"
 	"github.com/video-site/backend/internal/fingerprint"
 	"github.com/video-site/backend/internal/mediaimport"
@@ -130,6 +131,9 @@ func main() {
 		log.Fatalf("open catalog: %v", err)
 	}
 	defer cat.Close()
+	if err := cat.InterruptCrawlerTasks(context.Background()); err != nil {
+		log.Fatalf("recover crawler tasks: %v", err)
+	}
 	if err := cat.ResetLoginProtection(context.Background()); err != nil {
 		log.Fatalf("reset login protection at startup: %v", err)
 	}
@@ -215,6 +219,9 @@ func main() {
 	}
 	if err := app.attachLocalUpload(ctx); err != nil {
 		log.Printf("[local-upload] attach failed: %v", err)
+	}
+	if err := app.cleanupTelegramUploadSources(ctx); err != nil {
+		log.Printf("[telegram-upload] startup source cleanup: %v", err)
 	}
 	go app.runFingerprintReconciler(ctx)
 
@@ -329,7 +336,7 @@ func main() {
 			return app.reloadDriveRuntime(ctx, driveID)
 		},
 		OnPrepareDriveDelete: func(deleteCtx context.Context, driveID string) error {
-			app.stopDriveTasks(ctx, driveID)
+			app.cancelDriveTasks(ctx, driveID)
 			return app.waitDriveTasksStopped(deleteCtx, driveID)
 		},
 		OnDriveDeleteCleanup: func(cleanupCtx context.Context, driveID string) (int, error) {
@@ -350,6 +357,15 @@ func main() {
 			}
 			return app.scheduleScan(taskCtx, driveID)
 		},
+		OnCrawlerRunRequested: func(requestCtx context.Context, driveID string) (string, error) {
+			return app.startScriptCrawlerCrawl(applog.WithFields(ctx, applog.ContextFields(requestCtx)), driveID)
+		},
+		OnCrawlerTaskCancel: func(driveID, taskID string) bool {
+			app.mu.Lock()
+			crawler := app.scriptCrawlers[driveID]
+			app.mu.Unlock()
+			return crawler != nil && crawler.CancelTask(taskID)
+		},
 		OnCrawlerUploadRequested: func(driveID string) (bool, string) {
 			return app.scheduleManualCrawlerUploadMigration(ctx, driveID)
 		},
@@ -365,14 +381,8 @@ func main() {
 		OnRegenAllPreviews: func() {
 			go app.regenAllPreviews(ctx)
 		},
-		OnRegenFailedPreviews: func(driveID string) {
-			go app.regenFailedPreviews(ctx, driveID)
-		},
-		OnRegenFailedThumbnails: func(driveID string) {
-			go app.regenFailedThumbnails(ctx, driveID)
-		},
-		OnRegenFailedFingerprints: func(driveID string) {
-			go app.regenFailedFingerprints(ctx, driveID)
+		OnDriveGenerationRequested: func(reqCtx context.Context, driveID string, kind api.DriveGenerationKind) (api.DriveGenerationResult, error) {
+			return app.requestDriveGeneration(reqCtx, ctx, driveID, kind)
 		},
 		OnDeleteVideo: func(reqCtx context.Context, videoID string, deleteSource bool) (api.DeleteVideoResult, error) {
 			return app.deleteVideo(reqCtx, videoID, deleteSource)
@@ -393,6 +403,7 @@ func main() {
 		GetTagJobStatus: func() api.TagJobStatus {
 			return app.tagJobStatus()
 		},
+		GetDriveGenerationStatus: app.driveGenerationStatus,
 		GetDriveGenerationStatuses: func() map[string]api.DriveGenerationStatuses {
 			return app.driveGenerationStatuses()
 		},
@@ -439,11 +450,13 @@ func main() {
 	//   Phase 3 爬虫本地视频 → 云盘上传
 	//   Phase 4 扫描爬虫本地目录并恢复已取消拉黑的视频
 	//   Phase 5 全库重复视频维护：精确指纹去重 + 标题/时长/封面近似去重
+	// 每个存储在自身资源生成完成后补全缺失时长，各存储独立推进。
 	// 标签匹配不在夜间流水线中全库重算；新视频入库和管理员修改标签规则时按事件刷新。
 	// admin "扫描所有网盘" 使用同一个 Runner 的独立 scan-all 模式，只运行
 	// 云盘扫描、本地资产对账和全库重复维护，不触发爬虫、迁移或恢复，也不占用当天的定时执行标记。
 	liveSettings := app.liveConfigSettings()
 	app.nightlyRunner = nightly.New(nightly.Config{
+		OnStatusChanged:             func() { cat.DriveEvents().Notify("", true, driveevents.ActivityChanged) },
 		Settings:                    cat,
 		Disabled:                    liveSettings.NightlyDisabled,
 		StartTime:                   liveSettings.NightlyStartTime,
@@ -454,10 +467,10 @@ func main() {
 		RunCrawlerCrawl:             app.runScriptCrawlerCrawl,
 		WaitPreviewQueuesIdle:       app.waitAllPreviewQueuesIdle,
 		RunLocalAssetReconciliation: app.reconcileLocalGeneratedAssets,
-		RunMigration:                app.runCrawlerUploadMigration,
-		RunTelegramUpload:           app.runTelegramUploadMigration,
-		RestoreCrawlerVideos:        app.restoreScriptCrawlerVideos,
-		RunDedupeAssetCleanup:       app.cleanupDuplicateVideoAssets,
+
+		RunTelegramUpload: app.runTelegramUploadMigration,
+
+		RunDedupeAssetCleanup: app.cleanupDuplicateVideoAssets,
 	})
 	go configManager.Watch(ctx)
 	go app.nightlyRunner.Run(ctx)

@@ -20,6 +20,12 @@ import (
 	"github.com/video-site/backend/internal/drives"
 )
 
+type proxyTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (transport proxyTestRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
 func TestServeStreamLinkFailureReturnsStructuredErrorAndReportsStatus(t *testing.T) {
 	reg := NewRegistry()
 	drv := &proxyResultDrive{
@@ -121,6 +127,80 @@ func TestServeStreamForcedRelayFollowsDriveClientRedirects(t *testing.T) {
 	}
 	if got := rr.Body.String(); got != "video-bytes" {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestServeStreamForcedRelayStripsCrossOriginCredentials(t *testing.T) {
+	targetHeaders := make(chan http.Header, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHeaders <- r.Header.Clone()
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("video-bytes"))
+	}))
+	t.Cleanup(target.Close)
+
+	originHeaders := make(chan http.Header, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originHeaders <- r.Header.Clone()
+		http.Redirect(w, r, target.URL+"/video.mp4", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+
+	linkHeaders := make(http.Header)
+	linkHeaders.Set("Authorization", "Bearer drive-secret")
+	linkHeaders.Set("Cookie", "session=drive-secret")
+	linkHeaders.Set("Proxy-Authorization", "Basic proxy-secret")
+	baseTransport := &http.Transport{}
+	t.Cleanup(baseTransport.CloseIdleConnections)
+	transportCalls := 0
+	driveTransport := proxyTestRoundTripper(func(request *http.Request) (*http.Response, error) {
+		transportCalls++
+		return baseTransport.RoundTrip(request)
+	})
+	noRedirect := &http.Client{
+		Transport: driveTransport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	reg := NewRegistry()
+	reg.Set("webdav", &proxyFakeSimpleDrive{
+		kind: "webdav", url: origin.URL + "/redirect", headers: linkHeaders,
+		passThroughRedirects: true, httpClient: noRedirect,
+	})
+	p := New(reg)
+
+	req := httptest.NewRequest(http.MethodGet, "/p/stream/webdav/file-1?tripleScreenRelay=1", nil)
+	req.Header.Set("User-Agent", "browser-agent")
+	rr := httptest.NewRecorder()
+	p.ServeStream(rr, req, "webdav", "file-1")
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if got := rr.Body.String(); got != "video-bytes" {
+		t.Fatalf("body = %q", got)
+	}
+	if transportCalls != 2 {
+		t.Errorf("drive transport calls = %d, want initial and redirected requests", transportCalls)
+	}
+	firstHop := <-originHeaders
+	for name, want := range map[string]string{
+		"Authorization": "Bearer drive-secret",
+		"Cookie":        "session=drive-secret",
+	} {
+		if got := firstHop.Get(name); got != want {
+			t.Errorf("origin %s = %q, want %q", name, got, want)
+		}
+	}
+	redirected := <-targetHeaders
+	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "Referer"} {
+		if got := redirected.Get(name); got != "" {
+			t.Errorf("redirect target %s = %q, want empty", name, got)
+		}
+	}
+	if got := redirected.Get("User-Agent"); got != "browser-agent" {
+		t.Errorf("redirect target User-Agent = %q, want browser-agent", got)
 	}
 }
 

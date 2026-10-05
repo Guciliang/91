@@ -15,7 +15,8 @@ export class UnauthorizedError extends Error {
 export class APIResponseError extends Error {
   constructor(
     readonly status: number,
-    message: string
+    message: string,
+    readonly body?: unknown,
   ) {
     super(message);
     this.name = "APIResponseError";
@@ -41,13 +42,18 @@ async function request<T>(
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     let message = text;
+    let body: unknown;
     try {
-      const parsed = JSON.parse(text) as { error?: unknown };
-      if (typeof parsed.error === "string") message = parsed.error;
+      body = JSON.parse(text);
+      if (body && typeof body === "object") {
+        const parsed = body as { error?: unknown; message?: unknown };
+        if (typeof parsed.error === "string") message = parsed.error;
+        else if (typeof parsed.message === "string") message = parsed.message;
+      }
     } catch {
       // Keep a plain-text error response as-is.
     }
-    throw new APIResponseError(res.status, message || `HTTP ${res.status}`);
+    throw new APIResponseError(res.status, message || `HTTP ${res.status}`, body);
   }
   if (res.status === 204) return undefined as T;
   const ct = res.headers.get("content-type") ?? "";
@@ -320,8 +326,8 @@ export type RestoreReport = {
   warnings?: string[];
 };
 
-export function listBackups() {
-  return request<BackupList>("/backups");
+export function listBackups(signal?: AbortSignal) {
+  return request<BackupList>("/backups", { signal });
 }
 
 export function createBackup(selection?: BackupSelection) {
@@ -479,12 +485,12 @@ export type BackupReceiveTransfer = {
   cancellable: boolean;
 };
 
-export function listBackupTransfers() {
-  return request<BackupTransferJob[]>("/backup-transfers");
+export function listBackupTransfers(signal?: AbortSignal) {
+  return request<BackupTransferJob[]>("/backup-transfers", { signal });
 }
 
-export function listBackupReceiveTransfers() {
-  return request<BackupReceiveTransfer[]>("/backup-receives");
+export function listBackupReceiveTransfers(signal?: AbortSignal) {
+  return request<BackupReceiveTransfer[]>("/backup-receives", { signal });
 }
 
 export function cancelBackupReceiveTransfer(id: string) {
@@ -569,8 +575,8 @@ export type DriveGenerationStatus = {
   totalCount: number;
 };
 
-export function listDrives() {
-  return request<AdminDrive[]>("/drives");
+export function listDrives(signal?: AbortSignal) {
+  return request<AdminDrive[]>("/drives", { signal });
 }
 
 export function getDriveCredentials(id: string) {
@@ -591,8 +597,56 @@ export type AdminDriveStorage = DriveStorageUsage & {
   drives: Record<string, DriveStorageUsage>;
 };
 
-export function getDriveStorage() {
-  return request<AdminDriveStorage>("/drives/storage");
+export function getDriveStorage(signal?: AbortSignal) {
+  return request<AdminDriveStorage>("/drives/storage", { signal });
+}
+
+export type DriveRuntime = Pick<AdminDrive, "scanGenerationStatus" | "thumbnailGenerationStatus" | "previewGenerationStatus" | "fingerprintGenerationStatus"> & { maintenanceStatus?: MaintenanceJobStatus };
+export type DriveStats = Pick<AdminDrive, "thumbnailReadyCount" | "thumbnailPendingCount" | "thumbnailFailedCount" | "thumbnailDurationPendingCount" | "teaserReadyCount" | "teaserPendingCount" | "teaserFailedCount" | "fingerprintReadyCount" | "fingerprintPendingCount" | "fingerprintFailedCount">;
+export type DriveConfig = Omit<AdminDrive, keyof DriveRuntime | keyof DriveStats>;
+export type DriveResourceData = { config: DriveConfig; runtime: DriveRuntime; stats: DriveStats; storage: DriveStorageUsage };
+export type DriveResource = keyof DriveResourceData;
+export type DriveSnapshot<R extends DriveResource = DriveResource> = {
+  epoch: string;
+  driveId: string;
+  resource: R;
+  revision: number;
+  updatedAt: string;
+  data?: DriveResourceData[R];
+  error?: string;
+  status?: number;
+};
+
+function isDriveErrorSnapshot<R extends DriveResource>(body: unknown, id: string, resource: R, status: number): body is DriveSnapshot<R> {
+  if (!body || typeof body !== "object") return false;
+  const snapshot = body as Partial<DriveSnapshot>;
+  return snapshot.driveId === id && snapshot.resource === resource && snapshot.status === status
+    && typeof snapshot.epoch === "string" && snapshot.epoch.length > 0
+    && typeof snapshot.revision === "number" && Number.isSafeInteger(snapshot.revision) && snapshot.revision > 0
+    && typeof snapshot.updatedAt === "string" && typeof snapshot.error === "string" && snapshot.error.length > 0;
+}
+
+export async function getDriveSnapshot<R extends DriveResource>(id: string, resource: R, signal?: AbortSignal) {
+  try {
+    return await request<DriveSnapshot<R>>(`/drives/${encodeURIComponent(id)}/${resource}?refresh=true`, { signal });
+  } catch (error) {
+    if (error instanceof APIResponseError && error.status !== 403 && isDriveErrorSnapshot(error.body, id, resource, error.status)) {
+      return error.body;
+    }
+    throw error;
+  }
+}
+
+export function subscribeDriveSnapshots(id: string, onSnapshot: (snapshot: DriveSnapshot) => void, onOpen: () => void, onError: () => void) {
+  const source = new EventSource(`${BASE}/drives/${encodeURIComponent(id)}/events`);
+  source.onopen = onOpen;
+  source.onerror = onError;
+  source.addEventListener("heartbeat", onOpen);
+  source.addEventListener("snapshot", (event) => {
+    try { onSnapshot(JSON.parse((event as MessageEvent<string>).data) as DriveSnapshot); }
+    catch { onError(); }
+  });
+  return source;
 }
 
 export type UpsertDriveInput = {
@@ -610,6 +664,7 @@ export type UpsertDriveInput = {
 };
 
 export type DriveConfigSaveResult = {
+  snapshot?: DriveSnapshot<"config">;
   ok: boolean;
   deferred?: boolean;
   message?: string;
@@ -635,14 +690,14 @@ export function deleteDrive(id: string, body: DeleteDriveInput) {
 }
 
 export function rescan(id: string) {
-  return request<{ ok: boolean; accepted: boolean; message?: string; status?: MaintenanceJobStatus }>(
+  return request<{ ok: boolean; accepted: boolean; message?: string; status?: MaintenanceJobStatus; snapshot?: DriveSnapshot<"runtime"> }>(
     `/drives/${encodeURIComponent(id)}/rescan`,
     { method: "POST" }
   );
 }
 
 export function stopDriveTasks(id: string) {
-  return request<{ ok: boolean; stopped: boolean }>(
+  return request<{ ok: boolean; stopped: boolean; snapshot?: DriveSnapshot<"runtime"> }>(
     `/drives/${encodeURIComponent(id)}/tasks/stop`,
     { method: "POST" }
   );
@@ -650,11 +705,23 @@ export function stopDriveTasks(id: string) {
 
 // ---------- Crawlers ----------
 
+export type CrawlerTaskResult = {
+  taskId: string;
+  feedId?: string;
+  feedLabel?: string;
+  stopRequested?: boolean;
+  state: "queued" | "running" | "completed" | "partial" | "failed" | "canceled" | "interrupted";
+  stage: string;
+  checked: number;
+  newVideos: number;
+  message?: string;
+};
+
 export type CrawlerUploadResult = {
   taskId: string;
   driveId: string;
   targetDriveId: string;
-  state: "succeeded" | "partial" | "blocked" | "failed" | "canceled";
+  state: "queued" | "running" | "succeeded" | "partial" | "blocked" | "failed" | "canceled" | "interrupted";
   startedAt: string;
   finishedAt: string;
   candidateCount: number;
@@ -668,10 +735,18 @@ export type CrawlerUploadResult = {
   issues?: Array<{ videoId?: string; title?: string; stage: string; reason: string; message: string }>;
 };
 
+export type CrawlerFeed = {
+  id: string;
+  label: string;
+  default?: boolean;
+};
+
 export type AdminCrawler = {
   id: string;
   name: string;
   kind: "scriptcrawler";
+  feeds: CrawlerFeed[];
+  selectedFeedId: string;
   status: string;
   lastError?: string;
   scriptPath: string;
@@ -688,6 +763,9 @@ export type AdminCrawler = {
   fingerprintGenerationStatus?: DriveGenerationStatus;
   uploadGenerationStatus?: DriveGenerationStatus;
   lastUploadResult?: CrawlerUploadResult;
+  currentTask?: CrawlerTaskResult;
+  lastCrawlResult?: CrawlerTaskResult;
+  scriptError?: string;
   thumbnailReadyCount: number;
   thumbnailPendingCount: number;
   thumbnailFailedCount: number;
@@ -704,6 +782,7 @@ export type AdminCrawler = {
 
 export type UpsertCrawlerInput = {
   id?: string;
+  selectedFeedId: string;
   scriptPath: string;
   scriptSourceUrl?: string;
   proxy?: string;
@@ -715,6 +794,7 @@ export type UpsertCrawlerInput = {
 export type ImportCrawlerScriptResult = {
   scriptPath: string;
   name: string;
+  feeds: CrawlerFeed[];
   sourceUrl?: string;
 };
 
@@ -722,7 +802,6 @@ export type CrawlerDryRunItem = {
   title: string;
   sourceId?: string;
   mediaUrl?: string;
-  mediaLocalFile?: string;
   thumbnailUrl?: string;
   detailUrl?: string;
 };
@@ -737,6 +816,9 @@ export type CrawlerDryRunMediaCheck = {
 
 export type CrawlerDryRunResult = {
   ok: boolean;
+  feedId?: string;
+  feedLabel?: string;
+  validated: Array<"protocol" | "media_probe">;
   items: CrawlerDryRunItem[];
   mediaCheck?: CrawlerDryRunMediaCheck;
   error?: string;
@@ -744,8 +826,8 @@ export type CrawlerDryRunResult = {
   durationMs: number;
 };
 
-export function listCrawlers() {
-  return request<AdminCrawler[]>("/crawlers");
+export function listCrawlers(signal?: AbortSignal) {
+  return request<AdminCrawler[]>("/crawlers", { signal });
 }
 
 export function upsertCrawler(body: UpsertCrawlerInput) {
@@ -771,7 +853,7 @@ export function importCrawlerScriptURL(url: string) {
   });
 }
 
-export function testCrawlerScript(body: { scriptPath: string; proxy?: string }) {
+export function testCrawlerScript(body: { scriptPath: string; proxy?: string; selectedFeedId: string }) {
   return request<CrawlerDryRunResult>("/crawlers/test-script", {
     method: "POST",
     body: JSON.stringify(body),
@@ -985,30 +1067,25 @@ export function setDriveSkipDirIds(id: string, dirIds: string[]) {
   );
 }
 
-export function regenFailedPreviews(id: string) {
-  return request<{ ok: boolean }>(
-    `/drives/${encodeURIComponent(id)}/previews/failed/regenerate`,
+export type DriveGenerationResult = { state: "started" | "busy" | "ready"; message: string };
+
+export function generateDrivePreviews(id: string) {
+  return request<DriveGenerationResult>(
+    `/drives/${encodeURIComponent(id)}/previews/generate`,
     { method: "POST" }
   );
 }
 
-/**
- * 触发某 drive 下所有 thumbnail_status=failed 的封面重新入队生成。
- * 与 regenFailedPreviews 行为对称（一个管预览视频，一个管封面）。
- *
- * 后端立即返回 202；实际状态变化在下次 listDrives 拉到的 thumbnailFailedCount /
- * thumbnailGenerationStatus 字段里观察。
- */
-export function regenFailedThumbnails(id: string) {
-  return request<{ ok: boolean }>(
-    `/drives/${encodeURIComponent(id)}/thumbnails/failed/regenerate`,
+export function generateDriveThumbnails(id: string) {
+  return request<DriveGenerationResult>(
+    `/drives/${encodeURIComponent(id)}/thumbnails/generate`,
     { method: "POST" }
   );
 }
 
-export function regenFailedFingerprints(id: string) {
-  return request<{ ok: boolean }>(
-    `/drives/${encodeURIComponent(id)}/fingerprints/failed/regenerate`,
+export function generateDriveFingerprints(id: string) {
+  return request<DriveGenerationResult>(
+    `/drives/${encodeURIComponent(id)}/fingerprints/generate`,
     { method: "POST" }
   );
 }
@@ -1060,7 +1137,8 @@ export type AdminVideoListParams = {
 };
 
 export function listVideos(
-  params: AdminVideoListParams = {}
+  params: AdminVideoListParams = {},
+  signal?: AbortSignal,
 ) {
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
@@ -1074,7 +1152,7 @@ export function listVideos(
   if (params.size) qs.set("size", String(params.size));
   if (params.keyword) qs.set("keyword", params.keyword);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  return request<AdminVideoList>(`/videos${suffix}`);
+  return request<AdminVideoList>(`/videos${suffix}`, { signal });
 }
 
 // 后台视频管理两个标签页的计数。
@@ -1112,7 +1190,8 @@ export type AdminBlacklistList = {
 };
 
 export function listBlacklist(
-  params: { driveId?: string; page?: number; size?: number; keyword?: string } = {}
+  params: { driveId?: string; page?: number; size?: number; keyword?: string } = {},
+  signal?: AbortSignal,
 ) {
   const qs = new URLSearchParams();
   if (params.driveId) qs.set("driveId", params.driveId);
@@ -1120,7 +1199,7 @@ export function listBlacklist(
   if (params.size) qs.set("size", String(params.size));
   if (params.keyword) qs.set("keyword", params.keyword);
   const suffix = qs.toString() ? `?${qs.toString()}` : "";
-  return request<AdminBlacklistList>(`/blacklist${suffix}`);
+  return request<AdminBlacklistList>(`/blacklist${suffix}`, { signal });
 }
 
 // 允许视频在后续手动/定时任务中重新入库；此操作不会立即触发扫盘或爬取。
@@ -1145,8 +1224,8 @@ export type BlacklistSourceDeleteStatus = {
   lastFinishedAt?: string;
 };
 
-export function getBlacklistSourceDeleteStatus() {
-  return request<BlacklistSourceDeleteStatus>("/blacklist/source-delete/status");
+export function getBlacklistSourceDeleteStatus(signal?: AbortSignal) {
+  return request<BlacklistSourceDeleteStatus>("/blacklist/source-delete/status", { signal });
 }
 
 export function startBlacklistSourceDelete(
@@ -1214,8 +1293,8 @@ export type AdminTag = {
 
 export type TagMatchRules = NonNullable<AdminTag["matchRules"]>;
 
-export async function listTags(): Promise<AdminTag[]> {
-  const tags = await request<AdminTag[] | null>("/tags");
+export async function listTags(signal?: AbortSignal): Promise<AdminTag[]> {
+  const tags = await request<AdminTag[] | null>("/tags", { signal });
   if (tags === null) return [];
   if (!Array.isArray(tags)) {
     throw new Error("Invalid /admin/api/tags response");
@@ -1372,6 +1451,7 @@ export type ScanResult = {
   updatedCount: number;
   duplicateCount: number;
   tombstonedCount: number;
+  cleanedCount: number;
   errorCount: number;
   message?: string;
   issues?: ScanIssue[];
@@ -1393,8 +1473,8 @@ export type MaintenanceJobStatus = {
   issues?: ScanIssue[];
 };
 
-export function getScanAllJobStatus() {
-  return request<MaintenanceJobStatus>("/jobs/scan-all/status");
+export function getScanAllJobStatus(signal?: AbortSignal) {
+  return request<MaintenanceJobStatus>("/jobs/scan-all/status", { signal });
 }
 
 export function runScanAllJob() {
@@ -1421,8 +1501,8 @@ export type AdminUser = {
   createdAt: number;
 };
 
-export function listUsers() {
-  return request<AdminUser[]>("/users");
+export function listUsers(signal?: AbortSignal) {
+  return request<AdminUser[]>("/users", { signal });
 }
 
 export function createUser(body: { username: string; password: string; role: string }) {
@@ -1459,8 +1539,8 @@ export type BannedIP = {
   createdAt: number;
 };
 
-export function listBannedIPs() {
-  return request<BannedIP[]>("/banned-ips");
+export function listBannedIPs(signal?: AbortSignal) {
+  return request<BannedIP[]>("/banned-ips", { signal });
 }
 
 export function unbanIP(ip: string) {
@@ -1496,11 +1576,12 @@ export type ImportJob = {
   cancelRequested?: boolean; sequence: string; senderId?: string;
   retryCount: number; nextAttempt: number;
 };
+export const getTelegramAvailability = (signal?: AbortSignal) => request<{ enabled: boolean }>("/telegram/availability", { signal });
 export const getTelegramStatus = (signal?: AbortSignal) => request<TelegramStatus>("/telegram/status", { signal });
 export const testTelegram = () => request<{username: string}>("/telegram/test", {method: "POST"});
 export const prepareTelegramPolling = () => request<void>("/telegram/prepare-polling", {method:"POST"});
 export const resumeTelegram = () => request<void>("/telegram/resume", {method:"POST"});
 // The Telegram page filters and paginates within this recent record window.
-export const listTelegramImports = (limit: number) => request<ImportJob[]>(`/import-jobs?${new URLSearchParams({source: "telegram", limit: String(limit)})}`);
+export const listTelegramImports = (limit: number, signal?: AbortSignal) => request<ImportJob[]>(`/import-jobs?${new URLSearchParams({source: "telegram", limit: String(limit)})}`, { signal });
 export const cancelImport = (id: string) => request<ImportJob>(`/import-jobs/${encodeURIComponent(id)}/cancel`, {method:"POST"});
 export const retryImport = (id: string) => request<void>(`/import-jobs/${encodeURIComponent(id)}/retry`, {method:"POST"});

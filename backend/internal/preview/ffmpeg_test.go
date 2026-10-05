@@ -855,6 +855,65 @@ printf 'segment-output' > "$out"
 	}
 }
 
+func TestGenerateWithLinkRefreshRetriesFailedPassThroughLink(t *testing.T) {
+	dir := t.TempDir()
+	markers := filepath.Join(dir, "markers")
+	if err := os.MkdirAll(markers, 0o755); err != nil {
+		t.Fatalf("create attempt marker directory: %v", err)
+	}
+	ffmpeg := filepath.Join(dir, "ffmpeg")
+	script := fmt.Sprintf(`#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+case " $* " in
+  *" -f concat "*) printf 'concat-output' > "$out"; exit 0 ;;
+esac
+case "$out" in
+  *teaser-seg-0-*)
+    if [ ! -f %[1]q/first-attempt ]; then
+      : > %[1]q/first-attempt
+      printf 'Server returned 403 Forbidden' >&2
+      exit 1
+    fi
+    : > %[1]q/retried-same-segment
+    ;;
+  *teaser-seg-1-*) : > %[1]q/fallback-segment ;;
+esac
+printf 'segment-output' > "$out"
+`, markers, markers, markers)
+	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
+		t.Fatalf("write ffmpeg stub: %v", err)
+	}
+	ffprobe := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"video\",\"duration\":\"3.0\"}],\"format\":{\"duration\":\"3.0\"}}'\n"), 0o755); err != nil {
+		t.Fatalf("write ffprobe stub: %v", err)
+	}
+	gen := New(Config{FFmpegPath: ffmpeg, FFprobePath: ffprobe, LocalDir: filepath.Join(dir, "preview")})
+	refreshes := 0
+	path, err := gen.GenerateWithLinkRefresh(
+		context.Background(),
+		&drives.StreamLink{URL: "http://example.invalid/expired", PassThroughRedirects: true},
+		2.5,
+		func(context.Context) (*drives.StreamLink, error) {
+			refreshes++
+			return &drives.StreamLink{URL: "http://example.invalid/refreshed", PassThroughRedirects: true}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("generate after refreshing failed pass-through link: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if refreshes != 1 {
+		t.Fatalf("refreshes = %d, want one refresh after the initial link failed", refreshes)
+	}
+	if _, err := os.Stat(filepath.Join(markers, "retried-same-segment")); err != nil {
+		t.Fatalf("failed segment was not retried with the refreshed link: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(markers, "fallback-segment")); !os.IsNotExist(err) {
+		t.Fatalf("fallback segment marker error = %v, want no fallback attempt", err)
+	}
+}
+
 func TestDirectMediaLinkRefreshClassification(t *testing.T) {
 	for _, err := range []error{
 		errors.New("ffmpeg segment: Server returned 403 Forbidden"),
@@ -910,10 +969,10 @@ func TestGenerateMediaWithLimitedFFmpegThreads(t *testing.T) {
 			t.Fatal("default thread limit is not one")
 		}
 		link := &drives.StreamLink{URL: source}
-		if err := gen.generateThumbnailAtOffset(ctx, link, filepath.Join(dir, "cover.jpg"), 0); err != nil {
+		if err := gen.generateThumbnailAtOffset(ctx, link, filepath.Join(dir, "cover.jpg"), 0, &sourceColorRepair{}); err != nil {
 			t.Fatalf("thumbnail threads=%d: %v", threads, err)
 		}
-		if _, err := gen.generateSingleSegment(ctx, 0, 0, 1, false, link); err != nil {
+		if _, err := gen.generateSingleSegment(ctx, 0, 0, 1, false, link, &sourceColorRepair{}); err != nil {
 			t.Fatalf("preview threads=%d: %v", threads, err)
 		}
 	}

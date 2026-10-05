@@ -102,6 +102,19 @@ func validateArchiveDatabaseScope(ctx context.Context, databasePath string, mani
 			return err
 		}
 	}
+	// v3 tables are optional in older archives, but when present obey the
+	// same drive selection as source history.
+	for _, table := range []string{"crawler_discoveries", "crawler_tasks", "crawler_upload_tasks", "crawler_upload_results"} {
+		var present int
+		if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&present); err != nil {
+			return err
+		}
+		if present != 0 {
+			if err := validateArchiveDriveScopedTable(ctx, database, table, drives, selection); err != nil {
+				return err
+			}
+		}
+	}
 	// Older archives predate this optional internal history table.
 	if !selection.AllResources() {
 		var present int
@@ -246,7 +259,7 @@ func validateTelegramArchiveScope(ctx context.Context, db *sql.DB, selection Bac
 		}
 	}
 
-	for _, table := range []string{"telegram_settings", "telegram_connections", "telegram_receipts", "telegram_media_group_updates", "telegram_files", "telegram_local_files"} {
+	for _, table := range []string{"telegram_settings", "telegram_connections", "telegram_receipts", "telegram_media_group_updates", "telegram_files", "telegram_local_files", "telegram_upload_cleanups"} {
 		var present int
 		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&present); err != nil {
 			return err

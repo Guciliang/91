@@ -24,6 +24,7 @@ Examples from this codebase:
 ## Data fetching and effects
 
 - API functions live in `src/data/videos.ts` or `src/admin/api.ts`; a hook invokes them and maps the result to UI state. Do not write endpoint strings in a generic hook or component unless the existing feature already does so.
+- For admin data with periodic refresh, use `src/admin/useAdminResource.ts` rather than starting overlapping interval requests in a component. It owns cancellation, stale-data retention, retry, visibility, and online/focus behavior; drive detail uses `useDriveDetailData` and its versioned SSE snapshots. See [Admin Server State](./admin-server-state.md).
 - For an effect-triggered request, use an `AbortController` and abort it in the effect cleanup when the API accepts a signal. `useListingQuery` and `useInfiniteListing` are the canonical patterns.
 - Guard against stale responses with a request ID/reducer state or an active flag. `useListingQuery` ignores `success`/`failure` actions whose `requestID` is no longer current; `src/pages/SharedVideoPage.tsx` uses an `active` flag for its one-off claim request.
 - Separate initial loading, background revalidation, empty data, and errors. `useListingQuery` exposes `initialLoading`, `refreshing`, `transitioning`, and `revalidating`; `useInfiniteListing` retains existing items when loading the next batch.
@@ -41,5 +42,5 @@ For an external singleton, use `useSyncExternalStore` as in `src/lib/useIsActive
 - Do not create a new observer, interval, event listener, or request on every render. Put setup in an effect with precise dependencies and clean it up.
 - Do not omit dependencies just to silence effect behavior. There are a few documented `eslint-disable-next-line react-hooks/exhaustive-deps` comments in `src/components/VideoCard.tsx` and `src/shorts/useShortsSlideGestures.ts`; do not copy them without understanding the ref-based lifecycle they protect.
 - Do not call hooks conditionally or from event handlers. Conditional behavior belongs inside the hook's effect/callback.
-- There is no shared query cache library. `useListingQuery` has a local bounded LRU cache, while infinite feeds and detail prefetching have feature-specific caches in `src/lib`/`src/data`; do not assume React Query invalidation APIs exist.
+- There is no shared query cache library. `useListingQuery` has a local bounded LRU cache, infinite feeds and detail prefetching have feature-specific caches in `src/lib`/`src/data`, and each `useAdminResource` call owns a local resource instance (`queryKey` is not a cross-component cache); do not assume React Query invalidation APIs exist.
 - The repository has no generated hook types or runtime schema library. Return explicit TypeScript shapes and validate important network/storage boundaries in the API/data layer.

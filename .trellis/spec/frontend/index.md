@@ -10,6 +10,7 @@
 | [Component Guidelines](./component-guidelines.md) | Function components, props, global CSS, composition, accessibility |
 | [Hook Guidelines](./hook-guidelines.md) | Custom hooks, effects, cancellation, refs, and data fetching |
 | [State Management](./state-management.md) | Local state, URL state, Context, browser persistence, and server state |
+| [Admin Server State](./admin-server-state.md) | Admin polling resources, versioned drive snapshots, and SSE synchronization |
 | [Type Safety](./type-safety.md) | Strict TypeScript, shared models, unions, boundary validation |
 | [Quality Guidelines](./quality-guidelines.md) | Type checks, Node tests, builds, accessibility, and review checks |
 
