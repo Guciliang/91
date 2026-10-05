@@ -50,3 +50,25 @@ Merged upstream/main while preserving fork features; fixed inherited SQLite SQLI
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Merged upstream v0.3.5 and verified deployment
+<!-- trellis-session: v=2 fp=994e1e3eb0741735 -->
+
+**Date**: 2026-10-05
+**Task**: Merged upstream v0.3.5 and verified deployment
+**Branch**: `main`
+
+### Summary
+
+Merged upstream nianzhibai/91 v0.3.5 (c5e358c) into Guciliang/91 in commit 8b10e8f, preserving fork features and recording admin resource synchronization guidance. Backend serial full suite/build, Windows cross-compile, SQLite regression, frontend npm run verify (968 tests), and NAS HTTP/SQLite health checks passed. External crawler scripts must use crawler.v3; no external crawler project was changed. Task archived; no push. Unrelated pre-existing worktree files were left untouched.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8b10e8f` | Merge upstream v0.3.5 while preserving fork features |
+
+### Status
+
+[OK] **Completed**
