@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/10-05-upstream-release-merge/research/upstream-v0.3.5-diff.md", "reason": "Verification map for upstream changes, direct conflicts, shared paths, and preserved fork behavior."}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "Frontend type, test, build, accessibility, and review checks."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer contract validation checklist for integrated behavior."}
